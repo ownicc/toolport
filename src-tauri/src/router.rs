@@ -1106,8 +1106,8 @@ impl ServerSlot {
         }
     }
 
-    /// Only a dead connection or a failed half-open probe can degrade a live
-    /// supervisor. A lone slow call must never end other multiplexed calls.
+    /// Dead connections, exhausted connection attempts and failed half-open probes
+    /// can degrade a live supervisor. Preserve other active multiplexed calls.
     fn degrade(&self, generation: u64, successes: u64, error: &str, probe: bool) -> bool {
         let Some(supervisor) = &self.supervisor else {
             return false;
@@ -4162,7 +4162,12 @@ impl Router {
                     // retries) counts toward the breaker; a normal error response does
                     // not disable the server.
                     if e.is_health_failure() && slot.timeout_health(&e, generation, responses) {
-                        if slot.degrade(generation, successes, &e.to_string(), is_probe) {
+                        // HTTP connect failures do not mark the MCP session closed.
+                        // Once all pre-send connection retries fail, start recovery
+                        // without waiting for another call to trip the breaker.
+                        // degrade still preserves a connection serving other calls.
+                        let recovery_probe = is_probe || matches!(&e, TransportError::Retry { .. });
+                        if slot.degrade(generation, successes, &e.to_string(), recovery_probe) {
                             slot.breaker
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -10891,6 +10896,66 @@ for line in sys.stdin:
         );
         assert!(router.route_call("s__echo", json!({})).is_ok());
         assert_eq!(effects.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn supervisor_retries_an_unreachable_idle_endpoint_without_waiting_for_a_probe() {
+        let _data = crate::registry::DataDirTestEnv::new("supervisor-unreachable-idle-endpoint");
+        for another_call_active in [false, true] {
+            let reconnects = Arc::new(AtomicU64::new(0));
+            let counted = Arc::clone(&reconnects);
+            let mut router = Router::new().with_supervised_launch(
+                mock_server("s"),
+                Arc::new(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok(mock_server("s"))
+                }),
+                ReconnectBackoff {
+                    base: Duration::from_millis(10),
+                    cap: Duration::from_millis(20),
+                },
+            );
+            router.activate_supervisors();
+            let slot = Arc::clone(&router.servers[0]);
+            if another_call_active {
+                slot.handle_calls.fetch_add(1, Ordering::AcqRel);
+            }
+            let result: Result<Value, CallFailure> = router.call_with_retry_typed(
+                &slot,
+                None,
+                false,
+                ReplayPolicy::NoAmbiguousReplay,
+                SlotAccess::Shared,
+                |_| {
+                    Err(TransportError::Retry {
+                        retry_after: None,
+                        message: "Connection refused".into(),
+                    })
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                slot.supervisor.as_ref().unwrap().lock().unwrap().state,
+                if another_call_active {
+                    SupervisorState::Ready
+                } else {
+                    SupervisorState::Backoff
+                },
+                "exhausted pre-send failures should recover only a quiescent endpoint"
+            );
+            if another_call_active {
+                slot.handle_calls.fetch_sub(1, Ordering::AcqRel);
+                assert_eq!(reconnects.load(Ordering::SeqCst), 0);
+            } else {
+                assert!(wait_until(|| {
+                    router.maintain_supervisors();
+                    router.has_ready_reconnects()
+                }));
+                ready_supervisor(&mut router);
+                assert_eq!(reconnects.load(Ordering::SeqCst), 1);
+            }
+            assert!(router.route_call("s__echo", json!({})).is_ok());
+        }
     }
 
     #[test]

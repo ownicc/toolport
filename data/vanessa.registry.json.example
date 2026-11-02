@@ -1,0 +1,25 @@
+{
+  "version": 3,
+  "servers": [
+    {
+      "id": "vanessa",
+      "enabled": true,
+      "name": "Vanessa Automation",
+      "transport": "http",
+      "url": "http://127.0.0.1:9876/mcp",
+      "args": [],
+      "env": [],
+      "source": "manual",
+      "disabledTools": []
+    }
+  ],
+  "profiles": [
+    {
+      "id": "default",
+      "name": "Default",
+      "enabledServerIds": ["vanessa"]
+    }
+  ],
+  "activeProfileId": "default",
+  "discoveryMode": "full"
+}

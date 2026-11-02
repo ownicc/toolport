@@ -155,3 +155,6 @@ calls in flight. Changed servers get a new supervisor and start on their next
 use, or immediately when they have active resource subscriptions. The new
 connection restores those subscriptions. Policy-only edits do not restart
 connections. Fresh catalogs pass the integrity gate before calls can use them.
+
+For a local MCP endpoint tied to a running 1C session, see
+[Vanessa Automation across Enterprise restarts](vanessa.md).

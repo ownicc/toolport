@@ -99,9 +99,14 @@ impl Gateway {
     }
 
     fn start_with_backoff(dir: &Path, base_ms: &str) -> Self {
+        Self::start_as_client(dir, base_ms, "reconnect-test")
+    }
+
+    fn start_as_client(dir: &Path, base_ms: &str, client_name: &str) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_toolport-gateway"))
             .env("TOOLPORT_DATA_DIR", dir)
             .env("TOOLPORT_REGISTRY", dir.join("registry.json"))
+            .env("TOOLPORT_CLIENT_ID", client_name)
             // File vault in the scratch dir: never the OS keychain.
             .env("TOOLPORT_SECRET_KEY", "reconnect-test")
             // Short steps so the schedule fits a test: 300 ms, then one try per watcher tick.
@@ -158,7 +163,7 @@ impl Gateway {
             json!({
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
-                "clientInfo": { "name": "reconnect-test", "version": "1" }
+                "clientInfo": { "name": client_name, "version": "1" }
             }),
         );
         assert!(init.get("result").is_some(), "initialize failed: {init}");
@@ -203,9 +208,13 @@ impl Gateway {
 
     /// The text of a tool result, and whether it is an error.
     fn call(&mut self, name: &str) -> (bool, String) {
+        self.call_with_arguments(name, json!({ "text": "hi" }))
+    }
+
+    fn call_with_arguments(&mut self, name: &str, arguments: Value) -> (bool, String) {
         let response = self.request(
             "tools/call",
-            json!({ "name": name, "arguments": { "text": "hi" } }),
+            json!({ "name": name, "arguments": arguments }),
         );
         if let Some(error) = response.get("error") {
             return (true, error.to_string());
@@ -240,6 +249,242 @@ impl Gateway {
             .iter()
             .any(|note| note["method"] == "notifications/tools/list_changed")
     }
+}
+
+/// Starts with no listener, then models an unavailable application behind an
+/// HTTP endpoint and new sessions. Acknowledgements bound each state change.
+struct RestartableHttp {
+    url: String,
+    control: mpsc::Sender<(u64, mpsc::SyncSender<()>)>,
+    effects: Arc<AtomicU64>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RestartableHttp {
+    fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let (control, commands) = mpsc::channel::<(u64, mpsc::SyncSender<()>)>();
+        let effects = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&effects);
+        let worker = std::thread::spawn(move || {
+            let mut server: Option<tiny_http::Server> = None;
+            let mut generation = 0;
+            loop {
+                match commands.try_recv() {
+                    Ok((next, ready)) => {
+                        if next > 0 && server.is_none() {
+                            server = Some(tiny_http::Server::http(address).unwrap());
+                        }
+                        generation = next;
+                        ready.send(()).unwrap();
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+                let Some(server) = &server else {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                let Some(mut request) = server.recv_timeout(Duration::from_millis(20)).unwrap()
+                else {
+                    continue;
+                };
+                if generation == 0 {
+                    request.respond(tiny_http::Response::empty(503)).unwrap();
+                    continue;
+                }
+                if request.method() != &tiny_http::Method::Post {
+                    request.respond(tiny_http::Response::empty(405)).unwrap();
+                    continue;
+                }
+                let mut text = String::new();
+                request.as_reader().read_to_string(&mut text).unwrap();
+                let body: Value = serde_json::from_str(&text).unwrap();
+                let method = body["method"].as_str().unwrap();
+                let session = format!("session-{generation}");
+                if method != "initialize"
+                    && !request.headers().iter().any(|header| {
+                        header.field.equiv("Mcp-Session-Id") && header.value.as_str() == session
+                    })
+                {
+                    request
+                        .respond(
+                            tiny_http::Response::from_string("Session not found")
+                                .with_status_code(404),
+                        )
+                        .unwrap();
+                    continue;
+                }
+                if method.starts_with("notifications/") {
+                    request.respond(tiny_http::Response::empty(202)).unwrap();
+                    continue;
+                }
+                let result = match method {
+                    "initialize" => json!({
+                        "protocolVersion":"2025-03-26", "capabilities":{"tools":{}},
+                        "serverInfo":{"name":"restartable-http", "version":"1"}
+                    }),
+                    "tools/list" => json!({"tools":[
+                        {"name":"echo", "inputSchema":{"type":"object"}},
+                        {"name":"uncertain", "inputSchema":{"type":"object"}}
+                    ]}),
+                    "tools/call" if body["params"]["name"] == "uncertain" => {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        // The effect happened, but its reply was lost. Replaying
+                        // this request during recovery would perform it twice.
+                        request
+                            .respond(
+                                tiny_http::Response::from_string("").with_header(
+                                    tiny_http::Header::from_bytes(
+                                        "Content-Type",
+                                        "text/event-stream",
+                                    )
+                                    .unwrap(),
+                                ),
+                            )
+                            .unwrap();
+                        continue;
+                    }
+                    "tools/call" => json!({"content":[{"type":"text","text":"hi"}]}),
+                    _ => json!({}),
+                };
+                request
+                    .respond(
+                        tiny_http::Response::from_string(
+                            json!({"jsonrpc":"2.0", "id":body["id"], "result":result}).to_string(),
+                        )
+                        .with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        )
+                        .with_header(
+                            tiny_http::Header::from_bytes("Mcp-Session-Id", session).unwrap(),
+                        ),
+                    )
+                    .unwrap();
+            }
+        });
+        Self {
+            url: format!("http://{address}/mcp"),
+            control,
+            effects,
+            worker: Some(worker),
+        }
+    }
+
+    fn restart(&self, generation: u64) {
+        let (ready, done) = mpsc::sync_channel(0);
+        self.control.send((generation, ready)).unwrap();
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+}
+
+impl Drop for RestartableHttp {
+    fn drop(&mut self) {
+        let (unused, _) = mpsc::channel();
+        drop(std::mem::replace(&mut self.control, unused));
+        let _ = self.worker.take().unwrap().join();
+    }
+}
+
+#[test]
+fn vanessa_registry_example_enables_its_endpoint() {
+    let registry: conduit_lib::registry::Registry =
+        serde_json::from_str(include_str!("../../data/vanessa.registry.json.example")).unwrap();
+    let enabled = registry.enabled_servers();
+    assert_eq!(enabled.len(), 1);
+    assert_eq!(enabled[0].id, "vanessa");
+    assert_eq!(enabled[0].url.as_deref(), Some("http://127.0.0.1:9876/mcp"));
+}
+
+#[test]
+fn codex_keeps_access_when_http_backend_starts_late_and_restarts() {
+    let backend = RestartableHttp::new();
+    let dir = scratch_dir();
+    write_registry(
+        &dir,
+        &[
+            mock_entry("good", &[]),
+            json!({"id":"vanessa", "name":"Vanessa", "transport":"http",
+            "url":backend.url, "args":[], "env":[], "source":"manual", "disabledTools":[]}),
+        ],
+        &["good", "vanessa"],
+    );
+    let mut gateway = Gateway::start_as_client(&dir, "300", "codex");
+    let pid = gateway.child.id();
+    let names = gateway.tool_names();
+    assert!(
+        names.contains(&"toolport_call_tool".to_string()),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(&"toolport_search_tools".to_string()),
+        "{names:?}"
+    );
+    assert_eq!(gateway.call("good__echo"), (false, "hi".into()));
+    assert!(
+        gateway
+            .call_with_arguments(
+                "toolport_call_tool",
+                json!({
+                    "name":"vanessa__echo", "arguments":{"text":"hi"}
+                })
+            )
+            .0
+    );
+
+    backend.restart(1);
+    wait_for("late HTTP backend", Duration::from_secs(30), || {
+        !gateway
+            .call_with_arguments(
+                "toolport_call_tool",
+                json!({
+                    "name":"vanessa__echo", "arguments":{"text":"hi"}
+                }),
+            )
+            .0
+    });
+    let (error, search) = gateway.call_with_arguments(
+        "toolport_search_tools",
+        json!({
+            "query":"vanessa__echo", "server":"vanessa"
+        }),
+    );
+    assert!(!error && search.contains("vanessa__echo"), "{search}");
+    assert!(gateway.tool_names().contains(&"vanessa__echo".to_string()));
+
+    backend.restart(0);
+    assert!(gateway.call("vanessa__echo").0);
+    assert!(
+        gateway.tool_names().contains(&"vanessa__echo".to_string()),
+        "outage lost the catalog"
+    );
+    assert_eq!(gateway.call("good__echo"), (false, "hi".into()));
+    backend.restart(2);
+    wait_for("HTTP backend after outage", Duration::from_secs(30), || {
+        !gateway.call("vanessa__echo").0
+    });
+
+    // A restart can happen entirely between calls. The old session must be
+    // discarded on 404 and future calls must use a newly initialized session.
+    backend.restart(3);
+    assert!(gateway.call("vanessa__echo").0);
+    wait_for("new HTTP session", Duration::from_secs(30), || {
+        !gateway.call("vanessa__echo").0
+    });
+    assert!(gateway.call("vanessa__uncertain").0);
+    wait_for("recovery after lost reply", Duration::from_secs(30), || {
+        !gateway.call("vanessa__echo").0
+    });
+    assert_eq!(
+        backend.effects.load(Ordering::SeqCst),
+        1,
+        "uncertain operation was replayed"
+    );
+    assert_eq!(gateway.child.id(), pid);
+    assert!(gateway.child.try_wait().unwrap().is_none());
 }
 
 impl Drop for Gateway {
