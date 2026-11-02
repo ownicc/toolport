@@ -84,6 +84,31 @@ for headless tests.
 
 On macOS/Linux, see the platform notes in the [troubleshooting guide](docs/troubleshooting.md).
 
+## Local Linux installation
+
+With [just](https://just.systems/) and the build dependencies installed, run:
+
+```sh
+just install
+```
+
+The Tauri tray also needs AppIndicator GTK3 at runtime. On Arch/CachyOS install
+`libayatana-appindicator` (`sudo pacman -S --needed libayatana-appindicator`);
+on Debian/Ubuntu install `libayatana-appindicator3-dev`. `just check-desktop`
+checks this prerequisite before building. Cargo compilation and `ldd` alone
+cannot detect its absence because the tray loads this library dynamically.
+
+This builds the Tauri desktop and gateway in release mode, installs both into
+`~/.local/lib/toolport`, and adds `~/.local/bin/toolport` plus a Toolport application
+menu entry with its icon. Desktop files and icons respect `XDG_DATA_HOME`
+(default `~/.local/share`). No root privileges are needed. Repeat `just install`
+to rebuild and update; restart Toolport afterward to use the new binaries.
+
+Launch Toolport from the application menu or with `~/.local/bin/toolport`.
+Use `just build` to build without installing.
+These recipes use `src-tauri/target` regardless of `CARGO_TARGET_DIR`, matching
+the sidecar staging script so installation always uses the freshly built files.
+
 ## Development workflow
 
 ### What hot-reloads vs what needs a rebuild
