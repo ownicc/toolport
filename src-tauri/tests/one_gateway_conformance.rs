@@ -1112,10 +1112,22 @@ fn kill_daemons(dir: &Path) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        // Windows reuses a pid within seconds, so a descriptor left by a daemon that already
+        // ended could name another test's process. Only a listening endpoint proves it's ours.
         #[cfg(windows)]
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .status();
+        {
+            let listening = descriptor["endpoint"]
+                .as_str()
+                .and_then(|endpoint| endpoint.parse().ok())
+                .is_some_and(|address| {
+                    std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2)).is_ok()
+                });
+            if listening {
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .status();
+            }
+        }
     }
 }
 
@@ -1320,6 +1332,154 @@ fn text_of(result: &Value) -> String {
 // ---------------------------------------------------------------------------
 // Family 1: cold-start dedupe
 // ---------------------------------------------------------------------------
+
+/// The startup trace lines one process wrote to the shared gateway log.
+fn startup_lines(dir: &Path, pid: u32) -> Vec<String> {
+    let marker = format!(" pid={pid}");
+    std::fs::read_to_string(dir.join("gateway.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("startup: ") && line.ends_with(&marker))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn matrix_startup_logs_identify_a_blocked_election_and_keep_rpc_output_clean() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("startup-stage-log");
+    write_registry(&dir, vec![], vec![]);
+    let election = registry::lock_at(&election_lock_base(&dir, &compat_for(&dir)))
+        .expect("hold the real election lock");
+    let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+    let pid = client.child.id().to_string();
+    let events = |pid: &str| {
+        std::fs::read_to_string(dir.join("gateway.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.split_once("startup: ").map(|(_, event)| event))
+            .map(|event| {
+                event
+                    .split_whitespace()
+                    .filter_map(|field| field.split_once('='))
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            })
+            .filter(|event| event.get("pid").is_some_and(|value| value == pid))
+            .collect::<Vec<_>>()
+    };
+    let matches = |event: &std::collections::BTreeMap<String, String>, stage: &str, phase: &str| {
+        event.get("stage").is_some_and(|value| value == stage)
+            && event.get("event").is_some_and(|value| value == phase)
+    };
+    wait_until(
+        || {
+            events(&pid)
+                .iter()
+                .any(|event| matches(event, "election_lock", "start"))
+        },
+        "a persisted start event while the election is blocked",
+        RESPONSE_TIMEOUT,
+    );
+    assert!(
+        !events(&pid)
+            .iter()
+            .any(|event| matches(event, "election_lock", "end")),
+        "the contended stage must remain open until its lock is released"
+    );
+    drop(election);
+
+    let private_name = "startup-log-must-not-record-client-contents";
+    client.initialize(private_name);
+    wait_until(
+        || {
+            events(&pid)
+                .iter()
+                .any(|event| matches(event, "initialize_response", "end"))
+        },
+        "the completed initialization trace",
+        RESPONSE_TIMEOUT,
+    );
+    let startup = events(&pid);
+    let trace = startup[0].get("trace").expect("correlation ID").clone();
+    assert!(trace.parse::<u128>().is_ok());
+    for stage in [
+        "adapter_start",
+        "discovery",
+        "election_lock",
+        "descriptor_lock",
+        "spawn",
+        "readiness",
+        "tcp_connect",
+        "lifetime_open",
+        "first_input",
+        "initialize_headers",
+        "initialize_response",
+    ] {
+        let end = startup
+            .iter()
+            .find(|event| matches(event, stage, "end"))
+            .unwrap_or_else(|| panic!("missing completed {stage} stage"));
+        assert_eq!(end.get("trace"), Some(&trace));
+        assert_eq!(end.get("result").map(String::as_str), Some("ok"));
+        assert!(end.get("elapsed_ms").unwrap().parse::<u128>().is_ok());
+        assert!(startup.iter().any(|start| {
+            matches(start, stage, "start") && start.get("span") == end.get("span")
+        }));
+    }
+    let descriptor = first_descriptor(&dir).expect("published daemon descriptor");
+    let token = descriptor["token"].as_str().expect("daemon bearer");
+    for event in &startup {
+        assert_eq!(event.get("trace"), Some(&trace));
+        assert!(!event.values().any(|value| value.contains(private_name)));
+        assert!(!event.values().any(|value| value.contains(token)));
+    }
+    let startup_count = startup.len();
+    for _ in 0..2 {
+        let reply = client.request("tools/list", json!({}));
+        assert!(reply["result"]["tools"].is_array());
+    }
+    assert_eq!(
+        events(&pid).len(),
+        startup_count,
+        "ordinary RPCs stay quiet"
+    );
+
+    let mut warm = spawn_adapter(&dir, &AdapterOptions::default());
+    warm.initialize("startup-log-warm-client");
+    let warm_pid = warm.child.id().to_string();
+    wait_until(
+        || {
+            events(&warm_pid)
+                .iter()
+                .any(|event| matches(event, "initialize_response", "end"))
+        },
+        "a warm connection's initialization trace",
+        RESPONSE_TIMEOUT,
+    );
+    let warm_events = events(&warm_pid);
+    let warm_trace = warm_events[0].get("trace").expect("warm correlation ID");
+    assert_ne!(warm_trace, &trace);
+    assert!(warm_events
+        .iter()
+        .all(|event| event.get("trace") == Some(warm_trace)));
+    assert!(!warm_events.iter().any(|event| {
+        matches(event, "election_lock", "start") || matches(event, "spawn", "start")
+    }));
+    client.close_stdin();
+    warm.close_stdin();
+    assert!(client.wait_exit(RESPONSE_TIMEOUT).success());
+    assert!(warm.wait_exit(RESPONSE_TIMEOUT).success());
+    // Graceful exit flushes the existing asynchronous logger before this check.
+    assert_eq!(
+        events(&pid).len(),
+        startup_count,
+        "ordinary RPCs stay quiet"
+    );
+    assert_eq!(events(&warm_pid).len(), warm_events.len());
+}
 
 #[test]
 fn matrix_cold_start_twenty_simultaneous_adapters_elect_exactly_one_daemon() {
@@ -1552,6 +1712,205 @@ fn matrix_lifecycle_adapter_eof_releases_the_session_and_lets_the_daemon_exit() 
         first_descriptor(&dir).is_none(),
         "the descriptor outlived the daemon"
     );
+}
+
+#[test]
+fn matrix_lifecycle_eof_drains_pipelined_requests() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("eof-pipeline");
+    write_registry(&dir, vec![], vec![]);
+    let mut client = spawn_adapter(&dir, &AdapterOptions::default());
+    client.initialize("eof-pipeline");
+    for id in 100..116 {
+        client.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"}));
+    }
+    client.close_stdin();
+    let mut replies = std::collections::HashSet::new();
+    while replies.len() < 16 {
+        let response = client.next_message();
+        let Some(id) = response["id"].as_i64() else {
+            continue;
+        };
+        assert!((100..116).contains(&id));
+        assert!(replies.insert(id), "duplicate reply: {response}");
+        assert!(
+            response.get("error").is_none(),
+            "queued reply at EOF: {response}"
+        );
+        assert!(response["result"]["tools"].is_array());
+    }
+    client.wait_exit(Duration::from_secs(20));
+}
+
+#[test]
+fn matrix_lifecycle_idle_recovery_delivers_fresh_catalog_notification() {
+    let _guard = CASE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_fixture, dir) = Fixture::new("idle-recovery-notification");
+    let transcript = dir.join("fresh.jsonl");
+    write_registry(
+        &dir,
+        vec![mock_server_entry("fresh", &transcript, None)],
+        vec![],
+    );
+    let client_id = "matrix-idle-recovery";
+    let mut client = spawn_adapter(
+        &dir,
+        &AdapterOptions {
+            client_id: Some(client_id),
+            startup_catalog_servers: &["fresh"],
+            ..AdapterOptions::default()
+        },
+    );
+    client.initialize(client_id);
+    client.wait_for_tool("__grow", Duration::from_secs(30));
+    assert!(!client
+        .tool_names()
+        .iter()
+        .any(|name| name == "fresh__greet"));
+
+    let session_records = || -> Vec<Value> {
+        std::fs::read_to_string(dir.join("audit.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|row| {
+                row["kind"] == "session" && row["client"] == format!("adapter:{client_id}")
+            })
+            .collect()
+    };
+    wait_until(
+        || {
+            session_records()
+                .iter()
+                .any(|row| row["phase"] == "start" && row["reason"] == "initialize")
+        },
+        "the original adapter session audit record",
+        Duration::from_secs(15),
+    );
+    let original_sessions: Vec<String> = session_records()
+        .iter()
+        .filter_map(|row| row["sessionId"].as_str().map(str::to_string))
+        .collect();
+    let original = wait_for_descriptor(&dir, Duration::from_secs(10));
+    let old_pid = original["pid"].as_u64().expect("original daemon pid");
+    assert_ne!(old_pid, u64::from(std::process::id()));
+    assert_ne!(old_pid, u64::from(client.child.id()));
+    let identity = probe_identity(
+        original["endpoint"].as_str().expect("endpoint"),
+        original["token"].as_str().expect("token"),
+    )
+    .expect("authenticate the fixture daemon before stopping it");
+    assert_eq!(identity["pid"], old_pid);
+    assert_eq!(identity["compat"], original["compat"]);
+
+    // No client request is sent after this point until the fresh notification.
+    kill_daemons(&dir);
+    wait_until(
+        || !pid_alive(old_pid),
+        "the original fixture daemon to exit",
+        Duration::from_secs(20),
+    );
+    let mut replacement_pid = None;
+    wait_until(
+        || {
+            let Some(descriptor) = first_descriptor(&dir) else {
+                return false;
+            };
+            let Some(pid) = descriptor["pid"].as_u64() else {
+                return false;
+            };
+            let log = std::fs::read_to_string(dir.join("gateway.log")).unwrap_or_default();
+            let announced = log.lines().any(|line| {
+                line.contains(&format!("pid={pid} role=daemon"))
+                    && line.contains(
+                        "background build: initial catalog announced; servers=[\"fresh\"]",
+                    )
+            });
+            let records = session_records();
+            let new_records: Vec<&Value> = records
+                .iter()
+                .filter(|row| {
+                    row["sessionId"]
+                        .as_str()
+                        .is_some_and(|id| !original_sessions.iter().any(|original| original == id))
+                })
+                .collect();
+            // Without an adapter lifetime holder, the gateway records each
+            // handshake POST as a sessionless request, including initialize.
+            let reinitialized = new_records
+                .iter()
+                .any(|row| row["phase"] == "start" && row["reason"] == "initialize")
+                || new_records
+                    .iter()
+                    .filter(|row| row["phase"] == "start" && row["reason"] == "sessionless_request")
+                    .filter(|start| {
+                        new_records.iter().any(|end| {
+                            end["sessionId"] == start["sessionId"]
+                                && end["phase"] == "close"
+                                && end["reason"] == "request_complete"
+                        })
+                    })
+                    .count()
+                    >= 2;
+            if pid != old_pid && announced && reinitialized {
+                replacement_pid = Some(pid);
+                true
+            } else {
+                false
+            }
+        },
+        "an idle replacement daemon and reinitialized adapter session",
+        Duration::from_secs(60),
+    );
+    assert_ne!(replacement_pid, Some(old_pid));
+
+    // Both startup builds adopt the mock before announcing their initial
+    // catalogs. They announce only tools/list_changed; the mock has not grown.
+    // A separate client triggers a prompt change without writing to the idle
+    // client, whose server scope remains unchanged across daemon replacement.
+    let mut producer = spawn_adapter(&dir, &AdapterOptions::default());
+    producer.initialize("matrix-idle-recovery-producer");
+    let grow = producer.wait_for_tool("__grow", Duration::from_secs(30));
+    producer.call_tool(&grow, json!({}));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let notification = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "no fresh prompt notification\n{}",
+            client.diagnostics()
+        );
+        let message = client
+            .observed_message(remaining)
+            .unwrap_or_else(|| panic!("no fresh prompt notification\n{}", client.diagnostics()));
+        assert!(
+            message.get("id").is_none(),
+            "unexpected response: {message}"
+        );
+        if message["method"] == "notifications/prompts/list_changed" {
+            break message;
+        }
+    };
+    assert_eq!(notification["jsonrpc"], "2.0");
+    assert!(notification.get("id").is_none());
+    client.wait_for_tool_where(
+        "the newly grown tool after idle recovery",
+        |name| name == "fresh__greet",
+        Duration::from_secs(30),
+    );
+    let client_pid = client.child.id();
+    client.close_stdin();
+    client.wait_exit(Duration::from_secs(20));
+    // Rediscovering the lost daemon is not a second startup.
+    let discovery: Vec<_> = startup_lines(&dir, client_pid)
+        .into_iter()
+        .filter(|line| line.contains(" stage=discovery "))
+        .collect();
+    assert_eq!(discovery.len(), 2, "{discovery:?}");
 }
 
 #[test]
@@ -1925,6 +2284,7 @@ fn matrix_desktop_http_proxy_shares_daemon_and_releases_lease() {
         .stderr(Stdio::inherit())
         .spawn()
         .expect("start lightweight desktop HTTP proxy");
+    let proxy_pid = child.id();
     let mut proxy = HttpProxyChild(child);
     let public_url = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -2034,6 +2394,14 @@ fn matrix_desktop_http_proxy_shares_daemon_and_releases_lease() {
             .retain_status_body(),
         Err(conduit_lib::http_client::Error::Status(401, _))
     ));
+    // The proxy runs discovery for every request and renewal, so it stays out of
+    // the startup trace the adapter writes to this same log.
+    wait_until(
+        || !startup_lines(&dir, adapter.child.id()).is_empty(),
+        "the adapter's startup trace",
+        RESPONSE_TIMEOUT,
+    );
+    assert_eq!(startup_lines(&dir, proxy_pid), Vec::<String>::new());
 }
 
 #[test]

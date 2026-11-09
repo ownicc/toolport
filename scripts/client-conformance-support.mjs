@@ -2,7 +2,16 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { watch } from "node:fs";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
+import { connect } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -20,6 +29,110 @@ export const profiles = JSON.parse(
   await readFile(path.join(repo, "test/client-conformance/profiles.json"), "utf8"),
 ).profiles;
 export const deadlineMs = 20_000;
+// One intentional restart: probe rechecks 8s + election 20s + descriptor lock 5s
+// + ready 10s + lifetime headers 6s + handshake 10s, plus normal RPC 20s.
+// Round 79s to 80s. Ordinary RPCs retain 20s; this is only a fixture budget.
+export const coldRecoveryDeadlineMs = 80_000;
+
+export async function catalog(client, expected, timeoutMs = deadlineMs) {
+  const deadline = performance.now() + timeoutMs;
+  const tools = await client.list(Math.max(1, deadline - performance.now()));
+  if (tools.some((tool) => tool.name === client.spell(expected))) return tools;
+  return changedCatalog(client, expected, deadline);
+}
+
+export async function changedCatalog(
+  client,
+  expected,
+  deadline = performance.now() + deadlineMs,
+) {
+  while (performance.now() < deadline) {
+    await client.notification(
+      "notifications/tools/list_changed",
+      deadline - performance.now(),
+    );
+    const tools = await client.list(Math.max(1, deadline - performance.now()));
+    if (tools.some((tool) => tool.name === client.spell(expected))) return tools;
+  }
+  assert.fail(`${client.profile.id}: missing ${expected} after notifications`);
+}
+
+export async function coldRecoveryCatalog(
+  client,
+  expected,
+  onObservation = async () => {},
+) {
+  const started = performance.now();
+  // Dispatch immediately. Observation never resends or waits for idle recovery.
+  const pending = catalog(client, expected, coldRecoveryDeadlineMs);
+  let observation;
+  let observationError;
+  let pendingElapsedMs;
+  const observe = (state) =>
+    Promise.resolve()
+      .then(() => onObservation(state))
+      .catch((error) => {
+        observationError ??= error;
+      });
+  const timer = setTimeout(() => {
+    pendingElapsedMs = Math.round(performance.now() - started);
+    observation = observe({ phase: "pending", elapsedMs: pendingElapsedMs });
+  }, deadlineMs);
+  let phase = "failed";
+  let result;
+  let requestError;
+  try {
+    const tools = await pending;
+    phase = "completed";
+    result = { tools, elapsedMs: Math.round(performance.now() - started) };
+  } catch (error) {
+    requestError = error;
+  } finally {
+    clearTimeout(timer);
+    const elapsedMs = Math.round(performance.now() - started);
+    if (observation) {
+      await observation;
+      await observe({ phase, elapsedMs, pendingElapsedMs });
+    }
+  }
+  if (phase === "failed") {
+    if (observationError)
+      console.error("cold recovery diagnostics failed:", observationError);
+    throw requestError;
+  }
+  if (observationError) throw observationError;
+  return result;
+}
+
+export async function writeFixtureDiagnostics(fixture, observation) {
+  const dir = path.join(repo, ".verify/client-conformance-failures");
+  await mkdir(dir, { recursive: true });
+  const key = fixture.diagnosticsKey ?? fixture.id;
+  for (const name of ["gateway.log", "downstream.jsonl"]) {
+    try {
+      const raw = await readFile(path.join(fixture.data, name), "utf8");
+      await writeFile(path.join(dir, `${key}-${name}`), raw.slice(-65_536));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  if (observation) {
+    // Exclude descriptors, PIDs, endpoints, tokens, and reply bodies.
+    await writeFile(
+      path.join(dir, `${key}-cold-recovery.json`),
+      JSON.stringify(
+        {
+          profile: fixture.id,
+          phase: observation.phase,
+          elapsedMs: observation.elapsedMs,
+          pendingElapsedMs: observation.pendingElapsedMs,
+        },
+        null,
+        2,
+      ),
+    );
+  }
+}
 
 export function clientInventoryFromSource(source) {
   const definitions = source.match(/^fn defs\(\) -> Vec<ClientDef> \{([\s\S]*?)^\}/m);
@@ -347,11 +460,46 @@ export class Fixture {
     await this.killOwnedPid(pid);
     return pid;
   }
+  // Windows reuses a PID within seconds, so a recorded PID whose process already ended can
+  // belong to another fixture or test. Only signal one that still proves it's ours.
+  async daemonIsOurs(descriptor) {
+    const port = Number(
+      String(descriptor.endpoint ?? "")
+        .split(":")
+        .pop(),
+    );
+    if (process.platform !== "win32" || !port) return true;
+    return new Promise((resolve) => {
+      const socket = connect(port, "127.0.0.1");
+      socket.setTimeout(2_000);
+      const finish = (listening) => {
+        socket.destroy();
+        resolve(listening);
+      };
+      socket.once("connect", () => finish(true));
+      socket.once("timeout", () => finish(false));
+      socket.once("error", () => finish(false));
+    });
+  }
+  async mockIsOurs(pid) {
+    if (process.platform !== "win32") return true;
+    try {
+      // The mock holds this file open for life, so it can only be deleted once the mock ended.
+      await unlink(path.join(this.data, `mock.pid.${pid}.alive`));
+      return false;
+    } catch (error) {
+      if (["EBUSY", "EPERM", "EACCES"].includes(error.code)) return true;
+      // Nothing recorded this PID's liveness, as when a test wrote the file by hand.
+      if (error.code === "ENOENT") return true;
+      throw error;
+    }
+  }
   async close() {
     await Promise.all(this.clients.map((c) => stop(c.child)));
     // Stop the producers first, then consume every published mock/wiretap PID.
-    for (const descriptor of await this.descriptors())
-      await this.killOwnedPid(descriptor.pid);
+    for (const descriptor of await this.descriptors()) {
+      if (await this.daemonIsOurs(descriptor)) await this.killOwnedPid(descriptor.pid);
+    }
     for (const name of ["wiretap.pid", "mock.pid"]) {
       let pids;
       try {
@@ -360,8 +508,10 @@ export class Fixture {
         if (error.code === "ENOENT") continue;
         throw error;
       }
-      for (const pid of new Set(pids.trim().split(/\s+/).filter(Boolean).map(Number)))
+      for (const pid of new Set(pids.trim().split(/\s+/).filter(Boolean).map(Number))) {
+        if (name === "mock.pid" && !(await this.mockIsOurs(pid))) continue;
         await this.killOwnedPid(pid);
+      }
     }
     await rm(this.home, {
       recursive: true,

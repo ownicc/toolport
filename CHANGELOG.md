@@ -6,6 +6,97 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [2.3.4] - 2026-11-08
+
+Toolport 2.3.4 keeps your comments and layout when it edits Codex and Grok Build
+configs, and keeps those configs valid when a server switches between a command
+and a URL.
+
+If you are on Toolport 1.24.x, this is also your update to Toolport 2. Read the
+[upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
+before updating.
+
+### Fixed
+
+- Editing a server in a TOML config (Codex, Grok Build) no longer drops the comment
+  above the next section. Unknown settings, formatting and comments on keys,
+  arguments and environment values stay as they were. Thanks @1llum1n4t1s. (#1315)
+- Moving servers into Toolport and restoring them no longer duplicates comments or
+  puts entries back outside their BEGIN/END blocks after you edit the file. (#1315)
+- Switching a server between a command and a URL now removes the other transport's
+  settings, which Codex refuses to load. (#1315)
+
+## [2.3.3] - 2026-11-03
+
+Toolport 2.3.3 fixes the Servers page getting stuck on Initializing or Installing,
+and local servers going Unreachable after the npm cache is cleared. It also updates
+the in-app updater.
+
+If you are on Toolport 1.24.x, this is also your update to Toolport 2. Read the
+[upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
+before updating.
+
+### Security
+
+- Updated the Tauri updater so it no longer depends on zip 4 (RUSTSEC-2026-0429).
+  (#1303)
+
+### Fixed
+
+- The Servers page now checks every enabled server. Before, it only checked servers
+  in the Default access set, so the rest stayed on Initializing or Installing and
+  Refresh could not finish. (#1305, #1306)
+- Clearing the npm cache no longer breaks running npx servers. The gateway kept
+  launching a path it remembered, and every start failed until it restarted. It now
+  falls back to npx, which reinstalls the package. (#1306)
+- Servers with a secret now report their exit status when they stop, instead of one
+  generic error. Their output stays hidden. (#1306)
+- Ctrl+R rechecks servers on the GTK Servers page, as the refresh button says. (#1306)
+- Programs started from the AppImage no longer pick up its bundled GIO modules. (#1308)
+
+## [2.3.2] - 2026-11-02
+
+Toolport 2.3.2 lets idle clients recover on their own after the shared gateway
+stops, and keeps OAuth servers' cached tools across token refreshes. It also
+fixes process checks on Windows, adds agent-qa to the server catalog and updates
+dependencies with security fixes.
+
+If you are on Toolport 1.24.x, this is also your update to Toolport 2. Read the
+[upgrade guide](https://github.com/btsouth/toolport/blob/main/docs/migration.md)
+before updating.
+
+### Added
+
+- agent-qa, for natural-language web and mobile testing, is in the catalog under
+  Local tools. Thanks @pranshuchittora. (#1283)
+- `gateway.log` now records how long each stage of a stdio client's connection
+  took, so a client that hits its startup deadline shows what it was waiting
+  for. It records fixed stage names and timings, never credentials or request
+  contents. Thanks @1llum1n4t1s. (#1299)
+- The gateway container image now lists its Rust crates, so image scanners can
+  see them. Thanks @TechLuddite. (#1292)
+
+### Security
+
+- Updated tokio for RUSTSEC-2026-0386. Thanks @TechLuddite. (#1294)
+- Updated plist so quick-xml moves past RUSTSEC-2026-0194 and RUSTSEC-2026-0195.
+  Thanks @TechLuddite. (#1293)
+- Updated candle so the gateway uses zip 9 instead of a version with open
+  advisories. (#1295)
+
+### Fixed
+
+- An idle stdio client now recovers its session and notifications after the
+  shared gateway stops, without waiting for its next request. Restarts back off
+  from 5 seconds up to 60 seconds. Thanks @1llum1n4t1s. (#1289)
+- OAuth servers keep their cached tool list when their token refreshes. Before,
+  almost every cold start missed the cache. (#1296)
+- On Windows, a process that has exited no longer counts as running because
+  another process still holds a handle to it. Daemon run tracking and unclean
+  exit reports now work on Windows too. Thanks @1llum1n4t1s. (#1288, #1290)
+- Translations no longer contain hidden zero-width characters, and CI now rejects
+  them. Thanks @TechLuddite. (#1291)
+
 ## [2.3.1] - 2026-10-24
 
 Toolport 2.3.1 holds a destructive tool for review at Ask when its server stops
