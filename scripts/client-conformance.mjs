@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { readFile, mkdir, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
+import { availableParallelism } from "node:os";
 import path from "node:path";
 import {
   Fixture,
@@ -11,6 +12,10 @@ import {
   failed,
   textOf,
   deadlineMs,
+  catalog,
+  changedCatalog,
+  coldRecoveryCatalog,
+  writeFixtureDiagnostics,
   stop,
   waitExit,
 } from "./client-conformance-support.mjs";
@@ -22,10 +27,16 @@ assert.deepEqual(
   [...inventory].sort(),
   "client inventory changed; research and add its profile",
 );
-let active;
+const active = new Set();
+const starting = new Set();
+let stopping = false;
+let nextDiagnostics = 0;
 for (const signal of ["SIGINT", "SIGTERM"])
-  process.once(signal, () => {
-    (active?.close() || Promise.resolve()).finally(() => process.exit(1));
+  process.once(signal, async () => {
+    stopping = true;
+    await Promise.allSettled([...starting]);
+    await Promise.allSettled([...active].map((fixture) => fixture.close()));
+    process.exit(1);
   });
 let checks = 0;
 const pass = (message) => {
@@ -35,50 +46,47 @@ const pass = (message) => {
 const success = (reply) => assert(!failed(reply), JSON.stringify(reply).slice(0, 2_000));
 
 async function withFixture(profile, full, run) {
-  active = await Fixture.create(profile.id, { full });
+  const creating = Fixture.create(profile.id, { full }).then((created) => {
+    active.add(created);
+    return created;
+  });
+  starting.add(creating);
+  const fixture = await creating.finally(() => starting.delete(creating));
+  // The signal handler closes every active fixture, including this one.
+  if (stopping) return;
+  // A profile and its variants share an id, and may fail at the same time.
+  fixture.diagnosticsKey = `${profile.id}-${++nextDiagnostics}`;
   try {
-    await run(active, active.client(profile));
+    await run(fixture, fixture.client(profile));
   } catch (error) {
-    const dir = path.join(repo, ".verify/client-conformance-failures");
-    await mkdir(dir, { recursive: true });
-    for (const name of ["gateway.log", "downstream.jsonl"]) {
-      try {
-        const raw = await readFile(path.join(active.data, name), "utf8");
-        await writeFile(path.join(dir, `${profile.id}-${name}`), raw.slice(-65_536));
-      } catch (e) {
-        if (e.code !== "ENOENT") throw e;
-      }
-    }
+    await writeFixtureDiagnostics(fixture);
     throw error;
   } finally {
-    await active.close();
-    active = undefined;
+    await fixture.close();
+    active.delete(fixture);
   }
 }
 
-async function catalog(client, expected) {
-  const deadline = performance.now() + deadlineMs;
-  const tools = await client.list();
-  if (tools.some((t) => t.name === client.spell(expected))) return tools;
-  return changedCatalog(client, expected, deadline);
-}
-
-async function changedCatalog(
-  client,
-  expected,
-  deadline = performance.now() + deadlineMs,
-) {
-  // Startup and grow can each emit a valid event. Re-list for every event
-  // under one deadline until the changed entry arrives.
-  while (performance.now() < deadline) {
-    await client.notification(
-      "notifications/tools/list_changed",
-      deadline - performance.now(),
-    );
-    const refreshed = await client.list(Math.max(1, deadline - performance.now()));
-    if (refreshed.some((t) => t.name === client.spell(expected))) return refreshed;
-  }
-  assert.fail(`${client.profile.id}: missing ${expected} after notifications`);
+// Every fixture has its own home, daemon and downstream, and most of a scenario is
+// waiting on them. Stop starting new scenarios after the first failure.
+async function inParallel(items, run) {
+  const queue = [...items];
+  const errors = [];
+  // Windows starts processes more slowly, and width 8 overloaded its 4 vCPU runner.
+  const width =
+    process.platform === "win32" ? 4 : Math.min(8, availableParallelism() * 2);
+  await Promise.all(
+    Array.from({ length: width }, async () => {
+      while (queue.length > 0 && errors.length === 0 && !stopping) {
+        try {
+          await run(queue.shift());
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+    }),
+  );
+  if (errors.length > 0) throw errors[0];
 }
 
 async function baseline(profile) {
@@ -263,25 +271,29 @@ async function replay(profile) {
     );
     await fixture.killDaemon();
     assert(failed(await inflight));
-    await catalog(client, "mock__echo");
+    const recovery = await coldRecoveryCatalog(client, "mock__echo", (state) =>
+      writeFixtureDiagnostics(fixture, state),
+    );
     success(await client.call("mock__echo", { text: "after daemon restart" }));
     const sleeps = (await fixture.records()).filter(
       (r) => r.method === "tools/call" && r.params.name === "sleep",
     );
     assert.equal(sleeps.length, 2, "inflight call was replayed or never dispatched");
-    pass(`${profile.id}: daemon restart mid-session without replay`);
+    pass(
+      `${profile.id}: daemon restart mid-session without replay (${recovery.elapsedMs} ms)`,
+    );
   });
 }
 
 try {
-  for (const profile of profiles) await baseline(profile);
+  await inParallel(profiles, baseline);
   const captures = profiles
     .filter((p) => p.initialize)
     .flatMap((profile) => [
       profile,
       ...(profile.variants || []).map((variant) => ({ ...profile, ...variant })),
     ]);
-  for (const profile of captures) await replay(profile);
+  await inParallel(captures, replay);
   const codex = profiles.find((p) => p.id === "codex");
   const claude = profiles.find((p) => p.id === "claude-code");
   await withFixture(codex, true, async (fixture, first) => {
