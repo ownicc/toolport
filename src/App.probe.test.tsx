@@ -218,6 +218,160 @@ describe("App health visibility", () => {
     expect(screen.queryByRole("status", { name: /^Ready,/i })).not.toBeInTheDocument();
   });
 
+  it("shows a locked keyring as locked, and only a Retry may ask to unlock it", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    getRegistry.mockResolvedValue({
+      version: 3,
+      servers: [
+        {
+          id: "server-1",
+          enabled: true,
+          name: "Vaulted server",
+          transport: "stdio",
+          command: "example",
+          args: [],
+          env: [{ key: "TOKEN", secret: true }],
+          url: null,
+          source: "manual",
+        },
+      ],
+      profiles: [{ id: "default", name: "Default", enabledServerIds: ["server-1"] }],
+      activeProfileId: "default",
+    });
+    probeServers.mockResolvedValue([
+      {
+        serverId: "server-1",
+        ok: false,
+        toolCount: 0,
+        error: "keyring locked",
+        authRequired: false,
+        keyringLocked: true,
+      },
+    ]);
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("Unlock your keyring, then choose Retry."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/couldn't start/i)).not.toBeInTheDocument();
+    // The row's chip: waiting on the user (warning), not failing (destructive).
+    const chip = screen
+      .getAllByText("Keyring locked")
+      .map((node) => node.closest("[data-slot='badge']"))
+      .find(Boolean);
+    expect(chip).toHaveAttribute("data-variant", "warning");
+    expect(probeServers).toHaveBeenCalledWith(false);
+    expect(probeServers).not.toHaveBeenCalledWith(true);
+
+    await userEvent.click(screen.getByRole("button", { name: /Retry/ }));
+    await waitFor(() => expect(probeServers).toHaveBeenCalledWith(true));
+  });
+
+  it("names servers waiting for the keyring as GTK does, not as servers that couldn't start", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    const entry = (id: string, name: string) => ({
+      id,
+      enabled: true,
+      name,
+      transport: "stdio",
+      command: "example",
+      args: [],
+      env: [{ key: "TOKEN", secret: true }],
+      url: null,
+      source: "manual",
+    });
+    getRegistry.mockResolvedValue({
+      version: 3,
+      servers: [
+        entry("signin", "Needs sign-in server"),
+        entry("vault", "Vaulted server"),
+      ],
+      profiles: [
+        { id: "default", name: "Default", enabledServerIds: ["signin", "vault"] },
+      ],
+      activeProfileId: "default",
+    });
+    probeServers.mockResolvedValue([
+      {
+        serverId: "signin",
+        ok: false,
+        toolCount: 0,
+        error: "401",
+        authRequired: true,
+        keyringLocked: false,
+      },
+      {
+        serverId: "vault",
+        ok: false,
+        toolCount: 0,
+        error: "keyring locked",
+        authRequired: false,
+        keyringLocked: true,
+      },
+    ]);
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("1 needs sign-in · 1 waiting for the keyring"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("2 servers need a quick check")).toBeInTheDocument();
+    expect(screen.queryByText(/couldn't start/i)).not.toBeInTheDocument();
+  });
+
+  it("asks to unlock on Refresh and Ctrl+R, even queued behind the window's own probe", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    getRegistry.mockResolvedValue({
+      version: 3,
+      servers: [
+        {
+          id: "server-1",
+          enabled: true,
+          name: "Vaulted server",
+          transport: "stdio",
+          command: "example",
+          args: [],
+          env: [{ key: "TOKEN", secret: true }],
+          url: null,
+          source: "manual",
+        },
+      ],
+      profiles: [{ id: "default", name: "Default", enabledServerIds: ["server-1"] }],
+      activeProfileId: "default",
+    });
+    const locked = [
+      {
+        serverId: "server-1",
+        ok: false,
+        toolCount: 0,
+        error: "keyring locked",
+        authRequired: false,
+        keyringLocked: true,
+      },
+    ];
+    // The window's own probe is still running when the user refreshes.
+    let finishAutomatic: (value: ProbeResult[]) => void = () => {};
+    probeServers.mockImplementationOnce(
+      () => new Promise<ProbeResult[]>((resolve) => (finishAutomatic = resolve)),
+    );
+    probeServers.mockResolvedValue(locked);
+    const user = userEvent.setup();
+
+    render(<App />);
+    await waitFor(() => expect(probeServers).toHaveBeenCalledWith(false));
+
+    await user.click(await screen.findByRole("button", { name: "Check servers again" }));
+    act(() => finishAutomatic(locked));
+    await waitFor(() => expect(probeServers).toHaveBeenCalledTimes(2));
+    expect(probeServers).toHaveBeenLastCalledWith(true);
+
+    probeServers.mockClear();
+    await user.keyboard("{Control>}r{/Control}");
+    await waitFor(() => expect(probeServers).toHaveBeenCalledWith(true));
+    expect(probeServers).not.toHaveBeenCalledWith(false);
+  });
+
   it("drops stale health when a server is re-enabled", async () => {
     localStorage.setItem("toolport.onboarded", "1");
     const server = {
@@ -263,12 +417,12 @@ describe("App health visibility", () => {
     expect(
       await screen.findByRole("status", { name: /^Ready, 1 tool$/i }),
     ).toBeInTheDocument();
-    await userEvent.click(screen.getByLabelText("Toggle Example"));
+    await userEvent.click(screen.getByLabelText(/^(Enable|Disable) Example$/));
     await waitFor(() =>
       expect(setServerEnabled).toHaveBeenCalledWith("default", "server-1", false, false),
     );
 
-    await userEvent.click(screen.getByLabelText("Toggle Example"));
+    await userEvent.click(screen.getByLabelText(/^(Enable|Disable) Example$/));
 
     expect(
       await screen.findByRole("status", { name: "Checking connection" }),
@@ -324,12 +478,16 @@ describe("App health visibility", () => {
     expect(
       await screen.findByRole("status", { name: /^Ready, 1 tool$/i }),
     ).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "More actions" }));
-    await userEvent.click(screen.getByText("Disable all"));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Import and server actions" }),
+    );
+    await userEvent.click(screen.getByText("Disable all servers"));
     await waitFor(() => expect(setAllEnabled).toHaveBeenCalledWith("default", false));
 
-    await userEvent.click(screen.getByRole("button", { name: "More actions" }));
-    await userEvent.click(screen.getByText("Enable all"));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Import and server actions" }),
+    );
+    await userEvent.click(screen.getByText("Enable all reviewed servers"));
 
     expect(
       await screen.findByRole("status", { name: "Checking connection" }),
@@ -417,17 +575,23 @@ describe("server list stability and automatic prompts", () => {
       }),
     );
     render(<App />);
-    await screen.findByRole("switch", { name: "Toggle Alpha" });
+    await screen.findByRole("switch", { name: /^(Enable|Disable) Alpha$/ });
     const order = () =>
-      screen.getAllByRole("switch").map((row) => row.getAttribute("aria-label"));
+      screen
+        .getAllByRole("switch")
+        .map((row) => row.getAttribute("aria-label")?.replace(/^(Enable|Disable) /, ""));
     const before = order();
-    await userEvent.click(screen.getByRole("switch", { name: "Toggle Alpha" }));
+    await userEvent.click(
+      screen.getByRole("switch", { name: /^(Enable|Disable) Alpha$/ }),
+    );
     await waitFor(() => expect(setServerEnabled).toHaveBeenCalled());
     await waitFor(() =>
-      expect(screen.getByRole("switch", { name: "Toggle Alpha" })).toBeChecked(),
+      expect(
+        screen.getByRole("switch", { name: /^(Enable|Disable) Alpha$/ }),
+      ).toBeChecked(),
     );
     expect(order()).toEqual(before);
-    expect(before).toEqual(["Toggle Alpha", "Toggle Beta", "Toggle Zulu"]);
+    expect(before).toEqual(["Alpha", "Beta", "Zulu"]);
   });
   it("never asks for a star after finishing onboarding or returning", async () => {
     probeServers.mockResolvedValue([]);

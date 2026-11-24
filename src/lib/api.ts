@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type {
   AuditEntry,
   ClientActivity,
@@ -87,6 +88,8 @@ export interface SecurityEvent {
   new_fp?: string;
   /** Captured definition requires review in Settings before bound approval. */
   review_required?: boolean;
+  /** Held by a pending pin whose new definition is not captured yet. */
+  pending_capture?: boolean;
   /** Older unblocked records without a captured fingerprint, shown in history. */
   historical?: boolean;
   parameters?: { added: string[]; removed: string[]; changed: string[] };
@@ -119,6 +122,19 @@ export function getSecurityEvents(limit = 100): Promise<SecurityEvent[]> {
   return invoke<SecurityEvent[]>("get_security_events", { limit });
 }
 
+/** What Activity says about Safety (`integrity::activity_safety`): whether tool
+ * changes ask for review (true when the registry cannot be read) and whether Safety
+ * Off holds nothing. */
+export interface ActivitySafety {
+  toolChangeReviews: boolean;
+  blocksNothing: boolean;
+  /** An authoritative registry read found reviews on: Activity may say protection is active. */
+  reviewsConfirmed: boolean;
+}
+export function getActivitySafety(): Promise<ActivitySafety> {
+  return invoke<ActivitySafety>("activity_safety");
+}
+
 /** Net cl100k_base savings, exact MCP bytes, and separate historical estimates. */
 export function getSavingsSummary(): Promise<SavingsSummary> {
   return invoke<SavingsSummary>("savings_summary");
@@ -129,15 +145,23 @@ export function gatherDiagnostics(): Promise<string> {
   return invoke<string>("gather_diagnostics");
 }
 
-/** Connect to each enabled server and report health + tool count. */
-export function probeServers(): Promise<ProbeResult[]> {
-  return invoke<ProbeResult[]>("probe_servers");
+/** Connect to each enabled server and report health + tool count. Only an
+ * `interactive` check (a Refresh or Retry the user chose) may ask to unlock the
+ * keyring; otherwise a server that keeps values in a locked one says so. */
+export function probeServers(interactive = false): Promise<ProbeResult[]> {
+  return invoke<ProbeResult[]>("probe_servers", { interactive });
 }
 
 /** Connect to a (possibly unsaved) server entry to verify it works before
  * saving. Typed secret values ride in on `entry.env`; nothing is persisted. */
 export function testServer(entry: ServerEntry): Promise<ProbeResult> {
   return invoke<ProbeResult>("test_server", { entry });
+}
+
+/** Test a saved server from its saved definition, bounded by the probe timeout
+ * (the GTK row menu's check). Unsaved entries use `testServer`. */
+export function probeRegistered(serverId: string): Promise<ProbeResult> {
+  return invoke<ProbeResult>("probe_registered", { serverId });
 }
 
 /** Result of registering an HTTP-bridge client: the updated registry plus the
@@ -163,13 +187,36 @@ export function listServerTools(serverId: string): Promise<McpTool[]> {
   return invoke<McpTool[]>("list_server_tools", { serverId });
 }
 
-/** Invoke one tool on a server and return its raw MCP result. */
+/**
+ * Invoke one tool on a server and return its raw MCP result. With a `runId`,
+ * the Run can be cancelled with {@link cancelToolCall} and reports its phases
+ * through {@link onToolRunProgress}.
+ */
 export function callTool(
   serverId: string,
   tool: string,
   args: Record<string, unknown>,
+  runId?: string,
 ): Promise<ToolCallResult> {
-  return invoke<ToolCallResult>("call_tool", { serverId, tool, arguments: args });
+  return invoke<ToolCallResult>("call_tool", { serverId, tool, arguments: args, runId });
+}
+
+/** Cancel a Tools tab Run, including one still waiting for its server to start. */
+export function cancelToolCall(runId: string): Promise<void> {
+  return invoke<void>("cancel_tool_call", { runId });
+}
+
+/** A Tools tab Run's phase: the gateway is starting its server, or has started it. */
+export interface ToolRunProgress {
+  runId: string;
+  phase: "starting" | "started";
+}
+
+/** Listen for Tools tab Run phases. Resolves to the unlisten function. */
+export function onToolRunProgress(
+  handler: (progress: ToolRunProgress) => void,
+): Promise<() => void> {
+  return listen<ToolRunProgress>("tool-run-progress", (event) => handler(event.payload));
 }
 
 /** List the resources one server advertises (connects on demand). Server > Tools. */
@@ -408,6 +455,8 @@ export interface HttpBridgeStatus {
   port: number | null;
   url: string | null;
   token: string | null;
+  /** Left on, and waiting for the keyring to unlock before it starts. */
+  keyringLocked?: boolean;
 }
 
 /** Start the supervised toolport-gateway HTTP/OpenAPI server (Open WebUI etc.). */
@@ -418,6 +467,11 @@ export function startHttpBridge(port?: number): Promise<HttpBridgeStatus> {
 /** Stop the supervised HTTP/OpenAPI server. */
 export function stopHttpBridge(): Promise<HttpBridgeStatus> {
   return invoke<HttpBridgeStatus>("stop_http_bridge");
+}
+
+/** The user's Retry on an endpoint waiting for the keyring; may ask to unlock it. */
+export function retryHttpBridge(): Promise<HttpBridgeStatus> {
+  return invoke<HttpBridgeStatus>("retry_http_bridge");
 }
 
 /** Current HTTP/OpenAPI bridge status (reaps the child if it exited). */
@@ -683,6 +737,101 @@ export function installGateway(
   });
 }
 
+export interface ClientRecovery {
+  id: string;
+  clientId: string;
+  clientName: string;
+  path: string;
+  backupPath: string;
+  missing: { server: string; key: string }[];
+  dismissed: boolean;
+  message: string;
+  description: string;
+  valueLines: string[];
+  discardValues: string[];
+  error: string | null;
+  canDiscard: boolean;
+  /** The recovery file itself cannot be read; Discard deletes only that file. */
+  canDiscardFile?: boolean;
+  /** False while a started Discard must be finished; restoration is refused then. */
+  canRetry: boolean;
+  /** A confirmed Discard already started; only "Finish discarding" is offered. */
+  discardStarted: boolean;
+  /** Backend label for the Discard action ("Discard these saved values" or "Finish discarding"). */
+  discardAction: string;
+  cleanup: boolean;
+  instructions: string;
+  retention: string;
+  details: string;
+}
+
+/** Exact inventory the user confirms. The manifest token is compared before deletion. */
+export interface DiscardConfirmation {
+  manifest: string;
+  heading: string;
+  description: string;
+  /** One bounded list: "Value: …" and "Backup file: …" lines. */
+  lines: string[];
+  location: string;
+  actionLabel: string;
+}
+
+/** Read-only inventory after an error row's Retry, classified by the backend. */
+export interface RecoveryListingUpdate {
+  rows: ClientRecovery[];
+  /** Row whose Retry receives focus (the same error, or its replacement). */
+  focusId: string | null;
+  /** Neutral result only when the old record is truly gone with no related error. */
+  message: string | null;
+}
+
+export function listClientRecoveries(): Promise<ClientRecovery[]> {
+  return invoke<ClientRecovery[]>("list_client_recoveries");
+}
+
+export interface RecoveryAttempt {
+  id: string;
+  clientId: string;
+  clientName: string;
+  restored: number;
+  accounted: number;
+  remaining: number;
+  message: string;
+  pending: ClientRecovery | null;
+  /** Client configs waiting for the keyring were refreshed during this Retry. */
+  refreshed: boolean;
+}
+export function retryClientRecovery(id: string): Promise<RecoveryAttempt> {
+  return invoke<RecoveryAttempt>("retry_client_recovery", { id });
+}
+/** Lazy: reads recovery files only, never the credential store. */
+export function prepareClientRecoveryDiscard(id: string): Promise<DiscardConfirmation> {
+  return invoke<DiscardConfirmation>("prepare_client_recovery_discard", { id });
+}
+/** Deletes only the confirmed manifest; resolves with the shared success message. */
+export function discardClientRecovery(id: string, manifest: string): Promise<string> {
+  return invoke<string>("discard_client_recovery", { id, manifest });
+}
+export function refreshClientRecoveryNotice(
+  previousId: string,
+  clientId: string,
+  backupPath: string,
+): Promise<RecoveryListingUpdate> {
+  return invoke<RecoveryListingUpdate>("refresh_client_recovery_notice", {
+    previousId,
+    clientId,
+    backupPath,
+  });
+}
+/** Explicit Scan: noninteractive credential checks, status metadata only. */
+export function refreshClientRecoveryStatus(): Promise<void> {
+  return invoke<void>("refresh_client_recovery_status");
+}
+
+export function dismissClientRecovery(id: string, dismissed: boolean): Promise<void> {
+  return invoke<void>("dismiss_client_recovery", { id, dismissed });
+}
+
 /** Remove the Toolport gateway from a client's config. */
 export function uninstallGateway(clientId: string): Promise<WriteOutcome> {
   return invoke<WriteOutcome>("uninstall_gateway", { clientId });
@@ -700,6 +849,7 @@ export function migrateClient(
   revision = "",
   secretChoices?: Record<string, Record<string, boolean>>,
   credentialInputs?: Record<string, Record<string, string>>,
+  quiet = false,
 ): Promise<MigrateResult> {
   return invoke<MigrateResult>("migrate_client", {
     clientId,
@@ -709,6 +859,7 @@ export function migrateClient(
     credentialInputs,
     profile: profile ?? null,
     force: force ?? false,
+    quiet,
   });
 }
 
@@ -886,9 +1037,10 @@ export function takePendingTrayApprovals(): Promise<boolean> {
   return invoke<boolean>("take_pending_tray_approvals");
 }
 
-/** Import a shared setup, adding servers not already present. */
-export function importConfig(json: string): Promise<Registry> {
-  return invoke<Registry>("import_config", { json });
+/** Import a shared setup, adding servers not already present. `selected` limits it
+ * to the reviewed server names the user kept checked. */
+export function importConfig(json: string, selected?: string[]): Promise<Registry> {
+  return invoke<Registry>("import_config", { json, selected });
 }
 
 /** Read a shared-setup file from disk (path from an open dialog), size-capped. */
@@ -949,6 +1101,18 @@ export function parseServerSnippet(text: string): Promise<ParsedSnippetServer[]>
 
 export function addServer(entry: ServerEntry): Promise<Registry> {
   return invoke<Registry>("add_server", { entry });
+}
+
+/**
+ * Add a server from the Add server dialog in one step: its values (secret ones
+ * included), references and launch inputs are saved together or not at all.
+ * `declaredWithoutValue` lists the keys saved without a value; the server stays
+ * off until they have one.
+ */
+export function addServerWithRows(
+  entry: ServerEntry,
+): Promise<{ registry: Registry; declaredWithoutValue: string[] }> {
+  return invoke("add_server_with_rows", { entry });
 }
 
 /** Add a catalog entry as a registry server (the user vaults any keys after). */
@@ -1080,10 +1244,23 @@ export function disconnectAllClients(): Promise<DisconnectResult[]> {
   return invoke("disconnect_all_clients");
 }
 
+/** `quiet`: a Connect all step after the keyring stayed locked; nothing in it can ask to
+ * unlock the keyring (the backend's `connect_step`). */
 export function previewClientSetup(
   clientId: string,
+  quiet = false,
 ): Promise<import("@/lib/types").ClientSetupReview> {
-  return invoke("preview_client_setup", { clientId });
+  return invoke("preview_client_setup", { clientId, quiet });
+}
+
+/** Whether a failed Connect all step left the keyring locked. Never asks to unlock. */
+export function keyringLockedAfter(error: string): Promise<boolean> {
+  return invoke("keyring_locked_after", { error });
+}
+
+/** The client settings a connect or reset adds to Toolport's entry, as TOML lines. */
+export function previewGatewaySettings(clientId: string): Promise<string[]> {
+  return invoke("preview_gateway_settings", { clientId });
 }
 
 export function addSnippetServers(
@@ -1104,6 +1281,16 @@ export function addSnippetServers(
 }
 
 /** Recent privacy-safe session summaries, capped by the backend. */
+/** A token that changes when T3 Code's settings change; null when there are none. */
+export function t3CodeRevision(): Promise<string | null> {
+  return invoke<string | null>("t3_code_revision");
+}
+
+/** T3 Code instances Toolport cannot connect, with why, for the T3 Code card. */
+export function t3CodeOtherInstances(): Promise<import("@/lib/types").T3CodeOther[]> {
+  return invoke("t3_code_other_instances");
+}
+
 export function getClientSessions(): Promise<ClientActivity[]> {
   const sinceMs = new Date().setHours(0, 0, 0, 0);
   return invoke<ClientActivity[]>("get_client_sessions", { sinceMs });

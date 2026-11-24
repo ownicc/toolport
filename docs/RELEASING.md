@@ -22,7 +22,9 @@ Releases are built by CI on a version tag (`.github/workflows/release.yml`).
      to `SKIP` until the tag archive exists, then pin the real digest before
      dispatching the Arch repository workflow below)
    - `CHANGELOG.md`; move `[Unreleased]` entries into a dated section
-   - `server.json` only when publishing a matching standalone gateway package
+   - `server.json` (`version` and the `ghcr.io/btsouth/toolport-gateway:vX.Y.Z` image tag);
+     `scripts/check-release-version.mjs` and `src/test/mcp-registry-server.test.ts`
+     fail if either drifts
    - `scripts/install.ps1` / `scripts/install.sh` only if you changed them, in which
      case also move `INSTALL_SCRIPTS_REF` in the site repo's `worker/index.js`, since
      `toolport.app/install.*` redirects to a pinned commit and will otherwise keep
@@ -46,6 +48,12 @@ CI builds installers for **Windows** (NSIS), **macOS** (dmg), and **Linux**
 and attaches them to a **draft** release titled `Toolport vX.Y.Z` whose body is the
 changelog section. Review the draft, then click **Publish**.
 
+The **official MCP registry** lists the gateway as `io.github.btsouth/toolport`. After a
+stable tag pushes its GHCR image, the `list on MCP registry` job in `docker-publish.yml`
+checks the image's `io.modelcontextprotocol.server.name` label and publishes `server.json`
+over GitHub OIDC. Nothing waits on it; to retry, dispatch `docker-publish.yml` with
+`registry_tag=vX.Y.Z`.
+
 ## 2.0 staged rollout
 
 Publish 2.0.0 for manual installation first. Hold the 1.x in-app update offer
@@ -55,7 +63,7 @@ Keep 1.24.x available and provide security fixes for three months after 2.0.0.
 This is release policy, not an automatic workflow delay. The Tauri endpoint is
 `releases/latest/download/latest.json`; making 2.0.0 Latest with that asset
 immediately offers it to Windows, macOS and AppImage users. Publishing also
-triggers winget, the Homebrew tap follows Latest, and stable tags can update AUR.
+triggers winget, and the Homebrew tap follows Latest.
 Keep 2.0 out of Latest and hold those channel jobs during the manual-install
 period; defer the Arch repository's publishing dispatch too. Do not publish a
 normal Latest release and assume these channels will wait.
@@ -118,9 +126,8 @@ Linux system packages now ship the GTK shell as `.deb` and `.rpm`, built once on
 Ubuntu 24.04 and tested before upload to the draft. The Tauri AppImage remains the
 fallback for Ubuntu 22.04, Debian 12 and older RPM distributions, and keeps its
 in-app updater. GTK debs require Ubuntu 24.04+ or Debian 13+; RPMs require
-GTK 4.14+, libadwaita 1.5+, GLib 2.80+ and glibc 2.39+. Stable releases also
-update AUR `toolport-bin` by repackaging the GTK deb, so existing AUR users can
-upgrade with their helper. The native pacman package remains an alternative. See
+GTK 4.14+, libadwaita 1.5+, GLib 2.80+ and glibc 2.39+. Arch and Omarchy users
+install the native package from the Toolport pacman repository. See
 [`docs/linux-packages.md`](linux-packages.md) for build and upgrade checks.
 
 Publishing is also when the **Homebrew tap** is bumped, and that is now
@@ -128,12 +135,14 @@ automatic. `brew install --cask btsouth/toolport/toolport` and
 `brew upgrade --cask toolport` install the version + sha256 pinned in
 [`btsouth/homebrew-toolport`](https://github.com/btsouth/homebrew-toolport)
 `Casks/toolport.rb`. The `livecheck` / `github_latest` block in that cask only
-feeds `brew livecheck`; it does not move the pin. The copy at
-`packaging/homebrew/toolport.rb` in this repo is a snapshot `brew install` does
-not read.
+feeds `brew livecheck`; it does not move the pin. `packaging/homebrew/toolport.rb`
+in this repo is the only source of that cask: change uninstall, zap or caveats
+here, never in the tap.
 
-That tap's own `bump.yml` workflow tracks the latest published release, computes
-both digests from the DMGs GitHub actually serves, and commits the result. It
+That tap's own `bump.yml` workflow tracks the latest published release, copies
+`packaging/homebrew/toolport.rb` from that release tag, fills in the version and
+both digests from the DMGs GitHub actually serves, and commits the result when it
+differs from the tap. A cask change therefore reaches users with the next release. It
 runs every six hours, so it lands on its own; to have it immediately after a
 release, dispatch it:
 
@@ -158,6 +167,32 @@ installs from it), but keep them honest by copying what the tap landed.
 
 The **gateway container image** (`ghcr.io/btsouth/toolport-gateway`) publishes
 separately on every push to `main` via `docker-publish.yml`; no tag required.
+
+### macOS acceptance
+
+After the release and the Homebrew bump, run the macOS acceptance workflow on
+GitHub's Apple Silicon runners:
+
+```bash
+gh workflow run macos-acceptance.yml --repo btsouth/toolport            # latest release
+gh workflow run macos-acceptance.yml --repo btsouth/toolport -f tag=vX.Y.Z  # a published release
+```
+
+It installs the dmg the way a user does (browser quarantine, Finder drag,
+Gatekeeper prompt), checks signatures, notarization and every binary's
+architecture, then drives the window through macOS accessibility: onboarding,
+every screen, a server with a keychain secret, a connection to each seeded
+client with a real tool call through each entry, Launch at login, and every
+screen at the minimum window size, a narrow window and a larger display. It
+also upgrades from the previous release by dmg and through the in-app updater,
+runs the Intel dmg on an Intel runner, installs the Homebrew cask, uninstalls
+per [uninstall.md](uninstall.md) and lists every leftover. Every check is
+pass, fail or untested with a reason. The Homebrew and in-app update legs only
+run for the latest release, since that is all the tap and the updater offer.
+The five jobs run in parallel and take 10 to 25 minutes. Screenshots, logs and leftover lists are in the
+run's artifacts; the job summary lists every check and what the runner could
+not test. `-f build_ref=true` builds the current ref unsigned instead (about 20
+minutes; keychain checks are skipped because they need the signed entitlements).
 
 ## After users upgrade
 

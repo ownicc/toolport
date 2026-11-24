@@ -6,6 +6,8 @@ import { ServerToolsPanel } from "./ServerToolsPanel";
 const api = vi.hoisted(() => ({
   listServerTools: vi.fn(),
   callTool: vi.fn(),
+  cancelToolCall: vi.fn(),
+  onToolRunProgress: vi.fn(),
   setToolEnabled: vi.fn(),
   listServerResources: vi.fn(),
   listServerPrompts: vi.fn(),
@@ -55,6 +57,8 @@ describe("server Tools panel", () => {
     vi.clearAllMocks();
     api.listServerTools.mockResolvedValue(tools);
     api.callTool.mockResolvedValue({ content: [{ type: "text", text: "Record found" }] });
+    api.cancelToolCall.mockResolvedValue(undefined);
+    api.onToolRunProgress.mockResolvedValue(() => {});
     api.listServerResources.mockResolvedValue([]);
     api.listServerPrompts.mockResolvedValue([]);
   });
@@ -76,6 +80,66 @@ describe("server Tools panel", () => {
     expect(screen.queryByText("Pick a server…")).not.toBeInTheDocument();
   });
 
+  it("names each tool switch by its tool and describes its current state", async () => {
+    const { rerender } = render(
+      <ServerToolsPanel
+        serverId="alpha"
+        registry={registry}
+        onRegistryChange={vi.fn()}
+      />,
+    );
+    const on = await screen.findByRole("switch", { name: "read" });
+    const off = screen.getByRole("switch", { name: "remove" });
+    expect(on).toBeChecked();
+    expect(on).toHaveAttribute("title", "Exposed to clients. Hide it.");
+    expect(off).not.toBeChecked();
+    expect(off).toHaveAttribute("title", "Hidden from clients. Expose it.");
+
+    rerender(
+      <ServerToolsPanel
+        serverId="alpha"
+        registry={{
+          ...registry,
+          servers: [{ ...registry.servers[0], disabledTools: ["read"] }],
+        }}
+        onRegistryChange={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("switch", { name: "read" })).not.toBeChecked();
+    expect(screen.getByRole("switch", { name: "read" })).toHaveAttribute(
+      "title",
+      "Hidden from clients. Expose it.",
+    );
+    expect(screen.getByRole("switch", { name: "remove" })).toBeChecked();
+    expect(screen.queryByRole("switch", { name: /^Enable / })).not.toBeInTheDocument();
+
+    // With destructive tools hidden by the global switch, a destructive tool's
+    // switch says so whichever way it is set; other tools keep their wording.
+    const blocked =
+      "Destructive tools are hidden from clients by the global switch even when individually enabled.";
+    for (const disabledTools of [["read"], ["read", "remove"]]) {
+      rerender(
+        <ServerToolsPanel
+          serverId="alpha"
+          registry={{
+            ...registry,
+            denyDestructive: true,
+            servers: [{ ...registry.servers[0], disabledTools }],
+          }}
+          onRegistryChange={vi.fn()}
+        />,
+      );
+      expect(screen.getByRole("switch", { name: "remove" })).toHaveAttribute(
+        "title",
+        blocked,
+      );
+      expect(screen.getByRole("switch", { name: "read" })).toHaveAttribute(
+        "title",
+        "Hidden from clients. Expose it.",
+      );
+    }
+  });
+
   it("validates schema arguments, calls the selected server and renders the result", async () => {
     render(
       <ServerToolsPanel
@@ -91,9 +155,90 @@ describe("server Tools panel", () => {
     fireEvent.change(screen.getByLabelText(/id/), { target: { value: "42" } });
     fireEvent.click(screen.getByRole("button", { name: "Call tool" }));
     await waitFor(() =>
-      expect(api.callTool).toHaveBeenCalledWith("alpha", "read", { id: 42 }),
+      expect(api.callTool).toHaveBeenCalledWith(
+        "alpha",
+        "read",
+        { id: 42 },
+        expect.any(String),
+      ),
     );
     expect(await screen.findByText("Record found")).toBeVisible();
+  });
+
+  it("says the server is starting and cancels that Run in the gateway", async () => {
+    const call = deferred<unknown>();
+    api.callTool.mockReturnValue(call.promise);
+    let progress!: (p: { runId: string; phase: string }) => void;
+    api.onToolRunProgress.mockImplementation(async (handler) => {
+      progress = handler;
+      return () => {};
+    });
+    render(
+      <ServerToolsPanel
+        serverId="alpha"
+        registry={registry}
+        onRegistryChange={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /Read a record/ }));
+    fireEvent.change(screen.getByLabelText(/id/), { target: { value: "42" } });
+    fireEvent.click(screen.getByRole("button", { name: "Call tool" }));
+    await waitFor(() => expect(api.callTool).toHaveBeenCalled());
+    const runId = api.callTool.mock.calls[0][3] as string;
+    // Another Run's progress is not this one's.
+    act(() => progress({ runId: "someone-else", phase: "starting" }));
+    expect(screen.getByRole("button", { name: /Calling/ })).toBeVisible();
+    act(() => progress({ runId, phase: "starting" }));
+    expect(screen.getByRole("button", { name: /Starting Alpha/ })).toBeVisible();
+    act(() => progress({ runId, phase: "started" }));
+    expect(screen.getByRole("button", { name: /Calling/ })).toBeVisible();
+    act(() => progress({ runId, phase: "starting" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(api.cancelToolCall).toHaveBeenCalledWith(runId);
+    expect(screen.getByText(/The server was told to cancel the call/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Call tool" })).toBeEnabled();
+    // A late result after the cancel is dropped.
+    await act(async () => call.resolve({ content: [{ type: "text", text: "Late" }] }));
+    expect(screen.queryByText("Late")).not.toBeInTheDocument();
+  });
+
+  it("shows a result without Toolport's provenance, keeping the server's own _meta", async () => {
+    const labelled = { "app.toolport/provenance": { trust: "untrusted" }, own: 7 };
+    api.callTool.mockResolvedValue({
+      _meta: labelled,
+      content: [
+        { type: "text", text: "Record found", _meta: labelled },
+        { type: "image", data: "AAA", mimeType: "image/png", _meta: labelled },
+        {
+          type: "resource",
+          resource: { uri: "a:b", _meta: { "app.toolport/provenance": {} } },
+        },
+      ],
+    });
+    render(
+      <ServerToolsPanel
+        serverId="alpha"
+        registry={registry}
+        onRegistryChange={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /Read a record/ }));
+    fireEvent.change(screen.getByLabelText(/id/), { target: { value: "42" } });
+    fireEvent.click(screen.getByRole("button", { name: "Call tool" }));
+    const shown = await screen.findByText(/Record found/);
+    const text = shown.textContent ?? "";
+    expect(text).toContain("image/png");
+    expect(text).toContain('"own": 7');
+    expect(text).not.toContain("provenance");
+    expect(text).not.toContain('"_meta": {}');
+
+    api.callTool.mockResolvedValue({ _meta: labelled, content: [] });
+    fireEvent.click(screen.getByRole("button", { name: "Call tool" }));
+    await waitFor(() =>
+      expect(screen.queryByText(/Record found/)).not.toBeInTheDocument(),
+    );
+    const fallback = screen.getByText(/"own": 7/).textContent ?? "";
+    expect(fallback).not.toContain("provenance");
   });
 
   it("refreshes quarantine state when the default access changes", async () => {

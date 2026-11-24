@@ -63,7 +63,77 @@ fn location_name(kind: &str, folder: &str) -> String {
     label
 }
 
+/// The label of a T3 Code home: its folder below home, such as
+/// `Claude Code (t3/commandcode/claude)`. T3 Code's own instance name is shown beside it.
+pub(super) fn t3_location_name(client_type: &str, config: &Path) -> String {
+    let kind = defs()
+        .into_iter()
+        .find(|def| def.id == client_type)
+        .map(|def| def.name)
+        .unwrap_or(client_type);
+    let folder = config.parent().unwrap_or(config);
+    let shown = home()
+        .and_then(|root| {
+            let root = std::fs::canonicalize(&root).unwrap_or(root);
+            let rest = folder.strip_prefix(&root).ok()?;
+            let parts: Vec<String> = rest
+                .components()
+                .map(|part| short_hash(&part.as_os_str().to_string_lossy()))
+                .collect();
+            Some(format!("~/{}", parts.join("/")))
+        })
+        .unwrap_or_else(|| folder.display().to_string());
+    let shown: String = shown
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || " ._-+()[]/~".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(80)
+        .collect();
+    format!("{kind} ({shown})")
+}
+
+/// A folder named by a SHA-256 hash, such as T3 Code's Antigravity profiles, by its first
+/// eight characters; any other name as it is.
+fn short_hash(name: &str) -> String {
+    if name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        name[..8].to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// A home found only because T3 Code lists it. Listed again on each refresh while T3 Code
+/// does, and saved only once Toolport changes its config.
+pub(super) fn is_t3_home(row: &ClientLocation) -> bool {
+    !row.manual && super::t3code::is_location_id(&row.id)
+}
+
+/// A saved T3 Code home whose folder no longer exists, after T3 Code or the instance was
+/// removed. It reads as not installed rather than as an error. Writes still fail
+/// [`validate`], so nothing recreates the folder.
+pub(super) fn t3_home_folder_is_gone(row: &ClientLocation) -> bool {
+    is_t3_home(row)
+        && home()
+            .and_then(|home| std::fs::canonicalize(home).ok())
+            .is_some_and(|root| {
+                super::t3code::walk_below_home(&row.config_path, &root)
+                    == super::t3code::HomeWalk::Missing
+            })
+}
+
+/// A saved T3 Code home that T3 Code no longer lists. It stays listed so it can be
+/// disconnected, then forgotten.
+fn t3_home_is_gone(row: &ClientLocation) -> bool {
+    is_t3_home(row) && !super::t3code::lists(&row.config_path)
+}
+
 pub fn remove_client_location(id: &str) -> Result<(), String> {
+    let _auth = crate::registry_controller::acquire_auth_lock(&format!("client-config:{id}"))?;
     let store = store_path()?;
     let _lock = crate::registry::lock_at(&store)?;
     let mut rows = saved()?;
@@ -76,6 +146,12 @@ pub fn remove_client_location(id: &str) -> Result<(), String> {
     let client = read_client(&find_def(id).ok_or("Unknown client location")?);
     if client.error.is_some() || client.gateway_installed {
         return Err("Disconnect this client location before removing it".into());
+    }
+    if let Some(pending) = recovery::list()?
+        .into_iter()
+        .find(|row| row.client_id == id)
+    {
+        return Err(crate::i18n::trf("{client} still has saved recovery values. Choose Retry to restore them, or Discard these saved values to remove their copies, before removing this location.", &[("client", &pending.client_name)]));
     }
     rows.retain(|row| row.id != id);
     crate::registry::atomic_write(
@@ -121,7 +197,11 @@ pub(super) fn saved() -> Result<Vec<ClientLocation>, String> {
                     .into_iter()
                     .find(|def| def.id == row.client_type)
                     .unwrap();
-                row.name = location_name(kind.name, &folder_label(&row.config_path));
+                row.name = if super::t3code::is_location_id(&row.id) {
+                    t3_location_name(&row.client_type, &row.config_path)
+                } else {
+                    location_name(kind.name, &folder_label(&row.config_path))
+                };
                 rows.push(row);
             }
             Ok(rows)
@@ -183,7 +263,7 @@ pub(super) fn store_display_path() -> String {
         .unwrap_or_default()
 }
 
-fn valid_id(id: &str) -> bool {
+pub(super) fn valid_id(id: &str) -> bool {
     id.split_once('@')
         .is_some_and(|(kind, key)| !kind.is_empty() && !key.is_empty() && key != "." && key != "..")
         && id
@@ -224,6 +304,9 @@ pub(super) fn generated_id_type(id: &str) -> Option<&str> {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
+        return Some(kind);
+    }
+    if super::t3code::is_location_id(id) {
         return Some(kind);
     }
     if kind == "codex" {
@@ -494,8 +577,20 @@ fn launcher_is_gone(row: &ClientLocation) -> bool {
 
 /// Saved locations Toolport can forget: ones added by hand, automatic ones whose folder
 /// is gone, and launcher homes whose launcher is gone.
+/// A saved T3 Code home is decided by [`super::t3code::walk_below_home`] alone, before
+/// any other disk check, so nothing looks past a folder that became a link. One whose
+/// folder exists but has no config yet is kept while T3 Code still lists it.
 pub(super) fn forgettable(row: &ClientLocation) -> bool {
+    if is_t3_home(row) {
+        return t3_home_folder_is_gone(row) || t3_home_is_gone(row);
+    }
     row.manual || automatic_path_is_missing(row) || launcher_is_gone(row)
+}
+
+/// A T3 Code home that cannot be forgotten because T3 Code still lists it. Both shells
+/// show its Remove location control disabled, with why.
+pub(super) fn kept_by_t3_code(row: &ClientLocation) -> bool {
+    is_t3_home(row) && !forgettable(row)
 }
 
 /// Whether a Codex home outside the saved list is one automatic discovery lists.
@@ -595,13 +690,21 @@ pub(super) fn automatic_path_is_missing(row: &ClientLocation) -> bool {
 }
 
 pub(super) fn validate(row: &ClientLocation) -> Result<(), String> {
-    if row.manual
-        || automatic_path_is_missing(row)
-        || (row.client_type == "claude-code"
-            && home().is_some_and(|root| automatic_path_is_safe(&root, &row.config_path)))
-        || (row.client_type == "codex"
-            && home().is_some_and(|root| codex_automatic_path_is_safe(&root, &row.config_path)))
-    {
+    // A saved T3 Code home goes through the walk first and only: the older checks below
+    // look at the folder with calls that follow a link higher up the path, and would let
+    // a write recreate a home whose folder was deleted.
+    let ok = if is_t3_home(row) {
+        super::t3code::path_is_safe(&row.config_path)
+            && super::t3code::opencode_jsonc_is_plain(&row.config_path)
+    } else {
+        row.manual
+            || automatic_path_is_missing(row)
+            || (row.client_type == "claude-code"
+                && home().is_some_and(|root| automatic_path_is_safe(&root, &row.config_path)))
+            || (row.client_type == "codex"
+                && home().is_some_and(|root| codex_automatic_path_is_safe(&root, &row.config_path)))
+    };
+    if ok {
         Ok(())
     } else {
         Err("This automatic client location needs attention. Choose an ordinary config file inside home, or add the location manually to use a linked or external folder.".into())
@@ -663,6 +766,8 @@ fn automatic(home: &Path) -> Vec<ClientLocation> {
             &super::claude_profiles::user_path_dirs(),
         ),
     ));
+    let t3 = super::t3code::automatic(&rows);
+    rows.extend(t3);
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     rows
 }
@@ -675,8 +780,18 @@ pub(super) fn same_path(a: &Path, b: &Path) -> bool {
             .is_some_and(|(a, b)| a == b)
         // A config may not exist yet. Its existing canonical parent still
         // identifies the same location, including Windows extended prefixes.
-        || (a.file_name() == b.file_name() && a.parent().zip(b.parent()).is_some_and(|(a, b)|
+        || (same_file_name(a, b) && a.parent().zip(b.parent()).is_some_and(|(a, b)|
             std::fs::canonicalize(a).ok().zip(std::fs::canonicalize(b).ok()).is_some_and(|(a, b)| a == b)))
+}
+
+/// File names compare as the platform does: without regard to case on Windows.
+fn same_file_name(a: &Path, b: &Path) -> bool {
+    match (a.file_name(), b.file_name()) {
+        (Some(a), Some(b)) if cfg!(windows) => {
+            a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+        }
+        (a, b) => a == b,
+    }
 }
 
 /// Prefer ordinary Windows paths only when they resolve to the same directory.
@@ -740,6 +855,15 @@ pub(super) fn lookup(id: &str) -> Option<ClientLocation> {
     }
     if let Some(row) = saved().ok()?.into_iter().find(|row| row.id == id) {
         return Some(row);
+    }
+    if super::t3code::is_location_id(id) {
+        // As the page lists it: a T3 Code home a profile or Codex row already covers is
+        // not a second way to reach that file.
+        return home()
+            .map(|home| automatic(&home))
+            .unwrap_or_default()
+            .into_iter()
+            .find(|row| row.id == id);
     }
     if let Some(key) = id.strip_prefix("codex@") {
         return codex_lookup(id, key);

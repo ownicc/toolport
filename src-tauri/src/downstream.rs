@@ -220,6 +220,42 @@ pub(crate) fn header_param_specs(tool: &Value) -> Result<Vec<HeaderParamSpec>, S
     Ok(specs)
 }
 
+/// A definition (tool, prompt, resource or template) that carries a configured
+/// secret's value is advertised with the value replaced, before anything
+/// (clients, search, the tool cache, integrity pins) sees it, and the server and
+/// item are reported as a security event. Calls still reach the item by the
+/// name the server advertised ([`crate::secret_redact::upstream_identifier`]).
+///
+/// The identifier mapping is returned uncommitted: the caller commits it when
+/// the screened catalog replaces the advertised one, so a refresh that keeps the
+/// previous catalog keeps the mapping that goes with it.
+fn screen_definitions_for_secrets(
+    server_id: &str,
+    catalog: crate::secret_redact::Catalog,
+    items: &mut Vec<Value>,
+) -> crate::secret_redact::Screened {
+    let screened = crate::secret_redact::screen_definitions(server_id, catalog, items);
+    for item in &screened.refused {
+        let message = format!(
+            "toolport: server '{server_id}' put a configured secret in the {} identifier '{item}', and its alias collided with another; the item is not advertised",
+            catalog.as_str()
+        );
+        eprintln!("{message}");
+        crate::gatewaylog::append(&message);
+    }
+    for (tool, secrets) in &screened.flagged {
+        let message = format!(
+            "toolport: server '{server_id}' put a configured secret ({}) in the definition of {} '{tool}'; it is advertised with the value replaced",
+            secrets.join(", "),
+            catalog.as_str()
+        );
+        eprintln!("{message}");
+        crate::gatewaylog::append(&message);
+        crate::integrity::record_secret_in_definition(server_id, tool, secrets);
+    }
+    screened
+}
+
 fn filter_modern_http_tools(server_id: &str, tools: Vec<Value>) -> Vec<Value> {
     tools
         .into_iter()
@@ -576,6 +612,13 @@ pub const PER_HOP_META_KEYS: [&str; 3] = [
     "io.modelcontextprotocol/clientInfo",
     "io.modelcontextprotocol/clientCapabilities",
 ];
+
+/// A request asks the gateway to say, as progress on its own token, when the
+/// call waits for its server to start. Only Toolport's Tools tab sends it: the
+/// notices carry their own progress values, so a client that also reads the
+/// server's progress on that token could see the count go backwards. The
+/// gateway reads it and does not pass it on to the server.
+pub const START_NOTICES_META_KEY: &str = "app.toolport/startNotices";
 
 /// Keys relayed only once Toolport can honour what they ask for.
 ///
@@ -1089,9 +1132,28 @@ pub enum TransportError {
     Busy(String),
 }
 
-/// Tracks client-side JSON-RPC request ids that are currently proxied to a
-/// downstream stdio server. A later `notifications/cancelled` from the client can
-/// forward cancellation to the downstream server's own request id.
+/// Cancellation for the client requests on one connection.
+///
+/// One design, for the HTTP path, the stdio loop and the stdio adapter alike:
+///
+/// - A request instance is identified by `(id, generation)`. A client may reuse an
+///   id once it has cancelled or been answered, even while the old instance is still
+///   unwinding, so the id alone never names a request.
+/// - [`CancelRegistry::begin_client_request`] is the only way to obtain an instance,
+///   and it returns the instance's [`CancelContext`] from the same locked step that
+///   registers it. Nothing looks an instance up by id after that: its context,
+///   cancellation by its owner (an HTTP disconnect, an approval withdrawal), finish,
+///   the reply decision, progress routing and the upstream cancellation hooks all go
+///   through that handle.
+/// - Only the client's own `notifications/cancelled` resolves an id, to the newest
+///   instance with it ([`CancelRegistry::cancel`]). The stdio adapter names the
+///   instance it means with its own request number, so its cancellation reaches that
+///   instance even when it overtakes the request ([`CancelRegistry::cancel_instance`]).
+/// - Each instance speaks under its own lock: a reply or progress message is written
+///   only while the instance is live, and a cancellation waits for a message being
+///   written to finish. So a cancelled instance never answers, an answered one is
+///   never cancelled afterwards, and once a client has cancelled an instance it reads
+///   nothing more from it, whatever later reuses the id.
 #[derive(Clone, Default)]
 pub struct CancelRegistry {
     inner: Arc<Mutex<CancelState>>,
@@ -1099,14 +1161,103 @@ pub struct CancelRegistry {
 
 type CancelCallback = Arc<dyn Fn(Option<String>) + Send + Sync>;
 
+/// One request instance: its client request id and the generation it began with.
+type Slot = (String, u64);
+
+/// How many adapter cancellations for requests that have not arrived yet are held,
+/// and how many finished adapter requests are remembered. The adapter keeps at most
+/// a few hundred requests in flight, so neither is reached in practice; past it the
+/// oldest is forgotten.
+const MAX_EARLY_CANCELS: usize = 1024;
+
+struct Instance {
+    /// The adapter's own number for this request, when it sent one.
+    tag: Option<u64>,
+    /// `Some(reason)` once cancelled.
+    cancelled: Option<Option<String>>,
+    /// Its reply was claimed; a later cancellation changes nothing.
+    answered: bool,
+    /// Its handler has not finished.
+    active: bool,
+    hooks: HashMap<u64, CancelCallback>,
+    /// Held while the instance writes a message, and by a cancellation.
+    speech: Arc<Mutex<()>>,
+}
+
+impl Instance {
+    fn new(tag: Option<u64>, active: bool) -> Self {
+        Self {
+            tag,
+            cancelled: None,
+            answered: false,
+            active,
+            hooks: HashMap::new(),
+            speech: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Whether the client may still be sent a message for it.
+    fn live(&self) -> bool {
+        self.cancelled.is_none() && !self.answered
+    }
+}
+
 #[derive(Default)]
 struct CancelState {
-    active: HashSet<String>,
-    cancelled: HashMap<String, Option<String>>,
-    hooks: HashMap<String, HashMap<u64, CancelCallback>>,
+    /// The newest instance of each id, which a client cancellation means.
+    current: HashMap<String, u64>,
+    instances: HashMap<Slot, Instance>,
+    /// Adapter request numbers of open instances.
+    tags: HashMap<(String, u64), u64>,
+    /// Adapter cancellations that arrived before their request did.
+    early_cancels: VecDeque<((String, u64), Option<String>)>,
+    /// Adapter requests that already finished here, newest last, so a cancellation
+    /// that crosses its reply is not mistaken for one that overtook its request.
+    finished_tags: VecDeque<(String, u64)>,
+    close_hooks: HashMap<u64, CancelCallback>,
+    next_generation: u64,
     next_hook: u64,
     closed: bool,
     finished: bool,
+}
+
+impl CancelState {
+    /// Drop a finished instance once nothing refers to it.
+    fn settle(&mut self, slot: &Slot) {
+        let Some(instance) = self.instances.get(slot) else {
+            return;
+        };
+        if instance.active || !instance.hooks.is_empty() {
+            return;
+        }
+        if let Some(tag) = instance.tag {
+            self.tags.remove(&(slot.0.clone(), tag));
+            if self.finished_tags.len() >= MAX_EARLY_CANCELS {
+                self.finished_tags.pop_front();
+            }
+            self.finished_tags.push_back((slot.0.clone(), tag));
+        }
+        self.instances.remove(slot);
+        if self.current.get(&slot.0) == Some(&slot.1) {
+            self.current.remove(&slot.0);
+        }
+    }
+
+    fn lookup_current(&self, id: &str) -> Option<Slot> {
+        let generation = *self.current.get(id)?;
+        Some((id.to_string(), generation))
+    }
+
+    fn new_instance(&mut self, id: &str, tag: Option<u64>) -> Slot {
+        self.next_generation += 1;
+        let slot = (id.to_string(), self.next_generation);
+        self.instances
+            .insert(slot.clone(), Instance::new(tag, true));
+        if let Some(tag) = tag {
+            self.tags.insert((id.to_string(), tag), slot.1);
+        }
+        slot
+    }
 }
 
 #[derive(Clone)]
@@ -1121,66 +1272,172 @@ struct CancelEntry {
     forwarded: Arc<AtomicBool>,
 }
 
-/// Cancellation follows the owned call, including suspended multi-round trips.
+/// One request instance's handle. See [`CancelRegistry`].
 #[derive(Clone)]
 pub struct CancelContext {
     client_request_id: String,
+    generation: u64,
+    tag: Option<u64>,
     registry: CancelRegistry,
+}
+
+impl std::fmt::Debug for CancelContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancelContext")
+            .field("id", &self.client_request_id)
+            .field("generation", &self.generation)
+            .finish()
+    }
 }
 
 impl CancelContext {
     pub fn request_key(&self) -> String {
         self.client_request_id.clone()
     }
+
+    /// The adapter's number for this request, if it sent one.
+    pub fn adapter_tag(&self) -> Option<u64> {
+        self.tag
+    }
+
+    fn slot(&self) -> Slot {
+        (self.client_request_id.clone(), self.generation)
+    }
+
     pub fn is_cancelled(&self) -> bool {
-        self.registry.is_cancelled(&self.client_request_id)
+        let state = self.registry.lock();
+        state.closed
+            || state
+                .instances
+                .get(&self.slot())
+                .is_some_and(|instance| instance.cancelled.is_some())
+    }
+
+    /// Cancel this instance and nothing else: its owner went away.
+    pub fn cancel(&self, reason: Option<&str>) -> bool {
+        self.registry
+            .cancel_slot(&self.slot(), normalize_cancel_reason(reason))
+    }
+
+    /// Forward a cancellation of this instance to the downstream request.
+    fn register(&self, entry: CancelEntry) -> CancelGuard {
+        self.on_cancel(Arc::new(move |reason| entry.send_cancel_async(reason)))
+    }
+
+    /// This instance's handler is done; a reused id's newer instance is untouched.
+    pub fn finish(&self) {
+        let mut state = self.registry.lock();
+        let slot = self.slot();
+        if let Some(instance) = state.instances.get_mut(&slot) {
+            instance.active = false;
+        }
+        state.settle(&slot);
+    }
+
+    /// Whether this instance's handler is still running.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn is_active(&self) -> bool {
+        self.registry
+            .lock()
+            .instances
+            .get(&self.slot())
+            .is_some_and(|instance| instance.active)
     }
 
     fn reason(&self) -> Option<String> {
         self.registry
-            .inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cancelled
-            .get(&self.client_request_id)
-            .cloned()
+            .instances
+            .get(&self.slot())
+            .and_then(|instance| instance.cancelled.clone())
             .flatten()
     }
 
-    /// Keep an owned resource cancellable after its upstream round returns.
+    fn speech(&self) -> Option<Arc<Mutex<()>>> {
+        self.registry
+            .lock()
+            .instances
+            .get(&self.slot())
+            .map(|instance| Arc::clone(&instance.speech))
+    }
+
+    /// Claim this instance's reply and write it with `write`, unless the instance was
+    /// cancelled first. Returns whether it was written. A cancellation that arrives
+    /// while `write` runs waits for it and then changes nothing.
+    pub fn reply_with(&self, write: impl FnOnce()) -> bool {
+        let Some(speech) = self.speech() else {
+            return false;
+        };
+        let _speaking = speech
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        {
+            let mut state = self.registry.lock();
+            let closed = state.closed;
+            let Some(instance) = state.instances.get_mut(&self.slot()) else {
+                return false;
+            };
+            if closed || !instance.live() {
+                return false;
+            }
+            instance.answered = true;
+        }
+        write();
+        true
+    }
+
+    /// Write a message that belongs to this instance (progress) with `write`, only
+    /// while it is neither cancelled nor answered. Returns whether it was written.
+    pub fn speak_with(&self, write: impl FnOnce()) -> bool {
+        let Some(speech) = self.speech() else {
+            return false;
+        };
+        let _speaking = speech
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        {
+            let state = self.registry.lock();
+            let live = !state.closed
+                && state
+                    .instances
+                    .get(&self.slot())
+                    .is_some_and(Instance::live);
+            if !live {
+                return false;
+            }
+        }
+        write();
+        true
+    }
+
+    /// Keep an owned resource cancellable after its upstream round returns. The
+    /// callback runs at most once, and only for this instance.
     pub fn on_cancel(&self, callback: CancelCallback) -> CancelGuard {
+        let slot = self.slot();
         let (key, cancelled) = {
-            let mut state = self
-                .registry
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self.registry.lock();
             state.next_hook += 1;
             let key = state.next_hook;
-            let cancelled = if state.closed || state.cancelled.contains_key(&self.client_request_id)
-            {
-                Some(
-                    state
-                        .cancelled
-                        .get(&self.client_request_id)
-                        .cloned()
-                        .flatten(),
-                )
-            } else {
-                None
+            let closed = state.closed;
+            let instance = state
+                .instances
+                .entry(slot.clone())
+                .or_insert_with(|| Instance::new(self.tag, false));
+            // Kept even when already cancelled, so the instance stays known (and
+            // cancelled) for as long as something holds it.
+            instance.hooks.insert(key, callback.clone());
+            let cancelled = match &instance.cancelled {
+                Some(reason) => Some(reason.clone()),
+                None if closed => Some(None),
+                None => None,
             };
-            state
-                .hooks
-                .entry(self.client_request_id.clone())
-                .or_default()
-                .insert(key, callback.clone());
             (key, cancelled)
         };
         if let Some(reason) = cancelled {
             callback(reason);
         }
         CancelGuard {
-            client_request_id: self.client_request_id.clone(),
+            slot,
             registry: self.registry.clone(),
             key,
         }
@@ -1188,9 +1445,21 @@ impl CancelContext {
 }
 
 pub struct CancelGuard {
-    client_request_id: String,
+    slot: Slot,
     registry: CancelRegistry,
     key: u64,
+}
+
+/// Keeps a callback that runs when the connection closes.
+pub struct CloseGuard {
+    registry: CancelRegistry,
+    key: u64,
+}
+
+impl Drop for CloseGuard {
+    fn drop(&mut self) {
+        self.registry.lock().close_hooks.remove(&self.key);
+    }
 }
 
 impl CancelRegistry {
@@ -1198,61 +1467,137 @@ impl CancelRegistry {
         Self::default()
     }
 
-    pub fn begin_client_request(&self, client_request_id: String) -> bool {
-        let mut state = self
-            .inner
+    fn lock(&self) -> std::sync::MutexGuard<'_, CancelState> {
+        self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.closed || state.active.contains(&client_request_id) {
-            return false;
-        }
-        state.cancelled.remove(&client_request_id);
-        state.active.insert(client_request_id);
-        true
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub fn finish_client_request(&self, client_request_id: &str) {
-        let mut state = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.active.remove(client_request_id);
-        if !state.hooks.contains_key(client_request_id) {
-            state.cancelled.remove(client_request_id);
-        }
+    /// Begin a request instance and return its handle. `None` when the connection is
+    /// closed or the id is live: an id whose newest instance was cancelled or answered
+    /// may be reused at once, as a new instance with its own state.
+    pub fn begin_client_request(&self, client_request_id: String) -> Option<CancelContext> {
+        self.begin_instance(client_request_id, None)
     }
 
-    pub fn context(&self, client_request_id: String) -> CancelContext {
-        CancelContext {
+    /// [`Self::begin_client_request`] for a request the stdio adapter numbered. If the
+    /// adapter already cancelled that number, the instance begins cancelled, outside
+    /// the id's current instance, and its handler runs nothing.
+    pub fn begin_instance(
+        &self,
+        client_request_id: String,
+        tag: Option<u64>,
+    ) -> Option<CancelContext> {
+        let mut state = self.lock();
+        if state.closed {
+            return None;
+        }
+        if let Some(tag) = tag {
+            let key = (client_request_id.clone(), tag);
+            if state.tags.contains_key(&key) {
+                return None;
+            }
+            if let Some(at) = state
+                .early_cancels
+                .iter()
+                .position(|(early, _)| *early == key)
+            {
+                let (_, reason) = state
+                    .early_cancels
+                    .remove(at)
+                    .expect("position is in range");
+                let slot = state.new_instance(&client_request_id, Some(tag));
+                if let Some(instance) = state.instances.get_mut(&slot) {
+                    instance.cancelled = Some(reason);
+                }
+                return Some(CancelContext {
+                    client_request_id,
+                    generation: slot.1,
+                    tag: Some(tag),
+                    registry: self.clone(),
+                });
+            }
+        }
+        if let Some(current) = state.lookup_current(&client_request_id) {
+            if state
+                .instances
+                .get(&current)
+                .is_some_and(|instance| instance.active && instance.live())
+            {
+                return None;
+            }
+        }
+        let slot = state.new_instance(&client_request_id, tag);
+        state.current.insert(client_request_id.clone(), slot.1);
+        Some(CancelContext {
             client_request_id,
+            generation: slot.1,
+            tag,
             registry: self.clone(),
-        }
+        })
     }
 
+    /// The client cancelled `client_request_id`: cancel its newest instance, the one
+    /// the client means. Returns whether an open request was found.
     pub fn cancel(&self, client_request_id: &str, reason: Option<&str>) -> bool {
-        let (hooks, reason) = {
-            let mut state = self
-                .inner
+        let Some(slot) = self.lock().lookup_current(client_request_id) else {
+            return false;
+        };
+        self.cancel_slot(&slot, normalize_cancel_reason(reason))
+    }
+
+    /// The stdio adapter cancelled its request `tag`. That instance is cancelled even
+    /// when this arrives first: it then begins cancelled.
+    pub fn cancel_instance(&self, client_request_id: &str, tag: u64, reason: Option<&str>) -> bool {
+        let reason = normalize_cancel_reason(reason);
+        let slot = {
+            let mut state = self.lock();
+            match state.tags.get(&(client_request_id.to_string(), tag)) {
+                Some(generation) => (client_request_id.to_string(), *generation),
+                None => {
+                    let key = (client_request_id.to_string(), tag);
+                    if state.closed || state.finished_tags.contains(&key) {
+                        return false;
+                    }
+                    if state.early_cancels.len() >= MAX_EARLY_CANCELS {
+                        state.early_cancels.pop_front();
+                    }
+                    state
+                        .early_cancels
+                        .push_back(((client_request_id.to_string(), tag), reason));
+                    return true;
+                }
+            }
+        };
+        self.cancel_slot(&slot, reason)
+    }
+
+    /// Cancel one instance after any message it is writing, then run its hooks.
+    fn cancel_slot(&self, slot: &Slot, reason: Option<String>) -> bool {
+        let Some(speech) = self
+            .lock()
+            .instances
+            .get(slot)
+            .map(|instance| Arc::clone(&instance.speech))
+        else {
+            return false;
+        };
+        let hooks = {
+            let _speaking = speech
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !state.active.contains(client_request_id)
-                && !state.hooks.contains_key(client_request_id)
-            {
+            let mut state = self.lock();
+            let Some(instance) = state.instances.get_mut(slot) else {
                 return false;
-            }
-            if state.cancelled.contains_key(client_request_id) {
+            };
+            if instance.cancelled.is_some() {
                 return true;
             }
-            let reason = normalize_cancel_reason(reason);
-            state
-                .cancelled
-                .insert(client_request_id.to_string(), reason.clone());
-            let hooks = state
-                .hooks
-                .get(client_request_id)
-                .map(|hooks| hooks.values().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-            (hooks, reason)
+            if instance.answered {
+                return false;
+            }
+            instance.cancelled = Some(reason.clone());
+            instance.hooks.values().cloned().collect::<Vec<_>>()
         };
         for hook in hooks {
             hook(reason.clone());
@@ -1260,62 +1605,122 @@ impl CancelRegistry {
         true
     }
 
+    /// The connection closed. Unlike a client cancellation, this also retires what an
+    /// answered instance still holds (a suspended downstream request keeps its hook
+    /// past the reply), since nothing can resume it now. An answered instance stays
+    /// answered; its hooks run once, here. Hooks run outside both locks.
+    fn close_slot(&self, slot: &Slot, reason: Option<String>) {
+        let Some(speech) = self
+            .lock()
+            .instances
+            .get(slot)
+            .map(|instance| Arc::clone(&instance.speech))
+        else {
+            return;
+        };
+        let hooks = {
+            let _speaking = speech
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self.lock();
+            let Some(instance) = state.instances.get_mut(slot) else {
+                return;
+            };
+            if instance.cancelled.is_some() {
+                return;
+            }
+            if !instance.answered {
+                instance.cancelled = Some(reason.clone());
+            }
+            instance.hooks.values().cloned().collect::<Vec<_>>()
+        };
+        for hook in hooks {
+            hook(reason.clone());
+        }
+    }
+
+    /// Run `callback` once when this connection closes.
+    pub fn on_close(&self, callback: CancelCallback) -> CloseGuard {
+        let (key, closed) = {
+            let mut state = self.lock();
+            state.next_hook += 1;
+            let key = state.next_hook;
+            if !state.closed {
+                state.close_hooks.insert(key, callback.clone());
+            }
+            (key, state.closed)
+        };
+        if closed {
+            callback(Some("upstream caller disconnected".into()));
+        }
+        CloseGuard {
+            registry: self.clone(),
+            key,
+        }
+    }
+
     /// A finite HTTP exchange completed. Its suspended work belongs to the
     /// next round, so closing this old socket must no longer cancel it.
     pub fn finish_connection(&self) {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .finished = true;
+        self.lock().finished = true;
     }
 
     /// Closing is terminal: even a worker arriving after close cannot dispatch.
     pub fn close(&self) {
-        let hooks = {
-            let mut state = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reason = Some("upstream caller disconnected".to_string());
+        let (slots, close_hooks) = {
+            let mut state = self.lock();
             if state.closed || state.finished {
                 return;
             }
             state.closed = true;
-            let ids = state
-                .active
-                .iter()
-                .chain(state.hooks.keys())
-                .cloned()
-                .collect::<HashSet<_>>();
-            let mut hooks = Vec::new();
-            for id in ids {
-                if state.cancelled.contains_key(&id) {
-                    continue;
-                }
-                state
-                    .cancelled
-                    .insert(id.clone(), Some("upstream caller disconnected".into()));
-                if let Some(owned) = state.hooks.get(&id) {
-                    hooks.extend(owned.values().cloned());
-                }
-            }
-            hooks
+            let slots = state.instances.keys().cloned().collect::<Vec<_>>();
+            let hooks = state
+                .close_hooks
+                .drain()
+                .map(|(_, hook)| hook)
+                .collect::<Vec<_>>();
+            state.early_cancels.clear();
+            (slots, hooks)
         };
-        for hook in hooks {
-            hook(Some("upstream caller disconnected".into()));
+        for slot in slots {
+            self.close_slot(&slot, reason.clone());
+        }
+        for hook in close_hooks {
+            hook(reason.clone());
         }
     }
 
+    /// Whether the newest instance of an id is cancelled.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn is_cancelled(&self, client_request_id: &str) -> bool {
-        let state = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.closed || state.cancelled.contains_key(client_request_id)
+        let state = self.lock();
+        state.closed
+            || state
+                .lookup_current(client_request_id)
+                .and_then(|slot| state.instances.get(&slot))
+                .is_some_and(|instance| instance.cancelled.is_some())
     }
 
-    fn register(&self, client_request_id: String, entry: CancelEntry) -> CancelGuard {
-        self.context(client_request_id)
-            .on_cancel(Arc::new(move |reason| entry.send_cancel_async(reason)))
+    /// Whether every instance, early cancellation and close hook is gone.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn is_empty(&self) -> bool {
+        let state = self.lock();
+        state.instances.is_empty()
+            && state.current.is_empty()
+            && state.tags.is_empty()
+            && state.early_cancels.is_empty()
+            && state.close_hooks.is_empty()
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        let mut state = self.registry.lock();
+        if let Some(instance) = state.instances.get_mut(&self.slot) {
+            instance.hooks.remove(&self.key);
+        }
+        state.settle(&self.slot);
     }
 }
 
@@ -1408,27 +1813,6 @@ fn normalize_cancel_reason(reason: Option<&str>) -> Option<String> {
     reason
         .filter(|s| !s.trim().is_empty())
         .map(std::string::ToString::to_string)
-}
-
-impl Drop for CancelGuard {
-    fn drop(&mut self) {
-        let mut state = self
-            .registry
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(hooks) = state.hooks.get_mut(&self.client_request_id) {
-            hooks.remove(&self.key);
-            if hooks.is_empty() {
-                state.hooks.remove(&self.client_request_id);
-            }
-        }
-        if !state.active.contains(&self.client_request_id)
-            && !state.hooks.contains_key(&self.client_request_id)
-        {
-            state.cancelled.remove(&self.client_request_id);
-        }
-    }
 }
 
 impl TransportError {
@@ -3757,10 +4141,13 @@ impl StdioCore {
             .try_wait()
             .ok()
             .flatten();
+        // Redacted here, where it is still the whole kept tail: its first line
+        // may begin inside a secret the ring cut, and a secret may be wrapped
+        // across lines; every sink after this sees only one message.
         let tail = self
             .stderr
             .lock()
-            .map(|b| b.trim().to_string())
+            .map(|b| crate::secret_redact::redact_excerpt(&b).trim().to_string())
             .unwrap_or_default();
         let mut msg = String::from("downstream server exited");
         if let Some(code) = status.and_then(|s| s.code()) {
@@ -3856,16 +4243,13 @@ impl StdioCore {
                 .map_err(|e| TransportError::Unavailable(e.to_string()))?;
         }
         let cancel_guard = cancel.map(|ctx| {
-            ctx.registry.register(
-                ctx.client_request_id.clone(),
-                CancelEntry {
-                    stdin: Arc::clone(&self.stdin),
-                    forwarder: self.forwarder.clone(),
-                    downstream_id: downstream_id.clone(),
-                    waiter: Some(Arc::downgrade(self)),
-                    forwarded: forwarded.clone(),
-                },
-            )
+            ctx.register(CancelEntry {
+                stdin: Arc::clone(&self.stdin),
+                forwarder: self.forwarder.clone(),
+                downstream_id: downstream_id.clone(),
+                waiter: Some(Arc::downgrade(self)),
+                forwarded: forwarded.clone(),
+            })
         });
         self.wait(
             waiter,
@@ -8529,11 +8913,13 @@ impl DownstreamServer {
             .into());
         }
         let modern_http = matches!(era, Era::Modern { .. }) && transport.supports_request_headers();
-        let tools = if modern_http {
+        let mut tools = if modern_http {
             filter_modern_http_tools(&id, listed.items)
         } else {
             listed.items
         };
+        screen_definitions_for_secrets(&id, crate::secret_redact::Catalog::Tool, &mut tools)
+            .commit();
 
         // MCP Apps is advertised only for capability-aware catalog fetches.
         // Restore Toolport's ordinary per-request metadata before any live call
@@ -8727,12 +9113,17 @@ impl DownstreamServer {
         }
         let refreshed = match listed {
             Ok(listed) if listed.warning.is_none() => {
-                let new_tools = if self.modern_http {
+                let mut new_tools = if self.modern_http {
                     filter_modern_http_tools(&self.id, listed.items)
                 } else {
                     listed.items
                 };
-                apply_catalog_refresh(
+                let screened = screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Tool,
+                    &mut new_tools,
+                );
+                let applied = apply_catalog_refresh(
                     &mut self.tools,
                     new_tools,
                     &mut self.shrink_tools_streak,
@@ -8740,7 +9131,11 @@ impl DownstreamServer {
                     listed.cache_hint,
                     &self.id,
                     "tool",
-                )
+                );
+                if applied {
+                    screened.commit();
+                }
+                applied
             }
             Ok(listed) => {
                 self.tool_cache_hint.mark_stale_and_defer();
@@ -8794,15 +9189,24 @@ impl DownstreamServer {
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
         match fetch_paginated_list(&mut *self.transport, "resources/list", "resources") {
             Ok(listed) if listed.warning.is_none() => {
-                apply_catalog_refresh(
+                let mut items = listed.items;
+                let screened = screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Resource,
+                    &mut items,
+                );
+                let applied = apply_catalog_refresh(
                     &mut self.resources,
-                    listed.items,
+                    items,
                     &mut self.shrink_resources_streak,
                     &mut self.resource_cache_hint,
                     listed.cache_hint,
                     &self.id,
                     "resource",
                 );
+                if applied {
+                    screened.commit();
+                }
             }
             Ok(listed) => {
                 self.resource_cache_hint.mark_stale_and_defer();
@@ -8828,15 +9232,24 @@ impl DownstreamServer {
             "resourceTemplates",
         ) {
             Ok(listed) if listed.warning.is_none() => {
-                apply_catalog_refresh(
+                let mut items = listed.items;
+                let screened = screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Template,
+                    &mut items,
+                );
+                let applied = apply_catalog_refresh(
                     &mut self.resource_templates,
-                    listed.items,
+                    items,
                     &mut self.shrink_templates_streak,
                     &mut self.resource_template_cache_hint,
                     listed.cache_hint,
                     &self.id,
                     "resource-template",
                 );
+                if applied {
+                    screened.commit();
+                }
             }
             Ok(listed) => {
                 self.resource_template_cache_hint.mark_stale_and_defer();
@@ -8877,15 +9290,24 @@ impl DownstreamServer {
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
         match fetch_paginated_list(&mut *self.transport, "prompts/list", "prompts") {
             Ok(listed) if listed.warning.is_none() => {
-                apply_catalog_refresh(
+                let mut items = listed.items;
+                let screened = screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Prompt,
+                    &mut items,
+                );
+                let applied = apply_catalog_refresh(
                     &mut self.prompts,
-                    listed.items,
+                    items,
                     &mut self.shrink_prompts_streak,
                     &mut self.prompt_cache_hint,
                     listed.cache_hint,
                     &self.id,
                     "prompt",
                 );
+                if applied {
+                    screened.commit();
+                }
             }
             Ok(listed) => {
                 self.prompt_cache_hint.mark_stale_and_defer();
@@ -8924,7 +9346,14 @@ impl DownstreamServer {
                     );
                 }
                 self.resource_cache_hint = listed.cache_hint;
-                self.resources = listed.items;
+                let mut items = listed.items;
+                screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Resource,
+                    &mut items,
+                )
+                .commit();
+                self.resources = items;
             }
             if let Ok(listed) = fetch_paginated_list(
                 &mut *self.transport,
@@ -8938,7 +9367,14 @@ impl DownstreamServer {
                     );
                 }
                 self.resource_template_cache_hint = listed.cache_hint;
-                self.resource_templates = listed.items;
+                let mut items = listed.items;
+                screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Template,
+                    &mut items,
+                )
+                .commit();
+                self.resource_templates = items;
             }
         }
         if self.caps_prompts {
@@ -8952,7 +9388,14 @@ impl DownstreamServer {
                     );
                 }
                 self.prompt_cache_hint = listed.cache_hint;
-                self.prompts = listed.items;
+                let mut items = listed.items;
+                screen_definitions_for_secrets(
+                    &self.id,
+                    crate::secret_redact::Catalog::Prompt,
+                    &mut items,
+                )
+                .commit();
+                self.prompts = items;
             }
         }
     }
@@ -9013,6 +9456,15 @@ impl DownstreamServer {
     /// this downstream (SOU-394). The gateway only calls this when at least one
     /// upstream client is subscribed to the same URI.
     pub fn subscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
+        // The server's own URI, before either path: an advertised alias means
+        // nothing to it.
+        let uri = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Resource,
+            uri,
+        )
+        .into_owned();
+        let uri = uri.as_str();
         if matches!(self.era, Era::Modern { .. }) {
             if self.modern_resource_subscriptions.insert(uri.to_string()) {
                 let mut resource_subscriptions: Vec<String> =
@@ -9039,6 +9491,15 @@ impl DownstreamServer {
 
     /// Drop a previously established downstream resource subscription.
     pub fn unsubscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
+        // The server's own URI, before either path: an advertised alias means
+        // nothing to it.
+        let uri = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Resource,
+            uri,
+        )
+        .into_owned();
+        let uri = uri.as_str();
         if matches!(self.era, Era::Modern { .. }) {
             if self.modern_resource_subscriptions.remove(uri) {
                 let mut resource_subscriptions: Vec<String> =
@@ -9356,6 +9817,18 @@ pub trait ServerDispatch {
         } else {
             Vec::new()
         };
+        // A name or argument key the server advertised with a secret in it was
+        // shown to clients with the marker; send the server its own text.
+        let tool = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Tool,
+            tool,
+        );
+        let arguments = crate::secret_redact::upstream_arguments(
+            self.server_id(),
+            crate::secret_redact::Catalog::Tool,
+            arguments,
+        );
         self.request_with_mrtr(
             "tools/call",
             json!({ "name": tool, "arguments": arguments }),
@@ -9373,6 +9846,11 @@ pub trait ServerDispatch {
         meta: Option<&Value>,
         mrtr: Option<&MrtrRequest>,
     ) -> Result<Value, TransportError> {
+        let uri = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Resource,
+            uri,
+        );
         self.request_with_mrtr(
             "resources/read",
             json!({ "uri": uri }),
@@ -9391,6 +9869,16 @@ pub trait ServerDispatch {
         meta: Option<&Value>,
         mrtr: Option<&MrtrRequest>,
     ) -> Result<Value, TransportError> {
+        let name = crate::secret_redact::upstream_identifier(
+            self.server_id(),
+            crate::secret_redact::Catalog::Prompt,
+            name,
+        );
+        let arguments = crate::secret_redact::upstream_arguments(
+            self.server_id(),
+            crate::secret_redact::Catalog::Prompt,
+            arguments,
+        );
         self.request_with_mrtr(
             "prompts/get",
             json!({ "name": name, "arguments": arguments }),
@@ -9729,6 +10217,167 @@ fn fetch_paginated_list_with_deadline(
         Truncation::Bounded,
         format!("catalog exceeded the {MAX_LIST_PAGES}-page safety cap"),
     ))
+}
+
+/// Scripted stdio servers for the oversized frame (P09) tests.
+///
+/// The child is this test binary run again with only the
+/// `downstream::tests::p09_stdio_child` test selected, so the tests depend on no
+/// interpreter. They used `/usr/bin/python3`, which on macOS is an `xcrun` shim
+/// whose first launch on a fresh runner can take most of the ten second connect
+/// budget, so whichever test ran it first timed out waiting for its handshake.
+/// The libtest banner lines the child prints first are not JSON, which the
+/// transport ignores like any other stray line.
+#[cfg(all(test, unix))]
+pub(crate) mod p09_child {
+    use serde_json::{json, Value};
+    use std::io::{BufRead, Write};
+
+    const MODE: &str = "TOOLPORT_TEST_P09_CHILD_MODE";
+    const CALLS: &str = "TOOLPORT_TEST_P09_CHILD_CALLS";
+    /// One byte over `MAX_RESPONSE_BYTES`.
+    const OVER_LIMIT: usize = super::MAX_RESPONSE_BYTES as usize + 1;
+    /// What the router tests write: 2049 chunks of 8 KiB, past the limit.
+    const FLOOD: usize = 2049 * 8192;
+
+    #[derive(Clone, Copy)]
+    pub(crate) enum Mode {
+        /// Answer the first request as a readiness ping, read two more, write an
+        /// oversized frame and then the answer to the second, then answer the rest.
+        OwnedCalls,
+        /// Answer every request with `{"ok": true}`.
+        Echo,
+        /// A minimal MCP server whose `tools/call` records the dispatch in the
+        /// calls file, writes an oversized frame, then answers.
+        RouterDispatch,
+        /// Like `RouterDispatch`, but `tools/call` writes an oversized frame and
+        /// never answers.
+        RouterAlwaysOversized,
+    }
+
+    impl Mode {
+        fn name(self) -> &'static str {
+            match self {
+                Mode::OwnedCalls => "owned-calls",
+                Mode::Echo => "echo",
+                Mode::RouterDispatch => "router-dispatch",
+                Mode::RouterAlwaysOversized => "router-always-oversized",
+            }
+        }
+    }
+
+    /// Spawn the scripted child through the production stdio transport.
+    pub(crate) fn spawn(mode: Mode, calls: Option<&std::path::Path>) -> super::StdioTransport {
+        let exe = std::env::current_exe().unwrap();
+        let mut env = vec![(MODE.to_string(), mode.name().to_string())];
+        if let Some(calls) = calls {
+            env.push((CALLS.to_string(), calls.to_string_lossy().into_owned()));
+        }
+        super::StdioTransport::spawn(
+            &exe.to_string_lossy(),
+            &[
+                "--exact".to_string(),
+                "downstream::tests::p09_stdio_child".to_string(),
+                "--nocapture".to_string(),
+                "--test-threads=1".to_string(),
+            ],
+            &env,
+            None,
+            false,
+        )
+        .unwrap()
+    }
+
+    /// The child body. Returns at once in an ordinary test run.
+    pub(crate) fn serve_if_requested() {
+        let Ok(mode) = std::env::var(MODE) else {
+            return;
+        };
+        let calls = std::env::var_os(CALLS);
+        let stdin = std::io::stdin();
+        let mut requests = stdin
+            .lock()
+            .lines()
+            .map_while(Result::ok)
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap());
+        let mut out = std::io::stdout().lock();
+        // A write fails once the parent resets the connection; stop quietly then.
+        let _ = (|| -> std::io::Result<()> {
+            // libtest has printed `test <name> ... ` without a newline; end that
+            // line so the first reply starts a frame of its own.
+            out.write_all(b"\n")?;
+            let reply = |out: &mut std::io::StdoutLock<'_>, id: &Value, result: Value| {
+                writeln!(
+                    out,
+                    "{}",
+                    json!({"jsonrpc": "2.0", "id": id, "result": result})
+                )?;
+                out.flush()
+            };
+            let flood = |out: &mut std::io::StdoutLock<'_>, mut bytes: usize| {
+                let chunk = [b'x'; 8192];
+                while bytes > 0 {
+                    let count = bytes.min(chunk.len());
+                    out.write_all(&chunk[..count])?;
+                    bytes -= count;
+                }
+                out.flush()
+            };
+            match mode.as_str() {
+                "owned-calls" => {
+                    let Some(ready) = requests.next() else {
+                        return Ok(());
+                    };
+                    reply(&mut out, &ready["id"], json!({"ready": true}))?;
+                    let (Some(_first), Some(second)) = (requests.next(), requests.next()) else {
+                        return Ok(());
+                    };
+                    flood(&mut out, OVER_LIMIT)?;
+                    out.write_all(b"\n")?;
+                    reply(&mut out, &second["id"], json!({"ok": true}))?;
+                    for request in requests {
+                        reply(&mut out, &request["id"], json!({"ok": true}))?;
+                    }
+                }
+                "echo" => {
+                    for request in requests {
+                        reply(&mut out, &request["id"], json!({"ok": true}))?;
+                    }
+                }
+                "router-dispatch" | "router-always-oversized" => {
+                    for request in requests {
+                        let Some(id) = request.get("id") else {
+                            continue;
+                        };
+                        let result = match request["method"].as_str() {
+                            Some("initialize") => {
+                                json!({"protocolVersion": "2025-06-18", "capabilities": {}})
+                            }
+                            Some("tools/list") => json!({"tools": [{"name": "echo"}]}),
+                            Some("tools/call") if mode == "router-always-oversized" => {
+                                flood(&mut out, FLOOD)?;
+                                continue;
+                            }
+                            Some("tools/call") => {
+                                let path = calls.as_ref().expect("calls file");
+                                let mut file = crate::registry::open_append_private(
+                                    std::path::Path::new(path),
+                                )?;
+                                file.write_all(b"dispatch\n")?;
+                                flood(&mut out, FLOOD)?;
+                                out.write_all(b"\n")?;
+                                json!({"ok": true})
+                            }
+                            _ => json!({}),
+                        };
+                        reply(&mut out, id, result)?;
+                    }
+                }
+                other => panic!("unknown p09 child mode {other}"),
+            }
+            Ok(())
+        })();
+    }
 }
 
 #[cfg(test)]
@@ -12297,11 +12946,13 @@ mod tests {
         let registry = CancelRegistry::new();
         assert!(!registry.cancel("7", Some("too slow")));
 
-        assert!(registry.begin_client_request("7".to_string()));
+        let ctx_7 = registry
+            .begin_client_request("7".to_string())
+            .expect("begins");
         assert!(registry.cancel("7", Some("too slow")));
         assert!(registry.is_cancelled("7"));
 
-        registry.finish_client_request("7");
+        ctx_7.finish();
         assert!(!registry.is_cancelled("7"));
         assert!(!registry.cancel("7", None));
     }
@@ -12309,25 +12960,491 @@ mod tests {
     #[test]
     fn cancel_registry_rejects_duplicate_active_ids() {
         let registry = CancelRegistry::new();
-        assert!(registry.begin_client_request("7".to_string()));
-        assert!(!registry.begin_client_request("7".to_string()));
+        let ctx_7 = registry
+            .begin_client_request("7".to_string())
+            .expect("begins");
+        assert!(registry.begin_client_request("7".to_string()).is_none());
 
-        registry.finish_client_request("7");
-        assert!(registry.begin_client_request("7".to_string()));
+        ctx_7.finish();
+        assert!(registry.begin_client_request("7".to_string()).is_some());
+    }
+
+    #[test]
+    fn a_cancelled_id_can_be_reused_before_its_request_finishes() {
+        // A client that cancelled 7 no longer has 7 in flight and may send a new 7
+        // while the old exchange is still unwinding. Each instance keeps its own
+        // state: the old one stays cancelled and finishes only itself.
+        let registry = CancelRegistry::new();
+        let ctx_7 = registry
+            .begin_client_request("7".to_string())
+            .expect("begins");
+        let old = ctx_7.clone();
+        assert!(registry.cancel("7", Some("user")));
+        let ctx_7_5 = registry
+            .begin_client_request("7".to_string())
+            .expect("begins");
+        let new = ctx_7_5.clone();
+        assert!(old.is_cancelled());
+        assert!(!new.is_cancelled());
+        // A live, uncancelled 7 is still a duplicate.
+        assert!(registry.begin_client_request("7".to_string()).is_none());
+        // The old worker finishing does not end the replacement.
+        old.finish();
+        assert!(registry.begin_client_request("7".to_string()).is_none());
+        // A cancel for 7 now reaches the replacement, and only it.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fired = Arc::new(AtomicBool::new(false));
+        let seen = fired.clone();
+        let _hook = new.on_cancel(Arc::new(move |_| seen.store(true, Ordering::SeqCst)));
+        assert!(registry.cancel("7", None));
+        assert!(new.is_cancelled());
+        assert!(fired.load(Ordering::SeqCst));
+        new.finish();
+        let ctx_7_6 = registry
+            .begin_client_request("7".to_string())
+            .expect("begins");
+        assert!(!ctx_7_6.clone().is_cancelled());
+    }
+
+    mod cancellation_model {
+        use crate::downstream::{CancelContext, CancelGuard, CancelRegistry, CloseGuard};
+        use std::sync::{Arc, Mutex};
+
+        // Sol round 4: a reused id's handle comes from the locked begin, so a paused
+        // request cannot pick up its replacement's live context.
+        #[test]
+        fn http_begin_then_context_can_capture_replacement() {
+            let registry = CancelRegistry::new();
+            let a = registry.begin_client_request("7".into()).expect("A begins");
+            assert!(registry.cancel("7", None));
+            let b = registry
+                .begin_client_request("7".into())
+                .expect("B reuses the cancelled id");
+            assert!(a.is_cancelled(), "cancelled A acquired B's live context");
+            assert!(!b.is_cancelled());
+        }
+
+        // Sol round 4: an old connection's disconnect cancels its own instance only.
+        #[test]
+        fn old_http_disconnect_must_not_cancel_replacement() {
+            let registry = CancelRegistry::new();
+            let connection = CancelRegistry::new();
+            let a = registry.begin_client_request("7".into()).expect("A begins");
+            let own = a.clone();
+            let _watch = connection.on_close(Arc::new(move |_| {
+                own.cancel(Some("HTTP caller disconnected"));
+            }));
+            assert!(registry.cancel("7", None));
+            let b = registry.begin_client_request("7".into()).expect("B begins");
+            connection.close();
+            assert!(!b.is_cancelled(), "disconnect of A cancelled B");
+            assert!(a.is_cancelled());
+        }
+
+        // Sol round 5: closing the connection retires an answered request's retained
+        // work, which a client cancellation after the answer does not.
+        #[test]
+        fn closing_retires_a_hook_an_answered_request_still_holds() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let registry = CancelRegistry::new();
+            let context = registry.begin_client_request("1".into()).expect("begins");
+            let fired = Arc::new(AtomicUsize::new(0));
+            let seen = fired.clone();
+            let retained = context.on_cancel(Arc::new(move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }));
+            assert!(context.reply_with(|| {}));
+            context.finish();
+            assert!(
+                !registry.cancel("1", None),
+                "an answered request ignores a cancel"
+            );
+            assert_eq!(fired.load(Ordering::SeqCst), 0);
+            registry.close();
+            assert_eq!(
+                fired.load(Ordering::SeqCst),
+                1,
+                "connection close failed to retire an answered request's retained resource"
+            );
+            registry.close();
+            assert!(!context.cancel(None));
+            assert_eq!(fired.load(Ordering::SeqCst), 1);
+            drop(retained);
+            assert!(registry.is_empty());
+        }
+
+        /// One step of the cancellation model.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Step {
+            Begin(usize),
+            WatchConnection(usize),
+            Hook(usize),
+            Progress(usize),
+            Reply(usize),
+            Finish(usize),
+            /// The suspended work that kept A's hook past its reply resumes or expires.
+            Release(usize),
+            ClientCancel,
+            Disconnect,
+            /// The request registry closes: a session's DELETE or expiry, or an
+            /// adapter lifetime ending. On stdio, `Disconnect` is that close.
+            CloseSession,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Path {
+            /// Each request on its own socket; a dropped socket cancels its own request.
+            Http,
+            /// The gateway's stdio loop: one reader begins requests in order, and stdin
+            /// closing closes the connection.
+            Stdio,
+        }
+
+        /// A thread of steps that may start only after `after` (thread, steps done).
+        struct Program {
+            steps: Vec<Step>,
+            after: Option<(usize, usize)>,
+        }
+
+        /// Every interleaving of `programs`, each as the order its steps ran in.
+        fn interleavings(programs: &[Program]) -> Vec<Vec<Step>> {
+            fn walk(
+                programs: &[Program],
+                done: &mut Vec<usize>,
+                order: &mut Vec<Step>,
+                out: &mut Vec<Vec<Step>>,
+            ) {
+                let mut moved = false;
+                for thread in 0..programs.len() {
+                    let program = &programs[thread];
+                    if done[thread] == program.steps.len() {
+                        continue;
+                    }
+                    if let Some((other, count)) = program.after {
+                        if done[other] < count {
+                            continue;
+                        }
+                    }
+                    moved = true;
+                    order.push(program.steps[done[thread]]);
+                    done[thread] += 1;
+                    walk(programs, done, order, out);
+                    done[thread] -= 1;
+                    order.pop();
+                }
+                if !moved {
+                    out.push(order.clone());
+                }
+            }
+            let mut out = Vec::new();
+            walk(
+                programs,
+                &mut vec![0; programs.len()],
+                &mut Vec::new(),
+                &mut out,
+            );
+            out
+        }
+
+        #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+        enum Seen {
+            Began(usize),
+            Progress(usize),
+            Reply(usize),
+            Refused(usize),
+        }
+
+        /// Run one interleaving of two instances of `key` (A = 0, B = 1) and check every
+        /// property the design promises.
+        fn run_model(path: Path, key: &str, order: &[Step]) {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let registry = CancelRegistry::new();
+            // A's own socket on the HTTP path.
+            let connection = CancelRegistry::new();
+            let log = Arc::new(Mutex::new(Vec::<Seen>::new()));
+            let upstream = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+            let mut contexts: [Option<CancelContext>; 2] = [None, None];
+            let mut refused = [false; 2];
+            let mut finished = [false; 2];
+            let mut hooks: [Option<CancelGuard>; 2] = [None, None];
+            let mut watch: Option<CloseGuard> = None;
+            let mut client_cancelled_a = false;
+            let mut disconnected = false;
+            let mut registry_closed = false;
+            // An answered instance whose retained hook the close had to run.
+            let mut retired_after_reply = [false; 2];
+            let mut close_registry =
+                |hooks: &[Option<CancelGuard>; 2],
+                 contexts: &[Option<CancelContext>; 2],
+                 log: &Arc<Mutex<Vec<Seen>>>| {
+                    registry_closed = true;
+                    let held = [0, 1]
+                        .map(|x| hooks[x].is_some() && upstream[x].load(Ordering::SeqCst) == 0);
+                    for x in 0..2 {
+                        retired_after_reply[x] =
+                            held[x] && log.lock().unwrap().contains(&Seen::Reply(x));
+                    }
+                    registry.close();
+                    // Every hook still held runs exactly once, answered or not.
+                    for x in 0..2 {
+                        if held[x] {
+                            assert_eq!(
+                                upstream[x].load(Ordering::SeqCst),
+                                1,
+                                "{order:?}: closing did not retire {x}'s held hook"
+                            );
+                        }
+                    }
+                    let _ = contexts;
+                };
+            for step in order {
+                match *step {
+                    Step::Begin(x) => match registry.begin_client_request(key.to_string()) {
+                        Some(context) => {
+                            log.lock().unwrap().push(Seen::Began(x));
+                            contexts[x] = Some(context);
+                        }
+                        None => {
+                            refused[x] = true;
+                            log.lock().unwrap().push(Seen::Refused(x));
+                        }
+                    },
+                    Step::WatchConnection(x) => {
+                        if let Some(own) = contexts[x].clone() {
+                            watch = Some(connection.on_close(Arc::new(move |_| {
+                                own.cancel(Some("HTTP caller disconnected"));
+                            })));
+                        }
+                    }
+                    Step::Hook(x) => {
+                        if let Some(context) = &contexts[x] {
+                            let count = upstream[x].clone();
+                            hooks[x] = Some(context.on_cancel(Arc::new(move |_| {
+                                count.fetch_add(1, Ordering::SeqCst);
+                            })));
+                        }
+                    }
+                    Step::Progress(x) => {
+                        if let Some(context) = &contexts[x] {
+                            let log = log.clone();
+                            context.speak_with(|| log.lock().unwrap().push(Seen::Progress(x)));
+                        }
+                    }
+                    Step::Reply(x) => {
+                        if let Some(context) = &contexts[x] {
+                            let log = log.clone();
+                            context.reply_with(|| log.lock().unwrap().push(Seen::Reply(x)));
+                        }
+                    }
+                    Step::Finish(x) => {
+                        if let Some(context) = &contexts[x] {
+                            let other = 1 - x;
+                            let other_active =
+                                contexts[other].as_ref().map(CancelContext::is_active);
+                            context.finish();
+                            // A keeps its hook past the reply, as suspended
+                            // downstream work does, until `Release`.
+                            if x != 0 {
+                                hooks[x] = None;
+                            }
+                            if x == 0 {
+                                watch = None;
+                            }
+                            assert_eq!(
+                                contexts[other].as_ref().map(CancelContext::is_active),
+                                other_active,
+                                "{order:?}: finishing {x} changed the other instance"
+                            );
+                        }
+                        finished[x] = true;
+                    }
+                    Step::Release(x) => hooks[x] = None,
+                    Step::ClientCancel => {
+                        client_cancelled_a = registry.cancel(key, Some("user"));
+                    }
+                    Step::Disconnect => {
+                        disconnected = true;
+                        match path {
+                            Path::Http => connection.close(),
+                            Path::Stdio => close_registry(&hooks, &contexts, &log),
+                        }
+                    }
+                    Step::CloseSession => close_registry(&hooks, &contexts, &log),
+                }
+            }
+            drop(close_registry);
+            let log = log.lock().unwrap().clone();
+            let count = |seen: Seen| log.iter().filter(|entry| **entry == seen).count();
+            for x in 0..2 {
+                let cancels = upstream[x].load(Ordering::SeqCst);
+                // Cancelled upstream at most once.
+                assert!(
+                    cancels <= 1,
+                    "{order:?}: {x} cancelled upstream {cancels} times"
+                );
+                if refused[x] {
+                    assert_eq!(count(Seen::Reply(x)), 0, "{order:?}");
+                    continue;
+                }
+                // Cancelled or answered, never both, and answered once. An answered
+                // instance's hook runs only when the close retired its held work.
+                let replies = count(Seen::Reply(x));
+                assert!(replies <= 1, "{order:?}: {x} replied {replies} times");
+                let expected = if replies == 0 {
+                    1
+                } else {
+                    usize::from(retired_after_reply[x])
+                };
+                assert_eq!(
+                    cancels, expected,
+                    "{order:?}: {x} replied {replies} times, cancelled {cancels} times"
+                );
+            }
+            // Only the right instance is cancelled: B by nothing but the registry
+            // closing.
+            let b_may_be_cancelled = registry_closed;
+            if !b_may_be_cancelled {
+                assert_eq!(
+                    upstream[1].load(Ordering::SeqCst),
+                    0,
+                    "{order:?}: B was cancelled"
+                );
+            }
+            if upstream[0].load(Ordering::SeqCst) == 1 {
+                assert!(
+                    client_cancelled_a || disconnected || registry_closed,
+                    "{order:?}: A cancelled by nobody"
+                );
+            }
+            // Once the client's cancellation reached A, nothing from A reaches the
+            // client after B has begun. (A cancellation that arrives before its
+            // request exists cancels nothing; see `cancel_instance` for the adapter,
+            // which numbers its requests so that cannot happen.)
+            let b_began = log.iter().position(|seen| *seen == Seen::Began(1));
+            if let Some(b_began) = b_began.filter(|_| client_cancelled_a) {
+                assert!(
+                    !log[b_began..]
+                        .iter()
+                        .any(|seen| matches!(seen, Seen::Progress(0) | Seen::Reply(0))),
+                    "{order:?}: A spoke after B began: {log:?}"
+                );
+            }
+            // A request refused as a duplicate means the other was live.
+            if refused[1] && !registry_closed {
+                assert!(
+                    !client_cancelled_a,
+                    "{order:?}: B refused although A was cancelled"
+                );
+            }
+            assert!(finished.iter().all(|done| *done));
+            drop(watch);
+            assert!(registry.is_empty(), "{order:?}: registry not empty");
+            assert!(connection.is_empty(), "{order:?}: connection not empty");
+        }
+
+        fn model_programs(path: Path) -> Vec<Program> {
+            let worker = |x: usize, watch: bool| {
+                let mut steps = Vec::new();
+                if path == Path::Http {
+                    steps.push(Step::Begin(x));
+                }
+                if watch {
+                    steps.push(Step::WatchConnection(x));
+                }
+                steps.push(Step::Hook(x));
+                // B's progress on HTTP adds runs without new orders that matter:
+                // nothing cancels B before the registry closes.
+                if x == 0 || path == Path::Stdio {
+                    steps.push(Step::Progress(x));
+                }
+                steps.extend([Step::Reply(x), Step::Finish(x)]);
+                if x == 0 {
+                    steps.push(Step::Release(x));
+                }
+                steps
+            };
+            match path {
+                // Each request begins on its own handler thread. The client sends its
+                // cancellation, waits for the 202, then sends B.
+                Path::Http => vec![
+                    Program {
+                        steps: worker(0, true),
+                        after: None,
+                    },
+                    Program {
+                        steps: vec![Step::ClientCancel],
+                        after: None,
+                    },
+                    Program {
+                        steps: worker(1, false),
+                        after: Some((1, 1)),
+                    },
+                    Program {
+                        steps: vec![Step::Disconnect],
+                        after: None,
+                    },
+                    Program {
+                        steps: vec![Step::CloseSession],
+                        after: None,
+                    },
+                ],
+                // One reader: begin A, read the cancellation, begin B. Each worker starts
+                // after its request began.
+                Path::Stdio => vec![
+                    Program {
+                        steps: vec![Step::Begin(0), Step::ClientCancel, Step::Begin(1)],
+                        after: None,
+                    },
+                    Program {
+                        steps: worker(0, false),
+                        after: Some((0, 1)),
+                    },
+                    Program {
+                        steps: worker(1, false),
+                        after: Some((0, 3)),
+                    },
+                    Program {
+                        steps: vec![Step::Disconnect],
+                        after: None,
+                    },
+                ],
+            }
+        }
+
+        /// Every interleaving of begin, cancel, reuse, progress, reply, disconnect,
+        /// finish, the registry closing and retained work being released, for two
+        /// instances of one id, on the HTTP path and the stdio loop, for
+        /// a numeric and a string id. Both protocol eras use this same registry (a
+        /// session's or an adapter lifetime's), so the era does not change these runs.
+        #[test]
+        fn every_interleaving_of_two_instances_of_one_id_keeps_them_apart() {
+            let mut total = 0;
+            for path in [Path::Http, Path::Stdio] {
+                let orders = interleavings(&model_programs(path));
+                for key in ["7", "\"7\""] {
+                    for order in &orders {
+                        run_model(path, key, order);
+                    }
+                    total += orders.len();
+                }
+                eprintln!(
+                    "cancellation model {path:?}: {} interleavings per id",
+                    orders.len()
+                );
+            }
+            eprintln!("cancellation model: {total} runs");
+            assert!(total > 10_000);
+        }
     }
 
     #[test]
     fn cancel_registry_persists_reason_for_deferred_forward() {
         let registry = CancelRegistry::new();
-        assert!(registry.begin_client_request("7".to_string()));
+        let ctx_7 = registry
+            .begin_client_request("7".to_string())
+            .expect("begins");
         assert!(registry.cancel("7", Some("too slow")));
-
-        let state = registry
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cancelled = state.cancelled.get("7").expect("cancelled state");
-        assert_eq!(cancelled.as_deref(), Some("too slow"));
+        assert_eq!(ctx_7.reason().as_deref(), Some("too slow"));
     }
 
     /// A real child process that records everything written to its stdin, so a
@@ -12859,39 +13976,18 @@ mod tests {
         }
     }
 
+    /// Entry point for the scripted child in [`super::p09_child`]; a no-op in
+    /// an ordinary run.
+    #[cfg(unix)]
+    #[test]
+    fn p09_stdio_child() {
+        super::p09_child::serve_if_requested();
+    }
+
     #[cfg(unix)]
     #[test]
     fn p09_oversized_stdio_frame_fails_owned_calls_and_allows_explicit_reconnect() {
-        struct Scratch(std::path::PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let dir = Scratch(
-            std::env::temp_dir().join(format!("toolport-p09-downstream-{}", std::process::id())),
-        );
-        std::fs::create_dir_all(&dir.0).unwrap();
-        let bad = dir.0.join("oversized.py");
-        std::fs::write(&bad, r#"import json, sys
-ready = json.loads(sys.stdin.readline())
-print(json.dumps({'jsonrpc':'2.0','id':ready['id'],'result':{'ready':True}}), flush=True)
-requests = [json.loads(sys.stdin.readline()) for _ in range(2)]
-sys.stdout.buffer.write(b'x' * (16 * 1024 * 1024 + 1))
-sys.stdout.buffer.write(b'\n' + json.dumps({'jsonrpc':'2.0','id':requests[1]['id'],'result':{'ok':True}}).encode() + b'\n')
-sys.stdout.buffer.flush()
-for line in sys.stdin:
-    request = json.loads(line)
-    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'ok':True}}), flush=True)
-"#).unwrap();
-        let mut transport = super::StdioTransport::spawn(
-            "/usr/bin/python3",
-            &[bad.to_string_lossy().into_owned()],
-            &[],
-            None,
-            false,
-        )
-        .unwrap();
+        let mut transport = super::p09_child::spawn(super::p09_child::Mode::OwnedCalls, None);
         // Establish child readiness before measuring the bounded call phase.
         transport.set_read_timeout(super::STDIO_CONNECT_TIMEOUT);
         assert_eq!(transport.request("ping", json!({})).unwrap()["ready"], true);
@@ -12943,24 +14039,7 @@ for line in sys.stdin:
             .is_err());
         drop(handle);
         drop(transport);
-        let good = dir.0.join("bounded.py");
-        std::fs::write(
-            &good,
-            r#"import json, sys
-for line in sys.stdin:
-    request = json.loads(line)
-    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'ok':True}}), flush=True)
-"#,
-        )
-        .unwrap();
-        let mut fresh = super::StdioTransport::spawn(
-            "/usr/bin/python3",
-            &[good.to_string_lossy().into_owned()],
-            &[],
-            None,
-            false,
-        )
-        .unwrap();
+        let mut fresh = super::p09_child::spawn(super::p09_child::Mode::Echo, None);
         assert_eq!(
             fresh
                 .request("tools/call", json!({"name":"later"}))
@@ -13025,11 +14104,13 @@ for line in sys.stdin:
         let input = held.join().unwrap().unwrap();
         assert_eq!(input["resultType"], "input_required");
         let registry = CancelRegistry::new();
-        assert!(registry.begin_client_request("cancelled".into()));
+        let ctx_cancelled = registry
+            .begin_client_request("cancelled".into())
+            .expect("begins");
         let cancelled = fixture.request(
             "cancelled",
             json!({"name":"cancelled"}),
-            Some(registry.context("cancelled".into())),
+            Some(ctx_cancelled.clone()),
         );
         let other = fixture.request("other", json!({"name":"other"}), None);
         fixture.wait_for_pending(3);
@@ -13074,17 +14155,19 @@ for line in sys.stdin:
         *fixture.core.server_handler.lock().unwrap() =
             Some(Arc::new(|_| Some(ServerRequestAction::InputRequired)));
         let registry = CancelRegistry::new();
-        assert!(registry.begin_client_request("suspended".into()));
+        let ctx_suspended = registry
+            .begin_client_request("suspended".into())
+            .expect("begins");
         let first = fixture.request(
             "a",
             json!({"name":"interactive", "arguments":{}}),
-            Some(registry.context("suspended".into())),
+            Some(ctx_suspended.clone()),
         );
         fixture.wait_for_pending(1);
         fixture.server_says(server_request("input", "elicitation/create"));
         let held = first.join().unwrap().unwrap();
         assert_eq!(held["resultType"], "input_required");
-        registry.finish_client_request("suspended");
+        ctx_suspended.finish();
         assert!(
             registry.cancel("suspended", Some("caller left")),
             "finished rounds must retain ownership"
@@ -13172,16 +14255,18 @@ for line in sys.stdin:
         transport.server_handler = Some(Arc::new(|_| Some(ServerRequestAction::InputRequired)));
         let handle = transport.concurrent().unwrap();
         let registry = CancelRegistry::new();
-        assert!(registry.begin_client_request("held".into()));
+        let ctx_held = registry
+            .begin_client_request("held".into())
+            .expect("begins");
         let held = handle
             .request_with_cancel(
                 "tools/call",
                 json!({"name":"interactive","arguments":{}}),
-                Some(registry.context("held".into())),
+                Some(ctx_held.clone()),
             )
             .unwrap();
         assert_eq!(held["resultType"], "input_required");
-        registry.finish_client_request("held");
+        ctx_held.finish();
         registry.close();
         registry.close();
         let (original, frames) = seen_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -13215,12 +14300,8 @@ for line in sys.stdin:
         let registry = CancelRegistry::new();
         let mut workers = Vec::new();
         for id in ["one", "two"] {
-            assert!(registry.begin_client_request(id.into()));
-            workers.push(fixture.request(
-                "a",
-                json!({"name":id}),
-                Some(registry.context(id.into())),
-            ));
+            let ctx_id = registry.begin_client_request(id.into()).expect("begins");
+            workers.push(fixture.request("a", json!({"name":id}), Some(ctx_id.clone())));
         }
         fixture.wait_for_pending(2);
         for name in ["one", "two"] {
@@ -13258,12 +14339,10 @@ for line in sys.stdin:
     fn stdio_cancellation_wakes_the_waiter_and_drops_the_late_response() {
         let fixture = CoreFixture::new("cancel-wakes", "");
         let registry = CancelRegistry::new();
-        assert!(registry.begin_client_request("c-9".to_string()));
-        let cancelled = fixture.request(
-            "a",
-            json!({ "name": "slow" }),
-            Some(registry.context("c-9".to_string())),
-        );
+        let ctx_c_9 = registry
+            .begin_client_request("c-9".to_string())
+            .expect("begins");
+        let cancelled = fixture.request("a", json!({ "name": "slow" }), Some(ctx_c_9.clone()));
         fixture.wait_for_pending(1);
         // A call cancelled before it is written never reaches the server, so
         // there is nothing to cancel downstream. Cancel after the write.
@@ -13276,7 +14355,7 @@ for line in sys.stdin:
             Err(TransportError::Cancelled(_))
         ));
         assert!(fixture.core.lock_state().pending.is_empty());
-        registry.finish_client_request("c-9");
+        ctx_c_9.finish();
 
         // The late answer has no waiter; the next request still gets its own.
         fixture.server_says(response(1, json!({ "late": true })));
@@ -13321,6 +14400,34 @@ for line in sys.stdin:
             other => panic!("a request after the exit must fail at once, got {other:?}"),
         }
         fixture.finish();
+    }
+
+    #[test]
+    fn a_stderr_tail_never_reports_a_piece_of_a_secret() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-tail-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        crate::secret_redact::register("tail-server", "TAIL_KEY", "sk-TailSecret789xyz");
+        // The kept tail starts inside one secret (the ring trimmed the rest) and
+        // a tool wrapped another across a line break.
+        let mut fixture = CoreFixture::new(
+            "tail",
+            "Secret789xyz was rejected\nretrying with sk-Tail\nSecret789xyz\n",
+        );
+        let waiter = fixture.request("a", json!({ "name": "one" }), None);
+        fixture.wait_for_pending(1);
+        fixture.close_stdout();
+        match waiter.join().unwrap() {
+            Err(TransportError::Unavailable(message)) => {
+                assert!(message.contains("was rejected"), "{message}");
+                for piece in ["Secret789", "sk-Tail", "789xyz"] {
+                    assert!(!message.contains(piece), "{piece} in {message}");
+                }
+            }
+            other => panic!("expected the exit to fail the call, got {other:?}"),
+        }
+        fixture.finish();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn server_request(id: &str, method: &str) -> Value {
@@ -13478,7 +14585,9 @@ for line in sys.stdin:
         });
 
         let registry = CancelRegistry::new();
-        assert!(registry.begin_client_request("c-1".to_string()));
+        let ctx_c_1 = registry
+            .begin_client_request("c-1".to_string())
+            .expect("begins");
         assert!(registry.cancel("c-1", Some("user pressed stop")));
         let key = suspended["inputRequests"]
             .as_object()
@@ -13495,13 +14604,13 @@ for line in sys.stdin:
                 "requestState": suspended["requestState"].clone(),
                 "inputResponses": { key: { "action": "accept" } }
             }),
-            Some(registry.context("c-1".to_string())),
+            Some(ctx_c_1.clone()),
         );
         assert!(matches!(
             retry.join().unwrap(),
             Err(TransportError::Cancelled(_))
         ));
-        registry.finish_client_request("c-1");
+        ctx_c_1.finish();
         {
             let state = fixture.core.lock_state();
             assert!(state.suspended.is_empty());
@@ -13762,7 +14871,7 @@ for line in sys.stdin:
     #[test]
     fn pre_cancelled_stdio_call_does_not_reach_downstream() {
         let registry = CancelRegistry::new();
-        assert!(registry.begin_client_request("c-1".into()));
+        let ctx_c_1 = registry.begin_client_request("c-1".into()).expect("begins");
         assert!(registry.cancel("c-1", Some("user pressed stop")));
         let recorder = StdinRecorder::new("pre-cancelled");
         let mut transport = stdio_transport_fixture(
@@ -13773,11 +14882,11 @@ for line in sys.stdin:
             transport.request_with_cancel(
                 "tools/call",
                 json!({"name":"echo"}),
-                Some(registry.context("c-1".into()))
+                Some(ctx_c_1.clone())
             ),
             Err(TransportError::Cancelled(_))
         ));
-        registry.finish_client_request("c-1");
+        ctx_c_1.finish();
         drop(transport);
         assert!(recorder.finish().is_empty());
     }
@@ -13786,7 +14895,9 @@ for line in sys.stdin:
     fn cancel_before_registration_is_forwarded_once_the_request_is_written() {
         use std::io::Write;
         let registry = CancelRegistry::new();
-        assert!(registry.begin_client_request("between".into()));
+        let ctx_between = registry
+            .begin_client_request("between".into())
+            .expect("begins");
         let recorder = StdinRecorder::new("between-write-registration");
         {
             let mut stdin = recorder.stdin.lock().unwrap();
@@ -13799,16 +14910,13 @@ for line in sys.stdin:
             stdin.flush().unwrap();
         }
         assert!(registry.cancel("between", Some("stop")));
-        let guard = registry.register(
-            "between".into(),
-            super::CancelEntry {
-                stdin: recorder.stdin.clone(),
-                forwarder: super::StdioForwarder::new(std::sync::Weak::new()),
-                downstream_id: json!(41),
-                waiter: None,
-                forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            },
-        );
+        let guard = ctx_between.register(super::CancelEntry {
+            stdin: recorder.stdin.clone(),
+            forwarder: super::StdioForwarder::new(std::sync::Weak::new()),
+            downstream_id: json!(41),
+            waiter: None,
+            forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
         registry.cancel("between", None);
         drop(guard);
         let frames = recorder.finish();
@@ -13828,17 +14936,14 @@ for line in sys.stdin:
         let mut guards = Vec::new();
         for id in 0..80 {
             let key = id.to_string();
-            assert!(registry.begin_client_request(key.clone()));
-            guards.push(registry.register(
-                key,
-                super::CancelEntry {
-                    stdin: fixture.recorder.stdin.clone(),
-                    forwarder: fixture.core.forwarder.clone(),
-                    downstream_id: json!(id),
-                    waiter: None,
-                    forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                },
-            ));
+            let ctx_key = registry.begin_client_request(key.clone()).expect("begins");
+            guards.push(ctx_key.register(super::CancelEntry {
+                stdin: fixture.recorder.stdin.clone(),
+                forwarder: fixture.core.forwarder.clone(),
+                downstream_id: json!(id),
+                waiter: None,
+                forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }));
         }
         registry.close();
         for id in 80..100 {
@@ -13923,19 +15028,18 @@ for line in sys.stdin:
         use super::CancelEntry;
 
         let registry = CancelRegistry::new();
-        assert!(registry.begin_client_request("c-2".to_string()));
+        let ctx_c_2 = registry
+            .begin_client_request("c-2".to_string())
+            .expect("begins");
 
         let recorder = StdinRecorder::new("latch");
-        let guard = registry.register(
-            "c-2".to_string(),
-            CancelEntry {
-                stdin: Arc::clone(&recorder.stdin),
-                forwarder: super::StdioForwarder::new(std::sync::Weak::new()),
-                downstream_id: json!(41),
-                waiter: None,
-                forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            },
-        );
+        let guard = ctx_c_2.register(CancelEntry {
+            stdin: Arc::clone(&recorder.stdin),
+            forwarder: super::StdioForwarder::new(std::sync::Weak::new()),
+            downstream_id: json!(41),
+            waiter: None,
+            forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
 
         assert!(registry.cancel("c-2", Some("user pressed stop")));
         // Clients that hold down the stop key send this more than once.
@@ -13943,7 +15047,7 @@ for line in sys.stdin:
         assert!(registry.cancel("c-2", None));
 
         drop(guard);
-        registry.finish_client_request("c-2");
+        ctx_c_2.finish();
 
         let frames = recorder.finish();
         assert_eq!(
@@ -13966,39 +15070,35 @@ for line in sys.stdin:
         use super::CancelEntry;
 
         let registry = CancelRegistry::new();
-        assert!(registry.begin_client_request("c-3".to_string()));
+        let ctx_c_3 = registry
+            .begin_client_request("c-3".to_string())
+            .expect("begins");
 
         let first_recorder = StdinRecorder::new("retry-first");
-        let first_guard = registry.register(
-            "c-3".to_string(),
-            CancelEntry {
-                stdin: Arc::clone(&first_recorder.stdin),
-                forwarder: super::StdioForwarder::new(std::sync::Weak::new()),
-                downstream_id: json!(41),
-                waiter: None,
-                forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            },
-        );
+        let first_guard = ctx_c_3.register(CancelEntry {
+            stdin: Arc::clone(&first_recorder.stdin),
+            forwarder: super::StdioForwarder::new(std::sync::Weak::new()),
+            downstream_id: json!(41),
+            waiter: None,
+            forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
         assert!(registry.cancel("c-3", Some("user pressed stop")));
         // The first attempt is over before the retry registers, so its guard
         // cannot evict the replacement entry on drop.
         drop(first_guard);
 
         let second_recorder = StdinRecorder::new("retry-second");
-        let second_guard = registry.register(
-            "c-3".to_string(),
-            CancelEntry {
-                stdin: Arc::clone(&second_recorder.stdin),
-                forwarder: super::StdioForwarder::new(std::sync::Weak::new()),
-                downstream_id: json!(42),
-                waiter: None,
-                forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            },
-        );
+        let second_guard = ctx_c_3.register(CancelEntry {
+            stdin: Arc::clone(&second_recorder.stdin),
+            forwarder: super::StdioForwarder::new(std::sync::Weak::new()),
+            downstream_id: json!(42),
+            waiter: None,
+            forwarded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
         // Same post-write step the stdio request path runs.
         assert!(registry.is_cancelled("c-3"));
         drop(second_guard);
-        registry.finish_client_request("c-3");
+        ctx_c_3.finish();
 
         let first = first_recorder.finish();
         assert_eq!(first.len(), 1, "the first attempt was cancelled: {first:?}");
@@ -15586,6 +16686,46 @@ for line in sys.stdin:
                 .resource_subscriptions,
             vec!["fixture://a".to_string()]
         );
+        // A resource whose URI holds a secret is advertised under an alias;
+        // the server is subscribed to its own URI, and unsubscribed from it.
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("tp-sub-alias-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        crate::secret_redact::register("modern", "RES_KEY", "res-secret-4Kp9Wz");
+        let mut resources = vec![json!({"uri": "mem://res-secret-4Kp9Wz/doc", "name": "r"})];
+        crate::secret_redact::screen_definitions(
+            "modern",
+            crate::secret_redact::Catalog::Resource,
+            &mut resources,
+        )
+        .commit();
+        let alias = resources[0]["uri"].as_str().unwrap().to_string();
+        assert!(alias.contains("[secret:"), "{alias}");
+        server.subscribe_resource(&alias).unwrap();
+        let listened = filters
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .resource_subscriptions
+            .clone();
+        server.unsubscribe_resource(&alias).unwrap();
+        let after = filters
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .resource_subscriptions
+            .clone();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            listened,
+            vec![
+                "fixture://a".to_string(),
+                "mem://res-secret-4Kp9Wz/doc".to_string()
+            ]
+        );
+        assert_eq!(after, vec!["fixture://a".to_string()]);
         assert!(
             requests
                 .lock()
@@ -17684,8 +18824,10 @@ for line in sys.stdin:
         });
 
         let cancellations = CancelRegistry::new();
-        assert!(cancellations.begin_client_request("http-stall".to_string()));
-        let cancel_context = cancellations.context("http-stall".to_string());
+        let ctx_http_stall = cancellations
+            .begin_client_request("http-stall".to_string())
+            .expect("begins");
+        let cancel_context = ctx_http_stall.clone();
         let url = format!("http://127.0.0.1:{port}/");
         let worker = std::thread::spawn(move || {
             let mut transport = HttpTransport::new(&url);
@@ -17724,7 +18866,7 @@ for line in sys.stdin:
         assert!(follower_started.elapsed() < Duration::from_millis(100));
 
         release_tx.send(()).unwrap();
-        cancellations.finish_client_request("http-stall");
+        ctx_http_stall.finish();
         handle.join().unwrap();
 
         // Once the sole worker has drained, its full protocol state is restored
@@ -17841,8 +18983,10 @@ for line in sys.stdin:
         });
 
         let cancellations = CancelRegistry::new();
-        assert!(cancellations.begin_client_request("mrtr-cancel".to_string()));
-        let cancel_context = cancellations.context("mrtr-cancel".to_string());
+        let ctx_mrtr_cancel = cancellations
+            .begin_client_request("mrtr-cancel".to_string())
+            .expect("begins");
+        let cancel_context = ctx_mrtr_cancel.clone();
         let worker = std::thread::spawn(move || {
             transport.request_with_cancel("tools/call", retry_params, Some(cancel_context))
         });
@@ -17857,7 +19001,7 @@ for line in sys.stdin:
         assert_eq!(cancel["params"]["requestId"], 41);
 
         release_tx.send(()).unwrap();
-        cancellations.finish_client_request("mrtr-cancel");
+        ctx_mrtr_cancel.finish();
         handle.join().unwrap();
     }
 
@@ -17866,8 +19010,10 @@ for line in sys.stdin:
         use super::{CancelRegistry, HttpCancelSignal};
 
         let cancellations = CancelRegistry::new();
-        assert!(cancellations.begin_client_request("mrtr-pre-send".to_string()));
-        let context = cancellations.context("mrtr-pre-send".to_string());
+        let ctx_mrtr_pre_send = cancellations
+            .begin_client_request("mrtr-pre-send".to_string())
+            .expect("begins");
+        let context = ctx_mrtr_pre_send.clone();
         let signal = HttpCancelSignal::new(context, true);
 
         assert!(cancellations.cancel("mrtr-pre-send", Some("user pressed stop")));
@@ -17883,7 +19029,7 @@ for line in sys.stdin:
             !signal.cancel(),
             "only one caller may claim the cancellation notification"
         );
-        cancellations.finish_client_request("mrtr-pre-send");
+        ctx_mrtr_pre_send.finish();
     }
 
     #[test]
@@ -17941,15 +19087,17 @@ for line in sys.stdin:
             cancel_signal: None,
         });
         let cancellations = CancelRegistry::new();
-        assert!(cancellations.begin_client_request("already-cancelled".to_string()));
-        let context = cancellations.context("already-cancelled".to_string());
+        let ctx_already_cancelled = cancellations
+            .begin_client_request("already-cancelled".to_string())
+            .expect("begins");
+        let context = ctx_already_cancelled.clone();
         assert!(cancellations.cancel("already-cancelled", Some("user pressed stop")));
 
         let result = transport.request_with_cancel("tools/call", retry_params, Some(context));
         assert!(matches!(result, Err(TransportError::Cancelled(_))));
         assert!(transport.pending_mrtr.is_none());
         handle.join().unwrap();
-        cancellations.finish_client_request("already-cancelled");
+        ctx_already_cancelled.finish();
     }
 
     #[test]
@@ -17985,8 +19133,10 @@ for line in sys.stdin:
             cancel_signal: None,
         });
         let cancellations = CancelRegistry::new();
-        assert!(cancellations.begin_client_request("unrelated-cancel".to_string()));
-        let context = cancellations.context("unrelated-cancel".to_string());
+        let ctx_unrelated_cancel = cancellations
+            .begin_client_request("unrelated-cancel".to_string())
+            .expect("begins");
+        let context = ctx_unrelated_cancel.clone();
         assert!(cancellations.cancel("unrelated-cancel", Some("user pressed stop")));
 
         let result = transport.request_with_cancel("tools/call", unrelated, Some(context));
@@ -17995,7 +19145,7 @@ for line in sys.stdin:
             transport.pending_mrtr.is_some(),
             "an unrelated requestState must not consume another request's pending MRTR"
         );
-        cancellations.finish_client_request("unrelated-cancel");
+        ctx_unrelated_cancel.finish();
     }
 
     #[test]

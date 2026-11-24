@@ -154,13 +154,27 @@ fn url_needs_own_credentials(url: &str) -> bool {
         || url.contains("<redacted>")
 }
 
-pub(crate) fn apply_import(registry: &mut Registry, json: &str) -> Result<usize, String> {
+pub fn apply_import(registry: &mut Registry, json: &str) -> Result<usize, String> {
     apply_import_selected(registry, json, None)
+}
+
+/// Why pasted or loaded text is not a setup, in a plain sentence instead of the
+/// parser's line and column.
+pub(crate) fn not_a_setup(error: &serde_json::Error) -> String {
+    use serde_json::error::Category;
+    match error.classify() {
+        Category::Eof => "That doesn't look like a Toolport setup. The text ends before the setup does.",
+        Category::Syntax => "That doesn't look like a Toolport setup. The text isn't JSON.",
+        Category::Data | Category::Io => {
+            "That doesn't look like a Toolport setup. It is JSON, but not a setup exported from Toolport."
+        }
+    }
+    .to_string()
 }
 
 /// Like [`apply_import`], importing only the servers whose names are in
 /// `selected` (case-insensitive). `None` keeps every new server.
-pub(crate) fn apply_import_selected(
+pub fn apply_import_selected(
     registry: &mut Registry,
     json: &str,
     selected: Option<&[String]>,
@@ -169,8 +183,7 @@ pub(crate) fn apply_import_selected(
     struct Document {
         servers: Vec<ServerEntry>,
     }
-    let document: Document = serde_json::from_str(json)
-        .map_err(|error| format!("That doesn't look like a Toolport setup: {error}"))?;
+    let document: Document = serde_json::from_str(json).map_err(|error| not_a_setup(&error))?;
     let mut to_add = Vec::<ServerEntry>::new();
     for mut server in document.servers {
         if let Some(selected) = selected {
@@ -209,9 +222,10 @@ pub(crate) fn apply_import_selected(
         server.unknown_fields.remove("memberSecretRefs");
         server.source = Some("shared".to_string());
         crate::secret_refs::validate_server(&server).map_err(|e| e.to_string())?;
-        if crate::secret_refs::has_references(&server) {
-            server.enabled = false;
-        }
+        // A setup is an untrusted launch proposal. Importing it must never
+        // start a local command or contact a remote server; enabling is a
+        // separate decision, regardless of whether credentials are needed.
+        server.enabled = false;
         to_add.push(server);
     }
     let added = to_add.len();
@@ -279,8 +293,7 @@ pub fn preview_import(json: &str) -> Result<Vec<SetupImportItem>, String> {
     struct Document {
         servers: Vec<ServerEntry>,
     }
-    let document: Document = serde_json::from_str(json)
-        .map_err(|error| format!("That doesn't look like a Toolport setup: {error}"))?;
+    let document: Document = serde_json::from_str(json).map_err(|error| not_a_setup(&error))?;
     let registry = registry::load()?;
     Ok(document
         .servers
@@ -417,6 +430,42 @@ mod controller_tests {
         env["servers"][0]["name"] = serde_json::json!("Environment attack");
         env["servers"][0]["headerKeys"][0]["source"]["ref"] = serde_json::json!("env:BW_SESSION");
         assert!(apply_import(&mut reg, &env.to_string()).is_err());
+    }
+    #[test]
+    fn shared_setups_never_enable_imported_commands_or_remote_connections() {
+        let document = serde_json::json!({"kind":"conduit-setup","version":1,"servers":[
+            {"name":"Imported local","enabled":true,"transport":"stdio","command":"fixture-command","args":[],"env":[]},
+            {"name":"Imported HTTP","enabled":true,"transport":"http","url":"https://example.invalid/mcp","env":[]},
+            {"name":"Imported SSE","enabled":true,"transport":"sse","url":"https://example.invalid/events","env":[]}
+        ]}).to_string();
+        for selected in [false, true] {
+            let mut registry = Registry {
+                version: 3,
+                ..Registry::default()
+            };
+            let existing_id = registry.add_server(serde_json::from_value(serde_json::json!({
+                "name":"Keep running", "enabled":true,"transport":"stdio","command":"existing-command"
+            })).unwrap());
+            let names = ["Imported local", "Imported HTTP", "Imported SSE"].map(str::to_string);
+            let added = if selected {
+                apply_import_selected(&mut registry, &document, Some(&names)).unwrap()
+            } else {
+                apply_import(&mut registry, &document).unwrap()
+            };
+            assert_eq!(added, 3);
+            assert!(
+                registry.server_enabled(&existing_id),
+                "existing server stays enabled"
+            );
+            for server in registry
+                .servers
+                .iter()
+                .filter(|server| server.id != existing_id)
+            {
+                assert!(!server.enabled, "{} must import disabled", server.name);
+                assert!(!registry.server_enabled(&server.id));
+            }
+        }
     }
     #[test]
     fn import_warnings_flag_shell_commands_and_private_addresses() {
@@ -681,5 +730,34 @@ mod controller_tests {
             import_item_warnings(&item),
             vec!["Replace the placeholders in its URL with your own values"]
         );
+    }
+}
+
+#[cfg(test)]
+mod not_a_setup_tests {
+    #[test]
+    fn a_bad_setup_is_explained_without_parser_positions() {
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct Document {
+            servers: Vec<crate::registry::ServerEntry>,
+        }
+        for (text, reason) in [
+            ("not a setup", "The text isn't JSON."),
+            ("{\"servers\": [", "The text ends before the setup does."),
+            (
+                "{\"name\": 1}",
+                "It is JSON, but not a setup exported from Toolport.",
+            ),
+        ] {
+            let error = serde_json::from_str::<Document>(text).unwrap_err();
+            let message = super::not_a_setup(&error);
+            assert_eq!(
+                message,
+                format!("That doesn't look like a Toolport setup. {reason}"),
+                "{text}"
+            );
+            assert!(!message.contains("line"), "{message}");
+        }
     }
 }

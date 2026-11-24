@@ -497,6 +497,12 @@ fn inline_node(node: &mut Value, root: &Value, active: &mut HashSet<String>) {
 /// spec's nested `annotations.destructiveHint` and a top-level fallback some
 /// servers emit. An explicit `false` hint wins over the name fallback.
 pub fn is_destructive(tool: &Value) -> bool {
+    is_destructive_as(tool, tool.get("name").and_then(Value::as_str))
+}
+
+/// [`is_destructive`] judged under `name` instead of the definition's own name, so
+/// callers checking a downstream name need not clone the definition to rename it.
+pub fn is_destructive_as(tool: &Value, name: Option<&str>) -> bool {
     if let Some(hint) = tool
         .get("annotations")
         .and_then(|a| a.get("destructiveHint"))
@@ -506,10 +512,7 @@ pub fn is_destructive(tool: &Value) -> bool {
         return hint;
     }
 
-    tool.get("name")
-        .and_then(Value::as_str)
-        .map(name_looks_destructive)
-        .unwrap_or(false)
+    name.is_some_and(name_looks_destructive)
 }
 
 /// True when `name` contains an obvious write/delete verb. Used by
@@ -587,6 +590,10 @@ pub struct ToolPolicy {
     pub allow: HashMap<String, HashSet<String>>,
     /// Hide and block any tool annotated `destructiveHint: true`.
     pub deny_destructive: bool,
+    /// Server ids whose prompts are kept out of `prompts/list` and refused by
+    /// `prompts/get` and prompt completion. Their tools and resources are not
+    /// affected. Empty = every server's prompts are exposed (the default).
+    pub hidden_prompts: HashSet<String>,
     /// Exposed (namespaced) tool names quarantined after a high-risk drift; hidden
     /// until the user re-approves them. Empty unless quarantine-on-drift is enabled.
     pub quarantined: BTreeSet<String>,
@@ -668,6 +675,7 @@ pub struct RegistryPolicy {
     pub disabled: HashMap<String, HashSet<String>>,
     pub allow: HashMap<String, HashSet<String>>,
     pub deny_destructive: bool,
+    pub hidden_prompts: HashSet<String>,
 }
 
 impl RegistryPolicy {
@@ -682,6 +690,7 @@ impl RegistryPolicy {
             disabled: self.disabled,
             allow: self.allow,
             deny_destructive: self.deny_destructive,
+            hidden_prompts: self.hidden_prompts,
             quarantined,
             fail_closed_catalog,
         }
@@ -2303,6 +2312,7 @@ impl Router {
             disabled: self.policy.disabled.clone(),
             allow: self.policy.allow.clone(),
             deny_destructive: self.policy.deny_destructive,
+            hidden_prompts: self.policy.hidden_prompts.clone(),
         }
     }
 
@@ -2352,6 +2362,13 @@ impl Router {
                 }
             }
         }
+    }
+
+    /// Whether this router's policy hides `server_id`'s prompts (`hidePrompts`).
+    /// The gateway asks the live router this before an in-flight prompt dispatch,
+    /// since an older snapshot still routes the prompt.
+    pub fn prompts_hidden(&self, server_id: &str) -> bool {
+        self.policy.hidden_prompts.contains(server_id)
     }
 
     /// Recheck a dispatch this router is about to make against the policy of a
@@ -2614,8 +2631,18 @@ impl Router {
         }
 
         // Prompts: namespace names like tools so two servers can't collide, and
-        // allocate them in the same order-independent way.
+        // allocate them in the same order-independent way. Allocate even when
+        // hidden, like disabled tools, so toggling one server never renames
+        // another server's prompts.
         let prompt_names = self.allocate_exposed_names(server_id, prompts);
+        // Prompts the user hid for this server (`hidePrompts`) are never indexed,
+        // so they drop out of prompts/list, prompts/get and prompt completion
+        // together. The server's cached prompt list is kept, so turning the
+        // setting back off restores them on the next policy republish without
+        // reconnecting.
+        if self.policy.hidden_prompts.contains(server_id) {
+            return;
+        }
         for (idx, prompt) in prompts.iter().enumerate() {
             let Some(orig) = prompt.get("name").and_then(|n| n.as_str()) else {
                 continue;
@@ -3641,6 +3668,94 @@ impl Router {
     pub fn fail_closed_catalog(&mut self) {
         self.policy.fail_closed_catalog = true;
         self.rebuild_preserving_restored();
+    }
+
+    /// Whether this router's policy would refuse `tool` on `server_id` even before
+    /// the server publishes a catalog. A demand start by server and tool name checks
+    /// this first, so a start that can only end in a refusal never happens.
+    ///
+    /// Quarantine is keyed by alias, and without a catalog the alias is not final.
+    /// The rule: refuse when a quarantined name is exactly a name this tool can be
+    /// given or answer to, which are
+    /// - its indexed or persisted policy name, when one is known,
+    /// - its override alias, both the exposed spelling and the sanitized rename,
+    /// - its default alias `<server>__<tool>`, the dashed spelling of it, and the
+    ///   length-shortened alias this view would give it,
+    /// - a collision-suffixed default alias `<server>__<tool>_<n>` (or dashed),
+    ///   since which sibling gets the suffix is only known from the catalog.
+    ///
+    /// A length-shortened alias from a different alias budget, or of a
+    /// collision-suffixed name, is not computed here. Its unshortened legacy name is
+    /// its policy name, which the rule does match; otherwise the post-catalog call
+    /// check still refuses the call.
+    pub fn refuses_before_catalog(&self, server_id: &str, tool: &str) -> bool {
+        let policy = &self.policy;
+        if !policy.allows_server(server_id) || policy.fail_closed_catalog {
+            return true;
+        }
+        if policy
+            .allow
+            .get(server_id)
+            .is_some_and(|set| !set.contains(tool))
+            || policy
+                .disabled
+                .get(server_id)
+                .is_some_and(|set| set.contains(tool))
+        {
+            return true;
+        }
+        if policy.quarantined.is_empty() {
+            return false;
+        }
+        let mut exact: Vec<String> = [&self.policy_by_original, &self.canonical_policy]
+            .into_iter()
+            .filter_map(|names| names.get(server_id).and_then(|tools| tools.get(tool)))
+            .cloned()
+            .chain(self.reserved_policy_name(server_id, tool))
+            .collect();
+        if let Some(rename) = self
+            .overrides
+            .get(server_id)
+            .and_then(|tools| tools.get(tool))
+            .and_then(|o| o.name.as_deref())
+        {
+            let legacy = sanitize_segment(rename);
+            exact.push(bounded_alias(
+                &legacy,
+                &(server_id, tool, rename),
+                None,
+                self.alias_rule,
+            ));
+            exact.push(legacy);
+        }
+        let base = format!(
+            "{}__{}",
+            sanitize_segment(server_id),
+            sanitize_segment(tool)
+        );
+        exact.push(bounded_alias(
+            &base,
+            &(server_id, tool),
+            Some(server_id),
+            self.alias_rule,
+        ));
+        let dashed = AliasRule {
+            dashed: true,
+            ..self.alias_rule
+        }
+        .spell(&base);
+        let families = [base, dashed];
+        let collision = |name: &str, family: &str| {
+            name.strip_prefix(family)
+                .and_then(|rest| rest.strip_prefix('_'))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        };
+        policy.quarantined.iter().any(|name| {
+            exact.iter().any(|known| known == name)
+                || families
+                    .iter()
+                    .any(|family| family == name || collision(name, family))
+        })
     }
 
     /// True when this router is hiding the whole catalog because the quarantine
@@ -6340,44 +6455,11 @@ mod tests {
             std::env::temp_dir().join(format!("toolport-p09-router-{}", std::process::id())),
         );
         std::fs::create_dir_all(&dir.0).unwrap();
-        let script = dir.0.join("oversized.py");
         let calls = dir.0.join("calls");
-        std::fs::write(
-            &script,
-            r#"import json, os, sys
-for line in sys.stdin:
-    request = json.loads(line)
-    if 'id' not in request:
-        continue
-    method = request['method']
-    if method == 'initialize':
-        result = {'protocolVersion':'2025-06-18','capabilities':{}}
-    elif method == 'tools/list':
-        result = {'tools':[{'name':'echo'}]}
-    elif method == 'tools/call':
-        with open(sys.argv[1], 'a') as calls:
-            calls.write('dispatch\n')
-        for _ in range(2049):
-            os.write(1, b'x' * 8192)
-        os.write(1, b'\n')
-        result = {'ok':True}
-    else:
-        result = {}
-    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
-"#,
-        )
-        .unwrap();
-        let transport = crate::downstream::StdioTransport::spawn(
-            "/usr/bin/python3",
-            &[
-                script.to_string_lossy().into_owned(),
-                calls.to_string_lossy().into_owned(),
-            ],
-            &[],
-            None,
-            false,
-        )
-        .unwrap();
+        let transport = crate::downstream::p09_child::spawn(
+            crate::downstream::p09_child::Mode::RouterDispatch,
+            Some(&calls),
+        );
         struct ObservedReset {
             inner: crate::downstream::StdioTransport,
             seen: std::sync::mpsc::Sender<()>,
@@ -6505,34 +6587,6 @@ for line in sys.stdin:
         let _data = crate::registry::DataDirTestEnv::new(
             "f3-p09-always-oversized-server-trips-breaker-until-cooldown",
         );
-        struct Scratch(std::path::PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let dir = Scratch(
-            std::env::temp_dir().join(format!("toolport-p09-breaker-{}", std::process::id())),
-        );
-        std::fs::create_dir_all(&dir.0).unwrap();
-        let script = dir.0.join("oversized.py");
-        std::fs::write(
-            &script,
-            r#"import json, os, sys
-for line in sys.stdin:
-    request = json.loads(line)
-    if 'id' not in request: continue
-    method = request['method']
-    if method == 'initialize': result = {'protocolVersion':'2025-06-18','capabilities':{}}
-    elif method == 'tools/list': result = {'tools':[{'name':'echo'}]}
-    elif method == 'tools/call':
-        for _ in range(2049): os.write(1, b'x' * 8192)
-        continue
-    else: result = {}
-    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
-"#,
-        )
-        .unwrap();
         let spawns = Arc::new(AtomicUsize::new(0));
         let counted = spawns.clone();
         let fail_reconnect = Arc::new(AtomicBool::new(false));
@@ -6542,14 +6596,10 @@ for line in sys.stdin:
                 return None;
             }
             counted.fetch_add(1, Ordering::SeqCst);
-            let transport = crate::downstream::StdioTransport::spawn(
-                "/usr/bin/python3",
-                &[script.to_string_lossy().into_owned()],
-                &[],
+            let transport = crate::downstream::p09_child::spawn(
+                crate::downstream::p09_child::Mode::RouterAlwaysOversized,
                 None,
-                false,
-            )
-            .unwrap();
+            );
             Some(DownstreamServer::connect("s".into(), Box::new(transport)).unwrap())
         };
         let mut router = Router::new();
@@ -6651,8 +6701,10 @@ for line in sys.stdin:
     fn cancellation_during_reconnect_prevents_the_retried_call() {
         let router = Router::new();
         let cancellations = CancelRegistry::new();
-        assert!(cancellations.begin_client_request("reconnect-cancel".to_string()));
-        let cancel = cancellations.context("reconnect-cancel".to_string());
+        let ctx_reconnect_cancel = cancellations
+            .begin_client_request("reconnect-cancel".to_string())
+            .expect("begins");
+        let cancel = ctx_reconnect_cancel.clone();
         let cancel_from_factory = cancellations.clone();
         let slot = dead_slot(Some(Box::new(move || {
             assert!(cancel_from_factory.cancel("reconnect-cancel", Some("user pressed stop")));
@@ -6686,15 +6738,17 @@ for line in sys.stdin:
             0,
             "a reconnect that races cancellation must not emit the retry"
         );
-        cancellations.finish_client_request("reconnect-cancel");
+        ctx_reconnect_cancel.finish();
     }
 
     #[test]
     fn cancellation_from_reconnected_attempt_does_not_penalize_breaker() {
         let router = Router::new();
         let cancellations = CancelRegistry::new();
-        assert!(cancellations.begin_client_request("retry-cancel".to_string()));
-        let cancel = cancellations.context("retry-cancel".to_string());
+        let ctx_retry_cancel = cancellations
+            .begin_client_request("retry-cancel".to_string())
+            .expect("begins");
+        let cancel = ctx_retry_cancel.clone();
         let cancel_from_retry = cancellations.clone();
         let slot = dead_slot(Some(Box::new(|| Some(mock_server("s")))));
 
@@ -6723,7 +6777,7 @@ for line in sys.stdin:
         assert_eq!(breaker.consecutive_failures, 0);
         assert!(breaker.open_remaining(Instant::now()).is_none());
         drop(breaker);
-        cancellations.finish_client_request("retry-cancel");
+        ctx_retry_cancel.finish();
     }
 
     #[test]
@@ -6985,8 +7039,10 @@ for line in sys.stdin:
         let effects = Arc::new(AtomicU32::new(0));
         let fresh_effects = Arc::clone(&effects);
         let cancellations = CancelRegistry::new();
-        assert!(cancellations.begin_client_request("uncertain-cancel".into()));
-        let cancel = cancellations.context("uncertain-cancel".into());
+        let ctx_uncertain_cancel = cancellations
+            .begin_client_request("uncertain-cancel".into())
+            .expect("begins");
+        let cancel = ctx_uncertain_cancel.clone();
         let cancel_from_factory = cancellations.clone();
         let router = expired_probe_router(
             "tools/call",
@@ -7014,7 +7070,7 @@ for line in sys.stdin:
                 .consecutive_failures,
             BREAKER_FAILURE_THRESHOLD
         );
-        cancellations.finish_client_request("uncertain-cancel");
+        ctx_uncertain_cancel.finish();
     }
 
     #[test]
@@ -9398,20 +9454,17 @@ for line in sys.stdin:
         let mut router = Router::new();
         router.add(ds);
         let registry = CancelRegistry::new();
-        assert!(registry.begin_client_request("99".to_string()));
+        let ctx_99 = registry
+            .begin_client_request("99".to_string())
+            .expect("begins");
 
         let result = router
-            .route_call_with_cancel(
-                "s__echo",
-                json!({}),
-                Some(registry.context("99".to_string())),
-                None,
-            )
+            .route_call_with_cancel("s__echo", json!({}), Some(ctx_99.clone()), None)
             .unwrap();
 
         assert_eq!(result["content"][0]["text"], "ok");
         assert!(saw_cancel.load(Ordering::SeqCst));
-        registry.finish_client_request("99");
+        ctx_99.finish();
     }
 
     #[test]
@@ -9432,6 +9485,62 @@ for line in sys.stdin:
         let result = router.get_prompt("github__greet", json!({})).unwrap();
         assert_eq!(result["messages"][0]["content"], "github:greet");
         assert!(router.get_prompt("nope__greet", json!({})).is_err());
+    }
+
+    /// `hidePrompts` drops one server's prompts from prompts/list, prompts/get and
+    /// prompt completion, leaves its tools and the other servers alone, and can be
+    /// switched back on the same connection through a policy republish.
+    #[test]
+    fn hidden_prompts_policy_hides_one_servers_prompts_but_keeps_its_tools() {
+        let prompt_names = |router: &Router| -> Vec<String> {
+            router
+                .aggregated_prompts()
+                .iter()
+                .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        };
+        let mut router = Router::with_policy(ToolPolicy {
+            hidden_prompts: HashSet::from(["github".to_string()]),
+            ..Default::default()
+        });
+        router.add(mock_server("github"));
+        router.add(mock_server("postgres"));
+        let tools_before = exposed_names(&router);
+        assert!(
+            tools_before.iter().any(|name| name.starts_with("github__")),
+            "the hidden server's tools stay listed: {tools_before:?}"
+        );
+
+        assert_eq!(prompt_names(&router), vec!["postgres__greet"]);
+        assert!(router.prompt_server("github__greet").is_none());
+        let err = router.get_prompt("github__greet", json!({})).unwrap_err();
+        assert!(err.contains("no route"), "{err}");
+        assert!(router
+            .resolve_completion(&json!({"ref": {"type": "ref/prompt", "name": "github__greet"}}))
+            .is_err());
+        assert!(router.get_prompt("postgres__greet", json!({})).is_ok());
+
+        // Showing them again needs no reconnect and leaves the tool list as it was.
+        let mut policy = router.registry_policy();
+        policy.hidden_prompts.clear();
+        assert!(router.apply_registry_policy(policy.clone()));
+        assert!(
+            !router.apply_registry_policy(policy),
+            "an identical policy is not a change"
+        );
+        assert_eq!(
+            prompt_names(&router),
+            vec!["github__greet", "postgres__greet"]
+        );
+        let result = router.get_prompt("github__greet", json!({})).unwrap();
+        assert_eq!(result["messages"][0]["content"], "github:greet");
+        assert_eq!(exposed_names(&router), tools_before);
+
+        // And hiding them again on the live router takes effect immediately.
+        let mut policy = router.registry_policy();
+        policy.hidden_prompts.insert("postgres".to_string());
+        assert!(router.apply_registry_policy(policy));
+        assert_eq!(prompt_names(&router), vec!["github__greet"]);
     }
 
     #[test]
@@ -9884,8 +9993,10 @@ for line in sys.stdin:
         router.add(server);
         let router = Arc::new(router);
         let cancellations = CancelRegistry::new();
-        assert!(cancellations.begin_client_request("cancel-retry-1".to_string()));
-        let cancel = cancellations.context("cancel-retry-1".to_string());
+        let ctx_cancel_retry_1 = cancellations
+            .begin_client_request("cancel-retry-1".to_string())
+            .expect("begins");
+        let cancel = ctx_cancel_retry_1.clone();
 
         let worker_router = Arc::clone(&router);
         let handle = std::thread::spawn(move || {
@@ -9923,7 +10034,7 @@ for line in sys.stdin:
             breaker.open_until.is_none(),
             "cancellation must leave the breaker closed"
         );
-        cancellations.finish_client_request("cancel-retry-1");
+        ctx_cancel_retry_1.finish();
     }
 
     fn failure(message: &str, needs_auth: bool) -> ConnectFailure {

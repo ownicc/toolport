@@ -2,7 +2,25 @@ import { initializeLanguage, isLanguageChoice, LanguageProvider } from "@/lib/i1
 import { LocalizationControls } from "./localization-controls";
 import { securityFixture } from "./security-fixture";
 import { applySkillState, skillsFixture } from "./skills-fixture";
+import { withParity } from "./parity-fixture";
 const fixtureLocations: import("@/lib/types").DetectedClient[] = [];
+// Clients Disconnect took the gateway out of ("absent") and Connect then put
+// back ("managed"). Clients never disconnected keep their seeded state.
+const reconnectedClients = new Map<string, "absent" | "managed">();
+const withDisconnects = <T extends object>(clients: T[]): T[] =>
+  clients.map((client) => {
+    const entryState = reconnectedClients.get(String((client as { id?: unknown }).id));
+    return entryState
+      ? { ...client, gatewayInstalled: entryState === "managed", entryState }
+      : client;
+  });
+// The access Connect chose, removed for the default as the native app does.
+const saveClientScope = (clientId: string, profile: unknown) => {
+  const scopes = { ...registry.clientScopes };
+  if (profile) scopes[clientId] = String(profile);
+  else delete scopes[clientId];
+  registry.clientScopes = scopes;
+};
 // Separate development entry. Never imported by the shipping application.
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { useState } from "react";
@@ -134,6 +152,52 @@ const detailClients = [
       },
     ],
   }),
+];
+// T3 Code's OpenCode, Grok and Pi homes as rows, with the card.
+const t3Homes = new URLSearchParams(location.search).has("t3-homes");
+const t3Use = (displayName: string, enabled = true) => ({
+  instanceId: displayName.toLowerCase().replace(/ /g, "_"),
+  displayName,
+  enabled,
+});
+const t3HomeClients = [
+  fixtureClient(
+    "opencode@t3-0f1e2d3c4b5a6978",
+    "OpenCode (~/.t3/hermes-providers/clinepass/config/opencode)",
+    {
+      configPath:
+        "/home/fixture/.t3/hermes-providers/clinepass/config/opencode/opencode.json",
+      t3Code: [t3Use("ClinePass")],
+    },
+  ),
+  fixtureClient("grok@t3-1a2b3c4d5e6f7081", "Grok Build (~/.t3/grok-alt)", {
+    configPath: "/home/fixture/.t3/grok-alt/config.toml",
+    t3Code: [t3Use("Grok Alt")],
+  }),
+  fixtureClient("pi@t3-9f8e7d6c5b4a3921", "Pi (~/.t3/pi-work)", {
+    configPath: "/home/fixture/.t3/pi-work/mcp.json",
+    gatewayInstalled: true,
+    entryState: "managed",
+    t3Code: [t3Use("Pi Work"), t3Use("Pi Old", false)],
+  }),
+  fixtureClient(
+    "antigravity@t3-5e4d3c2b1a098f7e",
+    "Antigravity (~/.t3/userdata/providers/antigravity/c1a9e44a/config)",
+    {
+      configPath:
+        "/home/fixture/.t3/userdata/providers/antigravity/c1a9e44a482971b672b7f9a0ef35dad8f943f7d5bc73859a9de21eb7db7dc810/config/mcp_config.json",
+      t3Code: [t3Use("Antigravity Work")],
+    },
+  ),
+];
+const t3HomeOthers = [
+  {
+    instanceId: "ollama_cloud",
+    providerName: "OpenCode",
+    displayName: "Ollama Cloud",
+    enabled: true,
+    gap: "missingHome",
+  },
 ];
 const claudeProfileClients = [
   fixtureClient("claude-code", "Claude Code", {
@@ -311,6 +375,9 @@ if (memberReviewFixture) {
   } as NonNullable<Registry["team"]>;
 }
 
+const fixtureSafety = new URLSearchParams(location.search).get("safety");
+if (fixtureSafety === "off" || fixtureSafety === "ask" || fixtureSafety === "strict")
+  registry.safetyLevel = fixtureSafety;
 const driftFixture = new URLSearchParams(location.search).has("tool-changes");
 const profileDriftFixture = new URLSearchParams(location.search).has("profile-drift");
 const driftEvents = profileDriftFixture
@@ -620,6 +687,39 @@ function fixtureAdd(entry: ServerEntry) {
   registry.profiles[0].enabledServerIds.push(saved.id);
   return structuredClone(registry);
 }
+// The dialog's one-step add: secret values go to the (absent) vault, and the
+// server is switched on once every row has a value or a reference.
+function fixtureAddWithRows(entry: ServerEntry) {
+  // As the backend: a catalog preset's own requiredEnv leaves its optional keys
+  // out, every row is required otherwise, and a blank required launch input is
+  // named by its label.
+  const launch = entry.launch;
+  const required = (key: string) =>
+    !launch?.template || (launch.requiredEnv ?? []).includes(key);
+  const declaredWithoutValue = [
+    ...(entry.env ?? [])
+      .filter((row) => !row.source && !row.value?.trim() && required(row.key))
+      .map((row) => row.key),
+    ...(launch?.inputs ?? [])
+      .filter((input) => input.required && !input.source && !input.value?.trim())
+      .map((input) => input.label),
+  ];
+  const saved = {
+    ...entry,
+    id: `added-${registry.servers.length}`,
+    enabled: declaredWithoutValue.length === 0,
+    env: (entry.env ?? []).map((row) => (row.secret ? { ...row, value: null } : row)),
+    launch: entry.launch && {
+      ...entry.launch,
+      inputs: entry.launch.inputs.map((input) =>
+        input.secret ? { ...input, value: null } : input,
+      ),
+    },
+  };
+  registry.servers.push(saved);
+  if (saved.enabled) registry.profiles[0].enabledServerIds.push(saved.id);
+  return { registry: structuredClone(registry), declaredWithoutValue };
+}
 const calls: Record<string, number> = {};
 const missing: string[] = [];
 Object.assign(window, { toolportFixture: { calls, missing, driftEvents } });
@@ -676,7 +776,7 @@ if (new URLSearchParams(location.search).has("rules-link")) {
   });
 }
 mockIPC(
-  (command, payload) => {
+  withParity((command, payload) => {
     const args: Record<string, unknown> =
       payload &&
       !Array.isArray(payload) &&
@@ -706,13 +806,24 @@ mockIPC(
       }
     }
     switch (command) {
+      case "keyring_locked_after":
+        return false;
       case "preview_client_setup":
         return {
           configPath: "/fixture/codex.toml",
           backupDir: "/fixture/Toolport/backups/codex",
           revision: "fixture-review",
           items: setupItems,
+          gatewaySettings: [
+            "supports_parallel_tool_calls = true",
+            "startup_timeout_sec = 75",
+            "tool_timeout_sec = 600",
+          ],
         };
+      case "preview_gateway_settings":
+        return String(args.clientId ?? "").startsWith("codex")
+          ? ["startup_timeout_sec = 75", "tool_timeout_sec = 600"]
+          : [];
       case "migrate_client":
         if (setupVerifying) return new Promise(() => {});
         if (setupFailure && setupFailure !== "optional")
@@ -723,6 +834,10 @@ mockIPC(
                 ? "Calendar needs credentials. Open Credentials and retry. Client config unchanged."
                 : "Notes could not start. Check its command and retry. Client config unchanged.",
           );
+        // Only a migration that went through reconnects the client.
+        if (reconnectedClients.has(String(args.clientId)))
+          reconnectedClients.set(String(args.clientId), "managed");
+        saveClientScope(String(args.clientId), args.profile);
         setupConnected = true;
         fixtureAdd({
           id: "calendar",
@@ -754,6 +869,8 @@ mockIPC(
         return setupCatalog;
       case "add_server":
         return fixtureAdd(args.entry as ServerEntry);
+      case "add_server_with_rows":
+        return fixtureAddWithRows(args.entry as ServerEntry);
       case "test_secret_reference":
         return null;
       case "set_secret_reference": {
@@ -912,11 +1029,21 @@ mockIPC(
       case "delete_profile":
         registry.profiles = registry.profiles.filter((p) => p.id !== args.id);
         return registry;
-      case "install_gateway":
-        registry.clientScopes = {
-          ...registry.clientScopes,
-          [String(args.clientId)]: String(args.profile || ""),
+      case "uninstall_gateway": {
+        const clientId = String(args.clientId);
+        reconnectedClients.set(clientId, "absent");
+        registry.clientScopes = Object.fromEntries(
+          Object.entries(registry.clientScopes ?? {}).filter(([id]) => id !== clientId),
+        );
+        return {
+          path: `/fixture/${clientId}.json`,
+          backup: `/fixture/Toolport/backups/${clientId}/previous.json`,
         };
+      }
+      case "install_gateway":
+        if (reconnectedClients.has(String(args.clientId)))
+          reconnectedClients.set(String(args.clientId), "managed");
+        saveClientScope(String(args.clientId), args.profile);
         return registry;
       case "set_server_enabled": {
         const server = registry.servers.find((server) => server.id === args.serverId);
@@ -1012,51 +1139,74 @@ mockIPC(
         if (index >= 0) fixtureLocations.splice(index, 1);
         return null;
       }
+      case "list_client_recoveries":
+        return [];
+      case "retry_client_recovery":
+        return null;
+      case "dismiss_client_recovery":
+      case "refresh_client_recovery_status":
+        return null;
+      case "refresh_client_recovery_notice":
+        return { rows: [], focusId: null, message: null };
+      case "prepare_client_recovery_discard":
+        return {
+          manifest: "fixture-manifest",
+          heading: "Discard these saved values?",
+          description: "Fixture recovery discard.",
+          lines: [],
+          location: "",
+          actionLabel: "Discard these saved values",
+        };
+      case "discard_client_recovery":
+        return "Fixture recovery copies were deleted.";
       case "detect_clients":
-        return [
-          ...fixtureLocations,
-          ...(detailStates ? detailClients : []),
-          ...(claudeProfiles ? claudeProfileClients : []),
-          ...(args.inspectConfigs && !claudeProfiles
-            ? [
-                {
-                  id: "claude-code@claude2",
-                  name: "Claude Code (claude2)",
-                  usesConnectors: false,
-                  configPath: "/fixture/.claude2/.claude.json",
-                  configExists: true,
-                  appPresent: true,
-                  servers: [],
-                  pluginServers: [],
-                  gatewayInstalled: true,
-                  entryState: "managed",
-                  error: null,
-                },
-              ]
-            : []),
-          {
-            id: "codex",
-            name: "Codex",
-            usesConnectors: false,
-            configPath: "/fixture/codex.toml",
-            configExists: true,
-            appPresent: true,
-            servers: setupFixture || connectedImportFixture ? setupItems : [],
-            pluginServers: [],
-            gatewayInstalled: !setupFixture || setupConnected,
-            entryState: !setupFixture || setupConnected ? "managed" : "absent",
-            discovery: {
-              autoMode: "full",
-              nativeToolSearch: true,
-              toolsListChanged: null,
-              evidence: "fixture",
+        return withDisconnects(
+          [
+            ...fixtureLocations,
+            ...(detailStates ? detailClients : []),
+            ...(claudeProfiles ? claudeProfileClients : []),
+            ...(t3Homes ? t3HomeClients : []),
+            ...(args.inspectConfigs && !claudeProfiles
+              ? [
+                  {
+                    id: "claude-code@claude2",
+                    name: "Claude Code (claude2)",
+                    usesConnectors: false,
+                    configPath: "/fixture/.claude2/.claude.json",
+                    configExists: true,
+                    appPresent: true,
+                    servers: [],
+                    pluginServers: [],
+                    gatewayInstalled: true,
+                    entryState: "managed",
+                    error: null,
+                  },
+                ]
+              : []),
+            {
+              id: "codex",
+              name: "Codex",
+              usesConnectors: false,
+              configPath: "/fixture/codex.toml",
+              configExists: true,
+              appPresent: true,
+              servers: setupFixture || connectedImportFixture ? setupItems : [],
+              pluginServers: [],
+              gatewayInstalled: !setupFixture || setupConnected,
+              entryState: !setupFixture || setupConnected ? "managed" : "absent",
+              discovery: {
+                autoMode: "full",
+                nativeToolSearch: true,
+                toolsListChanged: null,
+                evidence: "fixture",
+              },
+              error: null,
             },
-            error: null,
-          },
-        ].filter(
-          // The Codex home in the profile set replaces the plain Codex row.
-          (client, index, all) =>
-            all.findIndex((other) => other.id === client.id) === index,
+          ].filter(
+            // The Codex home in the profile set replaces the plain Codex row.
+            (client, index, all) =>
+              all.findIndex((other) => other.id === client.id) === index,
+          ),
         );
       case "team_sync_status":
         return { state: "offline", lastSuccessMs: 1791504000000 };
@@ -1100,6 +1250,14 @@ mockIPC(
           toolCount: 25,
           error: null,
         }));
+      case "probe_registered":
+        return {
+          serverId: String(args.serverId ?? ""),
+          ok: true,
+          toolCount: 25,
+          error: null,
+          authRequired: false,
+        };
       case "main_window_visible":
         return true;
       case "take_pending_tray_approvals":
@@ -1109,6 +1267,10 @@ mockIPC(
       case "team_pair_state":
       case "plugin:updater|check":
         return null;
+      case "t3_code_revision":
+        return t3Homes ? "fixture-t3-homes" : null;
+      case "t3_code_other_instances":
+        return t3Homes ? t3HomeOthers : [];
       case "savings_summary":
         return savingsSummary;
       case "plugin:app|version":
@@ -1196,6 +1358,8 @@ mockIPC(
       case "list_server_resources":
       case "list_server_prompts":
         return [];
+      case "cancel_tool_call":
+        return null;
       case "call_tool":
         return {
           content: [{ type: "text", text: `Fixture result: ${JSON.stringify(payload)}` }],
@@ -1233,6 +1397,14 @@ mockIPC(
         return null;
       case "get_security_events":
         return driftEvents;
+      case "activity_safety": {
+        const off = registry.safetyLevel === "off";
+        return {
+          toolChangeReviews: !off,
+          blocksNothing: off && !driftEvents.some((event) => event.blocked !== false),
+          reviewsConfirmed: !off,
+        };
+      }
       case "release_quarantine": {
         const event = driftEvents.find(
           (event) => event.profile === args.profile && event.tool === args.tool,
@@ -1272,7 +1444,7 @@ mockIPC(
         missing.push(command);
         throw new Error(`Unimplemented fixture command: ${command}`);
     }
-  },
+  }),
   { shouldMockEvents: true },
 );
 

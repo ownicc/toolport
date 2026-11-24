@@ -28,7 +28,7 @@
 //! through [`strip_bundled_env`] first.
 //!
 //! Gated on `APPDIR`, which only an AppImage sets, so this is a no-op for the
-//! `.deb`, the AUR package, and a dev build.
+//! `.deb`, the pacman package, and a dev build.
 //!
 //! Deliberately NOT an `env_clear()`: an MCP server legitimately needs the
 //! user's `PATH`, `HOME`, proxy variables, and whatever its own `env` block
@@ -46,6 +46,26 @@
 //! software: a browser, a file manager, a login shell, an MCP server.
 
 use std::process::Command;
+
+/// A launcher started by [`spawn_reaped`].
+pub struct Reaped {
+    /// The launcher's process id, for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub pid: u32,
+    /// Waits for the launcher. Dropping it detaches the waiter, not the child.
+    pub reaper: std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>>,
+}
+
+/// Start a fire-and-forget launcher (a browser, file manager or editor opener)
+/// and wait for it off the calling thread. A launcher may exit at once or stay
+/// alive with the app it opened; dropping its `std::process::Child` instead
+/// leaves every exited launcher as a zombie on Unix.
+pub fn spawn_reaped(command: &mut Command) -> std::io::Result<Reaped> {
+    let mut child = command.spawn()?;
+    let pid = child.id();
+    let reaper = std::thread::spawn(move || child.wait());
+    Ok(Reaped { pid, reaper })
+}
 
 #[cfg(target_os = "linux")]
 use std::ffi::OsStr;
@@ -250,6 +270,21 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     use super::*;
 
+    #[test]
+    #[cfg(unix)]
+    fn spawned_launcher_is_reaped_after_it_exits() {
+        let handle =
+            super::spawn_reaped(std::process::Command::new("/bin/sh").args(["-c", "exit 7"]))
+                .unwrap();
+        #[cfg(target_os = "linux")]
+        let pid = handle.pid;
+        let status = handle.reaper.join().unwrap().unwrap();
+        assert_eq!(status.code(), Some(7));
+        // A reaped child leaves no zombie entry behind.
+        #[cfg(target_os = "linux")]
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+
     #[cfg(all(unix, not(target_os = "macos")))]
     fn env_of(cmd: &Command) -> Vec<(String, Option<String>)> {
         cmd.get_envs()
@@ -306,7 +341,7 @@ mod tests {
         assert!(!env_of(&cmd).iter().any(|(k, _)| k == "XDG_DATA_DIRS"));
     }
 
-    /// The .deb, the AUR package and a dev build must be untouched. They never
+    /// The .deb, the pacman package and a dev build must be untouched. They never
     /// set APPDIR, so the guard in `strip_bundled_env` is what protects them.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]

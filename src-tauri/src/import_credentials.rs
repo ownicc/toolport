@@ -8,6 +8,11 @@ use serde::{Serialize, Serializer};
 const VAULT_FAILURE: &str =
     "Keychain unavailable. Unlock it and retry importing. Client config unchanged.";
 
+/// Whether `error` is a reviewed import's vault write failing (it names no cause).
+pub(crate) fn is_vault_failure(error: &str) -> bool {
+    error.contains(VAULT_FAILURE)
+}
+
 pub(crate) fn provided(value: &str) -> bool {
     let value = value.trim();
     static PLACEHOLDER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -43,6 +48,25 @@ pub(crate) fn secret_url_name(value: &str) -> bool {
         .to_ascii_uppercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|word| SECRET_NAMES.contains(&word))
+}
+
+/// Whether the last word of `key` is the credential word `secret_env` matches
+/// (`API_KEY`, `DB_PASSWORD`, `AUTHORIZATION`), rather than a word that
+/// qualifies one (`TOKEN_TYPE`, `AUTH_METHOD`, `API_KEY_ID`).
+pub(crate) fn secret_word_is_last(key: &str) -> bool {
+    let key = key.to_ascii_uppercase();
+    let Some(last) = key
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .rfind(|word| !word.is_empty())
+    else {
+        return false;
+    };
+    last == "PAT"
+        || (!matches!(last, "KEYBOARD" | "MONKEY" | "COMPASS")
+            && SECRET_NAMES
+                .iter()
+                .filter(|needle| **needle != "PAT")
+                .any(|needle| last.contains(needle)))
 }
 
 pub(crate) fn secret_env(key: &str, value: Option<&str>) -> bool {
@@ -108,7 +132,9 @@ impl VaultWrites {
         let previous = secrets::get_vault_secret_result(id, key).map_err(|_| VAULT_FAILURE)?;
         self.receipts
             .push((id.into(), key.into(), previous, value.into()));
-        secrets::set_secret(id, key, value).map_err(|_| VAULT_FAILURE.into())
+        secrets::set_secret(id, key, value).map_err(|_| VAULT_FAILURE.to_string())?;
+        crate::clients::backup_storage::register(id, key, value);
+        Ok(())
     }
     pub(crate) fn keep(&mut self) {
         self.receipts.clear();
@@ -141,6 +167,13 @@ impl VaultWrites {
 pub(crate) fn transaction<T>(
     action: impl FnOnce(&mut VaultWrites) -> Result<T, String>,
 ) -> Result<T, String> {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            crate::clients::backup_storage::clear();
+        }
+    }
+    let _clear = Clear;
     let mut writes = VaultWrites::default();
     match action(&mut writes) {
         Ok(result) => Ok(result),
@@ -466,7 +499,7 @@ impl Import {
             if !secret || launch.bindings.iter().any(|binding| binding.index == index) {
                 continue;
             }
-            let key = format!("IMPORTED_ARG_{index}");
+            let key = imported_arg_key(index);
             values.push((
                 key.clone(),
                 Some(std::mem::replace(
@@ -558,6 +591,9 @@ impl Import {
         if existing.command != self.entry.command || existing.transport != self.entry.transport {
             return Ok(false);
         }
+        // A read that failed (a locked keyring) is reported as such, not as the
+        // missing value `resolve_args_with` would name.
+        let read_failed = std::cell::Cell::new(false);
         let args = |server: &ServerEntry, imported: bool| {
             crate::launch_inputs::resolve_args_with(server, |id, key| {
                 if imported {
@@ -565,17 +601,33 @@ impl Import {
                         return Ok(value.clone());
                     }
                 }
-                secrets::get_vault_secret_result(id, key)
+                secrets::get_vault_secret_result(id, key).inspect_err(|_| read_failed.set(true))
             })
             .map(|args| args.args)
+            .map_err(|error| {
+                if read_failed.get() {
+                    VAULT_FAILURE.to_string()
+                } else {
+                    error
+                }
+            })
         };
         if args(existing, false)? != args(&self.entry, true)? {
             return Ok(false);
         }
         let existing_url = if has_imported_url(existing) {
-            secrets::get_vault_secret_result(&existing.id, secrets::IMPORTED_URL_KEY)
+            // The registry holds only the redacted display URL; comparing that would
+            // claim (or deny) identity on a URL that is not the real endpoint.
+            let url = secrets::get_vault_secret_result(&existing.id, secrets::IMPORTED_URL_KEY)
                 .map_err(|_| VAULT_FAILURE)?
-                .or(existing.url.clone())
+                .filter(|url| url::Url::parse(url).is_ok())
+                .ok_or_else(|| {
+                    format!(
+                        "The saved address of {} is missing from the keychain. Enter its URL again under Servers.",
+                        existing.name
+                    )
+                })?;
+            Some(url)
         } else {
             existing.url.clone()
         };
@@ -719,6 +771,12 @@ pub(crate) fn ready(server: &ServerEntry) -> Result<bool, String> {
     Ok(true)
 }
 
+/// The stored name of a secret launch argument at `index`, as an import names
+/// it. Redaction uses the same name for that argument's value.
+pub(crate) fn imported_arg_key(index: usize) -> String {
+    format!("IMPORTED_ARG_{index}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,6 +807,7 @@ mod tests {
                 name: "nanobot".into(),
                 uses_connectors: false,
                 location_removable: false,
+                location_kept_by_t3_code: false,
                 discovery: crate::clients::DiscoveryCapabilities {
                     auto_mode: "lazy",
                     native_tool_search: Some(false),
@@ -767,6 +826,7 @@ mod tests {
                 entry_state: crate::clients::GatewayEntryState::Absent,
                 error: None,
                 claude_profile: None,
+                t3_code: Vec::new(),
             };
             let definition = crate::clients::import_definition(&client, "native")
                 .unwrap()

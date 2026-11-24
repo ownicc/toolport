@@ -26,11 +26,10 @@ dist-ssr
 /docs/LAUNCH-DAY.md
 /docs/MONETIZATION.md
 
-# Draft MCP-registry manifest (references an unpublished gateway package; not for launch yet)
-/server.json
-
 # Editor directories and files
-.claude/
+# Local agent state anywhere, except the repo's shared skills.
+**/.claude/*
+!/.claude/skills
 .vscode/*
 !.vscode/extensions.json
 .idea
@@ -122,6 +121,7 @@ src-tauri/rate_limit_counters.test.json
 # Local verification logs and screenshots
 /.verify/
 
-# AUR metadata pins one published release and is rendered on demand.
-/packaging/linux/aur/PKGBUILD
-/packaging/linux/aur/.SRCINFO
+
+# Python bytecode
+__pycache__/
+*.pyc

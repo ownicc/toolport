@@ -315,7 +315,7 @@ fn tool_list(cfg: &Config, grown: bool) -> Value {
     if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") {
         tools.extend([
             json!({"name":"structured", "description":"Return typed fixture data.",
-                "inputSchema":{"type":"object","properties":{}},
+                "inputSchema":{"type":"object","properties":{"bytes":{"type":"integer"}}},
                 "outputSchema":{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"]}}),
             json!({"name":"large", "description":"Return a bounded large fixture result.",
                 "inputSchema":{"type":"object","properties":{"bytes":{"type":"integer"}}}}),
@@ -332,6 +332,8 @@ fn tool_list(cfg: &Config, grown: bool) -> Value {
     if cfg.concurrent {
         tools.push(json!({ "name": "sleep", "description": "Wait ms milliseconds, then reply.",
                 "inputSchema": { "type": "object", "properties": { "ms": { "type": "number" } } } }));
+        tools.push(json!({ "name": "hold", "description": "Wait until the test opens the named gate, then reply.",
+                "inputSchema": { "type": "object", "properties": { "gate": { "type": "string" } } } }));
     }
     if grown {
         tools.push(json!({ "name": "greet", "description": "Greet someone by name.",
@@ -585,6 +587,24 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
                     ),
                 ));
             }
+            // `echo` with `echoEnvError` reads the named variable from this
+            // process's environment (where the gateway injected the server's
+            // secrets) and fails with its value in the text: `mode` "result" gives
+            // an `isError` result, "rpc" a JSON-RPC error. Exercises what Toolport
+            // persists when an upstream echoes a credential back.
+            if name == "echo" {
+                if let Some(key) = args.get("echoEnvError").and_then(Value::as_str) {
+                    let value = std::env::var(key).unwrap_or_default();
+                    let text = format!("upstream rejected credential {value} (Bearer {value})");
+                    if args.get("mode").and_then(Value::as_str) == Some("rpc") {
+                        return Some(error(id, -32001, &text, Some(json!({ "echo": value }))));
+                    }
+                    return Some(success(
+                        id,
+                        json!({ "content": [{ "type": "text", "text": text }], "isError": true }),
+                    ));
+                }
+            }
             // `echo_meta` reflects the request's `_meta` back as structured
             // content so a test can assert end-to-end propagation through the
             // gateway without reading the transcript file.
@@ -680,9 +700,13 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
             }
             let text = match name {
                 "structured" if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") => {
+                    let mut data = json!({"answer": 42});
+                    if let Some(bytes) = args.get("bytes").and_then(Value::as_u64) {
+                        data["payload"] = json!("x".repeat(bytes.min(1024 * 1024) as usize));
+                    }
                     return Some(success(
                         id,
-                        json!({"content":[{"type":"text","text":"{\"answer\":42}"}],"structuredContent":{"answer":42},"isError":false}),
+                        json!({"content":[{"type":"text","text":data.to_string()}],"structuredContent":data,"isError":false}),
                     ));
                 }
                 "large" if std::env::var("MOCK_MCP_CONFORMANCE").as_deref() == Ok("1") => {
@@ -723,6 +747,10 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
                         None => format!("slept {ms} ms"),
                     }
                 }
+                "hold" => format!(
+                    "released {}",
+                    args.get("gate").and_then(|g| g.as_str()).unwrap_or("")
+                ),
                 "greet" => {
                     let who = args.get("name").and_then(|t| t.as_str()).unwrap_or("there");
                     format!("hello {who}")
@@ -945,6 +973,27 @@ fn sleep_ms(req: &Value) -> Option<u64> {
     Some(req["params"]["arguments"]["ms"].as_u64().unwrap_or(0))
 }
 
+/// The gate a `hold` call waits on: a file named `gate-<name>` beside the transcript,
+/// which the test creates to let that call answer.
+fn hold_gate(cfg: &Config, req: &Value) -> Option<std::path::PathBuf> {
+    if req.get("method").and_then(Value::as_str) != Some("tools/call")
+        || req["params"]["name"].as_str() != Some("hold")
+    {
+        return None;
+    }
+    let gate = req["params"]["arguments"]["gate"].as_str().unwrap_or("");
+    let dir = cfg
+        .transcript
+        .as_deref()
+        .and_then(|path| {
+            std::path::Path::new(path)
+                .parent()
+                .map(std::path::Path::to_path_buf)
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    Some(dir.join(format!("gate-{gate}")))
+}
+
 /// `MOCK_MCP_CONCURRENT=1`: one thread per request, responses in completion order.
 fn serve_concurrent(cfg: Config, state: State) {
     use std::sync::{Arc, Condvar, Mutex};
@@ -993,6 +1042,12 @@ fn serve_concurrent(cfg: Config, state: State) {
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
+            if let Some(gate) = hold_gate(&cfg, &req) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                while !gate.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
             }
             let mut pre = Vec::new();
             let (resp, grew) = {

@@ -1,7 +1,7 @@
 # Maintainer: Tyler South <tsouth2@gmail.com>
 # The archive is expected to unpack to toolport-$pkgver.
 pkgname=toolport
-pkgver=2.3.4
+pkgver=2.3.8
 pkgrel=1
 install=toolport.install
 pkgdesc='One local MCP gateway for every AI client, with a native GTK shell'
@@ -26,9 +26,9 @@ options=('!lto')
 source=("toolport-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "toolport.install"
         "disconnect-users.sh")
-sha256sums=('8d6a08f7e50710b586074e1bb53242232eb1c3b425ee124b4bb5b250afc1ca41'
+sha256sums=('a9301cc9a758ac3bfd38a16583fc29b210b73e2579338645e46d887670e24b01'
             '0083ee13186ff966eb3c5379a75e2f1107e4f51fbeb9cd213ffa807acc7b97ab'
-            '21222580a18e27e7a8e9ea614e9b8dd083980d686274ec48944bc83283e29b8b')
+            '84fab489c8c11413a32f51e7cc4d8f00a52ca63a1ff35b560d7bbd8e9b8dc68b')
 
 build() {
   cd "toolport-$pkgver/src-tauri"
@@ -48,6 +48,8 @@ package() {
     "$pkgdir/usr/bin/toolport-gtk"
   install -Dm755 src-tauri/target/release/toolport-gateway \
     "$pkgdir/usr/bin/toolport-gateway"
+  ln -s toolport-gtk "$pkgdir/usr/bin/toolport"
+  ln -s toolport-gtk "$pkgdir/usr/bin/conduit"
   install -Dm644 packaging/linux/native/com.tsout.Toolport.desktop \
     "$pkgdir/usr/share/applications/com.tsout.Toolport.desktop"
   install -Dm644 packaging/linux/native/com.tsout.Toolport.metainfo.xml \

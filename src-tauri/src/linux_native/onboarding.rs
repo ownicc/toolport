@@ -1280,6 +1280,7 @@ mod tests {
             profiles: Vec::new(),
             sessions: Vec::new(),
             sessions_error: false,
+            t3_others: Vec::new(),
         };
         assert!(should_offer(&registry, &empty));
 
@@ -1304,11 +1305,14 @@ mod tests {
                 inherited_discovery: None,
                 config_error: false,
                 location_removable: false,
+                location_kept_by_t3_code: false,
                 claude_profile: None,
+                t3_code: Vec::new(),
             }],
             profiles: Vec::new(),
             sessions: Vec::new(),
             sessions_error: false,
+            t3_others: Vec::new(),
         };
         assert!(!should_offer(&registry, &connected));
 
@@ -1325,6 +1329,7 @@ mod tests {
             cwd: None,
             source: None,
             disabled_tools: Vec::new(),
+            hide_prompts: false,
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,

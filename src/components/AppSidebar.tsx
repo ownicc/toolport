@@ -1,7 +1,7 @@
 import { translate, translate as t, useI18n, msg, type SourceMessage } from "@/lib/i18n";
 import { SETTINGS_PAGES, type SettingsSubpage } from "@/lib/settingsPages";
 import { isPersonalSync } from "@/lib/personalSync";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   Shield,
@@ -53,7 +53,11 @@ import {
 } from "@/lib/updater";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { ShareDialog } from "@/components/ShareDialog";
+import { navItemTitle } from "@/lib/shortcuts";
+
+const ShareDialog = lazy(() =>
+  import("@/components/ShareDialog").then((m) => ({ default: m.ShareDialog })),
+);
 
 const FOCUS_RING =
   "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
@@ -311,15 +315,24 @@ function VersionFooter({
               {t("Keyboard shortcuts")}
               <span className="ml-auto">?</span>
             </button>
-            <ShareDialog
-              onImported={onImport}
-              trigger={
+            <Suspense
+              fallback={
                 <button className={HELP_ITEM}>
                   <Share2 className="size-4" />
                   {t("Share or import a setup")}
                 </button>
               }
-            />
+            >
+              <ShareDialog
+                onImported={onImport}
+                trigger={
+                  <button className={HELP_ITEM}>
+                    <Share2 className="size-4" />
+                    {t("Share or import a setup")}
+                  </button>
+                }
+              />
+            </Suspense>
             <button className={HELP_ITEM} onClick={onReplay}>
               <Compass className="size-4" />
               {t("Run setup again")}
@@ -549,7 +562,7 @@ export function AppSidebar({
     <button
       onClick={onClick}
       aria-label={t(label)}
-      title={`${t(label)}${["Servers", "Clients", "Activity", "Settings"].includes(label) ? ` (${/Mac/.test(navigator.platform) ? "⌘" : "Ctrl"}${["Servers", "Clients", "Activity", "Settings"].indexOf(label) + 1})` : ""}`}
+      title={navItemTitle(label, t(label), /Mac/.test(navigator.platform))}
       aria-current={active ? "page" : undefined}
       className={`${NAV_ITEM} ${label === "Settings" ? "font-semibold" : ""} ${active ? "bg-accent font-medium text-foreground" : "text-muted-foreground"}`}
     >
@@ -678,15 +691,19 @@ export function AppSidebar({
         {savings && (savings.tokenizedLoads ?? 0) > 0 && (
           <button
             onClick={() => onSelectView("activity")}
-            className="sidebar-savings mx-3 mt-2 flex items-center gap-2 rounded-lg border border-success/30 bg-success/5 px-3 py-2 text-left text-meta transition-colors hover:bg-success/10"
+            // Green only for a real saving; extra tokens read neutral, as in GTK.
+            className={`sidebar-savings mx-3 mt-2 flex items-center gap-2 rounded-lg border px-3 py-2 text-left text-meta transition-colors ${savings.tokensSaved < 0 ? "border-border bg-muted/20 hover:bg-muted/40" : "border-success/30 bg-success/5 hover:bg-success/10"}`}
             title={`${savingsStale ? t("Catalog telemetry unavailable; showing the last loaded measurement. ") : ""}${t("cl100k_base tokenizer; one full catalog baseline per client session minus every catalog and search response. Sessionless HTTP and unverifiable history excluded; not model usage or billing. Click for the breakdown.")}`}
           >
-            <Zap className="size-3.5 shrink-0 text-success" />
+            <Zap
+              className={`size-3.5 shrink-0 ${savings.tokensSaved < 0 ? "text-muted-foreground" : "text-success"}`}
+            />
             <span className="text-muted-foreground">
+              {/* A negative net saving is overhead: show its size as extra tokens. */}
               <span className="font-semibold text-foreground">
-                {fmtTokens(savings.tokensSaved)}
+                {fmtTokens(Math.abs(savings.tokensSaved))}
               </span>{" "}
-              {t("tokens saved")}
+              {savings.tokensSaved < 0 ? t("extra tokens") : t("tokens saved")}
               {savingsStale ? t(" (stale)") : ""}
             </span>
           </button>

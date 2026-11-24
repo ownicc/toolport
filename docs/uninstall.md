@@ -2,7 +2,7 @@
 
 Toolport installs a gateway entry into each AI client's own config file and keeps
 its state in a per-user data directory. A clean removal has two parts: disconnect
-the clients while Toolport is still installed, then remove the app. Normal uninstall and upgrades keep your data and credentials.
+the clients while Toolport is still installed, then remove the app. Normal uninstall keeps your registry and credentials. Verified client recovery releases backup payloads; upgrades keep connections and recovery data.
 
 ## 1. Disconnect your clients
 
@@ -12,10 +12,75 @@ removing the app or its data. You can also run `toolport-gateway --disconnect-al
 as your normal user; `--dry-run` lists the affected clients without changing them.
 Do not run this command with sudo. Untouched configs return to their exact original
 bytes; subsequent unrelated edits are preserved or reported as conflicts.
+
+Removing Toolport from all clients also stops the Toolport gateway daemon unless a
+client is connected to it right now. A connected client keeps working until it
+disconnects; the daemon then exits at once instead of waiting out its idle time.
+The same happens when you quit Toolport. A daemon whose app was deleted, moved to
+the Trash or replaced by a package upgrade notices within a few seconds and exits
+as soon as no client is connected.
+
+Backups of imported credentials are stored in the vault with a recovery copy
+that omits secret values. At desktop startup, Toolport also seals older plaintext
+backups before updating client gateway paths. If that migration cannot use the
+vault, it retains the original backup and reports the failure; unlock the vault
+and restart Toolport to retry. If a saved value cannot be read, restoration still recovers the config and
+keeps a placeholder for that value. **Clients** lists each server and key with
+its reason and next step. A locked keyring needs unlocking; an unavailable store
+needs starting or reconnecting; duplicate matches need resolving. A missing or
+damaged saved value can be re-entered in the client, or entered in Toolport before
+choosing **Retry**. Access rejection and cancellation have their own messages.
+Technical placeholder names appear only in **Details**.
+
+Retry restores unchanged placeholder leaves, including entries you moved, while
+preserving your edits, comments and ordering. A value you replaced yourself or a
+server entry you deleted is accounted for without being overwritten or restored.
+Results state how many values were restored and how many still need attention.
+The receipt and saved values are retained until the committed file has no owed
+placeholders. Partial recovery never removes its receipt. Recovery also works
+from `toolport-gateway --disconnect-all`, even for an already disconnected client.
+
+Pending notices survive restarting either shell. **Dismiss** only hides a notice;
+**Show recovery** brings it back. The notice and confirmation show the backup path
+and explain that it does not expire automatically. **Discard these saved values**
+is separate and permanent: its confirmation lists the saved values and every
+backup file it will delete, including older snapshots and the matching move
+record. The current client config and server credentials do not change; temporary
+text for missing values stays until you replace it yourself. If deletion starts
+but cannot finish, the notice says which material may already be gone and offers
+**Finish discarding** with a fresh list of remaining files. Restoration is blocked
+for that receipt once deletion has started. **Scan clients again** and Ctrl+R
+check saved-value availability without an unlock prompt or changing the client
+config; available values are marked ready for **Retry**. Malformed or untrusted receipts are
+listed separately with a repair reason and cannot authorize unsafe writes or
+deletion. One bad receipt does not hide other recoveries.
+
+Linux backup reads and deletion never open keyring unlock prompts. macOS backup
+queries use `kSecUseAuthenticationUIFail`: interaction-not-allowed, authentication
+failure and cancellation map to separate states. Credential Manager maps reported
+Windows access, authentication, cancellation, missing and corrupt-data errors.
+Windows has no separately lockable generic-credential vault, so normal reads do
+not produce a keyring-locked state or an unlock prompt to cancel. Its unique
+credential target names also do not produce Secret Service's duplicate-match
+state. Keychain's service/account/access-group query does not report that Linux
+match-cardinality state either. Payload integrity failures are checked by
+Toolport on every platform.
+
+Status mapping and backup round-trip tests run in **Headless Rust tests
+(macos-latest, core)** and **Headless Rust tests (windows-latest, core)** in
+`.github/workflows/ci.yml`. Unsigned macOS runners assert the production Keychain
+entitlement refusal instead of publishing an unprotected backup; real Keychain
+round-trip acceptance needs the signed app with its provisioning profile.
+
+Data removal refuses to discard incomplete recovery.
+After verified restoration, historical backup payloads are deleted and only
+empty ownership metadata remains, so a later uninstall cannot claim native entries.
 Turn off **Launch at login** in Settings.
 
 Windows NSIS and native GTK deb/rpm/Arch packages attempt the same operation before
-removing their gateway. Failure is logged with recovery instructions and removal
+removing their gateway (`--disconnect-all --uninstall`), which also removes
+Toolport's own launch-at-login entry; a changed or unrecognized entry is kept and
+named. Failure is logged with recovery instructions and removal
 continues. Keep Toolport's data on failure, reinstall it, and retry the action above.
 Linux hooks enumerate accounts with `~/.config/Toolport` or `~/.config/Conduit`
 and switch to each account without a login shell. For a custom `XDG_CONFIG_HOME`
@@ -24,13 +89,23 @@ Upgrades skip the removal action. Windows installers defer while client gateways
 are open and name the affected clients: close their MCP sessions and retry, or
 cancel to install later. They never force-kill gateways by name.
 
-**AppImage, Tauri .deb, and macOS:** use the in-app action before deleting the app.
-AppImage and dragging a macOS app to Trash have no uninstall hook. The native GTK
-.deb is distinct from the Tauri .deb. The Homebrew tap is `btsouth/homebrew-toolport`;
-its cask also requires the action before uninstall or zap. Homebrew runs uninstall
-preflight blocks during upgrades without exposing an upgrade flag, so the cask
-uses a manual action to preserve client connections during updates. On macOS the
-CLI is `"/Applications/Toolport.app/Contents/MacOS/toolport-gateway" --disconnect-all`
+Windows uninstalls then stop any gateway still running from the install folder,
+because Windows cannot remove a running program; a client that was connected
+loses its gateway at that point.
+
+**Homebrew:** the cask in the `btsouth/homebrew-toolport` tap runs the same
+operation on `brew uninstall --cask toolport`, while the app is still installed,
+then quits Toolport. Upgrades and reinstalls skip it, so clients stay connected.
+The cask checks both Homebrew's call stack and the brew command; if they
+disagree it leaves every client connected and prints the command to run by
+hand. If it cannot restore a client it prints a warning and the uninstall continues;
+Toolport's data, which holds the original configs, is kept.
+
+**AppImage, Tauri .deb, and dragging macOS to the Trash:** use the in-app action
+and turn off **Launch at login** in Settings before deleting the app. These have
+no uninstall hook, so nothing can remove the login entry after the app is gone. The native GTK .deb is
+distinct from the Tauri .deb. On macOS the CLI is
+`"/Applications/Toolport.app/Contents/MacOS/toolport-gateway" --disconnect-all`
 (adjust the app path if needed).
 
 ## 2. Remove the app
@@ -39,13 +114,21 @@ CLI is `"/Applications/Toolport.app/Contents/MacOS/toolport-gateway" --disconnec
   `winget uninstall Toolport.Toolport`. The NSIS uninstaller removes the app and its
   bundled gateway.
 - **macOS:** quit Toolport, then drag `Toolport.app` from Applications to the Trash.
-  With the Homebrew cask, run `brew uninstall --cask toolport`.
+  With the Homebrew cask, run `brew uninstall --cask toolport`. It keeps Toolport's
+  data and credentials; `brew uninstall --cask --zap toolport` removes them too
+  (see below).
 - **Linux:** use the package manager that installed it:
   - pacman repository: `sudo pacman -R toolport`. See
     [Arch and Omarchy](arch-pacman-repo.md) for removing the repo and key.
   - `.deb`: `sudo apt remove toolport` (or `sudo dpkg -r toolport`).
   - Native GTK `.rpm`: `sudo dnf remove toolport`.
-  - AppImage: quit Toolport and delete the `.AppImage` file.
+  - AppImage: disconnect clients, quit Toolport, then run the installer cleanup as
+    your normal user: `bash install.sh --uninstall-appimage` (download
+    [install.sh](https://toolport.app/install.sh) first). This removes the actual
+    extensionless `$XDG_BIN_HOME/toolport` (default `~/.local/bin/toolport`),
+    desktop launcher, icons, autostart entries and update resume state.
+    Use the same XDG paths as installation. For a manually downloaded AppImage,
+    also delete that file.
 
 ## Optional: remove Toolport data
 
@@ -119,8 +202,13 @@ tries the runtime directory's bus and inventories older keyring tokens even if
 the file backend is selected. An unavailable desktop bus or Secret Service
 provider reports credential cleanup as incomplete and keeps the registry so
 retry can find the same accounts. Startup cleanup precedes
-credential deletion. Any partially completed cleanup lists removed and failed
-items separately and keeps the registry so retry uses the same ownership scope.
+credential deletion. Each credential is removed on its own: one that cannot be
+removed never stops the others, and the rest of the data is still removed. The
+report lists what was removed, what was already gone (`absent`, for example a
+legacy keychain view of an item that was just deleted), and every leftover with
+its reason. When a credential is left over, `registry.json` and
+`client-locations.json` are kept, and listed, so a retry finds the same accounts,
+and the command exits with status 1.
 Toolport's own launch-at-login entries are removed; changed or unrecognized
 entries are preserved and reported. Failed removals list the exact resource
 paths, or the credential scope if the OS denied inventory access.
@@ -128,10 +216,18 @@ paths, or the credential scope if the OS denied inventory access.
 The resource inventory also includes app caches, preferences, saved state and
 WebView storage for `com.tsout.conduit`. These are removed for a sole default
 install and preserved with an explanation when another install or a custom data
-directory is in use. Homebrew zap removes these app storage paths, while keeping
-registry/recovery data and credentials. Custom data directories require a valid
+directory is in use. Custom data directories require a valid
 Toolport registry regardless of their folder name, except for the explicit
 `--all-installs` option when a corrupt registry file exists.
+
+**Homebrew zap:** `brew uninstall --cask --zap toolport` quits Toolport and runs
+this same removal (`--remove-data --confirm`) while the app is still installed,
+saving the report to `~/Toolport-removal-report.json`. It then trashes the app
+storage listed above and removes `~/Library/Application Support/Toolport` and
+`Conduit` only if the removal left them empty. If the removal reports leftovers,
+the zap continues, prints the report path and keeps whatever the report lists,
+including the registry needed for a retry. Plain `brew uninstall` never removes
+data.
 
 Native client files, servers and installed package binaries are kept. The package manager removes installed binaries in step 2. The action
 uses the current data directory, including a custom `TOOLPORT_DATA_DIR`, an
@@ -140,6 +236,8 @@ existing `Conduit` directory or the separate `Toolport-dev` directory.
 ## Keeping Toolport
 
 To move a client off Toolport without uninstalling, use **Disconnect** on that
-client only. To keep a client connected but stop sending its tool definitions, set
-`TOOLPORT_DISCOVERY=full` on that client's gateway entry; see
-[Configuration](configuration.md).
+client only. To keep a client connected while finding tools on demand instead
+of sending the full tool list, choose lazy discovery for that client on the
+**Clients** page. `TOOLPORT_DISCOVERY=full` sends every definition and is only a
+standalone process default; shared daemon sessions use the saved client setting.
+See [Configuration](configuration.md).

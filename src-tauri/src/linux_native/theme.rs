@@ -37,7 +37,7 @@ enum ThemeMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct OmarchyPalette {
+pub(super) struct OmarchyPalette {
     mode: ThemeMode,
     background: String,
     dark_background: String,
@@ -181,7 +181,7 @@ impl OmarchyPalette {
         }
     }
 
-    fn css(&self) -> String {
+    pub(super) fn css(&self) -> String {
         let tokens = self.tokens();
         format!(
             r#"
@@ -925,12 +925,17 @@ dropdown popover row:selected {{
   margin-bottom: 8px;
 }}
 
+/* Activity's stat tiles (spec 9): a surface card, as React draws them. */
 .toolport-summary-item {{
-  background-color: transparent;
-  border: none;
-  border-bottom: 1px solid @toolport_border;
-  border-radius: 0;
-  padding: 10px 13px;
+  background-color: @toolport_card;
+  border: 1px solid @toolport_border;
+  border-radius: 12px;
+  padding: 12px 13px;
+}}
+
+.toolport-summary-item.error {{
+  background-color: alpha(@toolport_error, 0.08);
+  border-color: alpha(@toolport_error, 0.5);
 }}
 
 .toolport-security-status {{
@@ -997,6 +1002,20 @@ button.toolport-activity-filter {{
   box-shadow: 0 0 0 2px alpha(@toolport_accent, 0.10);
 }}
 
+/* React's StatusCard: a 32px muted tile, a 14/600 title. */
+.toolport-status-tile {{
+  min-width: 32px;
+  min-height: 32px;
+  border-radius: 8px;
+  background-color: alpha(@toolport_fg, 0.06);
+  color: @toolport_text_secondary;
+}}
+
+.toolport-status-card-title {{
+  font-size: 14px;
+  font-weight: 600;
+}}
+
 .toolport-card {{
   background-color: transparent;
   border: none;
@@ -1039,6 +1058,20 @@ button.toolport-activity-filter {{
 }}
 .toolport-gateway-flow flowboxchild {{ padding: 0; }}
 
+/* React's plain <details> disclosure in the connect dialogs: no border or fill, a regular
+   weight title with a hover tint, the content under it. */
+.toolport-disclosure {{ padding: 0; border: none; background: none; }}
+.toolport-disclosure > box > title {{
+  min-height: 0;
+  padding: 2px 4px;
+  margin: 0 -4px;
+  border-radius: 6px;
+  font-weight: 400;
+}}
+.toolport-disclosure > box > title:hover {{ background-color: alpha(@toolport_fg, 0.06); }}
+.toolport-disclosure.small > box > title,
+.toolport-disclosure-text {{ font-size: 13px; }}
+
 .toolport-details-expander {{
   padding: 11px 14px;
   border: 1px solid @toolport_border;
@@ -1064,6 +1097,127 @@ button.toolport-activity-filter {{
 
 .toolport-stat-metrics {{
   font-variant-numeric: tabular-nums;
+}}
+
+/* A failed Activity call and a breakdown server open in place; the button keeps
+   the row's look instead of a button's. */
+button.toolport-activity-row-button {{
+  padding: 0;
+  margin: 0;
+  min-height: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  font-weight: normal;
+}}
+
+.toolport-activity-detail {{
+  margin-top: 10px;
+  padding-top: 8px;
+  padding-left: 52px;
+  border-top: 1px solid @toolport_border;
+}}
+
+.toolport-activity-error {{
+  color: @toolport_error;
+}}
+
+/* The weight `.toolport-native button` gives would make a whole row bold. */
+.toolport-native button.toolport-activity-row-button {{
+  font-weight: normal;
+}}
+
+/* React's savings banner: a green leading bar over a green tint, the number in green. */
+.toolport-savings-card {{
+  padding: 16px;
+  border-left: 3px solid @toolport_success;
+  border-radius: 0 12px 12px 0;
+  background-color: alpha(@toolport_success, 0.08);
+}}
+
+.toolport-savings-card.cost {{
+  border-left-color: @toolport_border;
+  background-color: alpha(@toolport_fg, 0.03);
+}}
+
+.toolport-savings-card.cost image,
+.toolport-sidebar-savings.cost image {{
+  color: @toolport_text_secondary;
+}}
+
+.toolport-savings-card.cost .toolport-savings-value {{
+  color: @toolport_fg;
+}}
+
+.toolport-sidebar-savings.cost {{
+  border-color: @toolport_border;
+  background: alpha(@toolport_fg, 0.03);
+}}
+
+.toolport-savings-title {{
+  color: @toolport_text_secondary;
+  font-weight: 500;
+}}
+
+.toolport-native button.toolport-savings-share {{
+  min-height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: normal;
+  color: @toolport_text_secondary;
+}}
+
+.toolport-savings-value {{
+  color: @toolport_success;
+  font-size: 30px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}}
+
+/* Stat tile numbers (spec 9): 22px, weight 600. */
+.toolport-native label.toolport-summary-value {{
+  font-size: 22px;
+  font-weight: 600;
+}}
+
+/* Tiles line up with the cards above: no flow box child inset. */
+.toolport-summary > flowboxchild {{
+  padding: 0;
+}}
+
+/* Errors only: plain text, and red while on, as React's toggle. */
+.toolport-native button.toolport-activity-filter {{
+  font-weight: normal;
+}}
+
+.toolport-native button.toolport-activity-filter:checked {{
+  color: @toolport_error;
+  background-color: alpha(@toolport_error, 0.10);
+  border-color: alpha(@toolport_error, 0.5);
+}}
+
+/* Remove in a row menu is red text; a fill only on hover, like the other items. */
+.toolport-action-menu button.toolport-destructive {{
+  padding: 0 10px;
+  background-color: transparent;
+}}
+
+.toolport-action-menu button.toolport-destructive:hover {{
+  background-color: alpha(@toolport_error, 0.10);
+}}
+
+.toolport-row-group .toolport-card.toolport-stat-header {{
+  min-height: 0;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  background-color: alpha(@toolport_fg, 0.03);
+}}
+
+/* Server rows: one line each, as in React's table. */
+.toolport-row-group .toolport-card.toolport-stat-server {{
+  min-height: 0;
+  padding-top: 8px;
+  padding-bottom: 8px;
 }}
 
 .toolport-settings-parent {{ font-weight: 600; }}
@@ -1159,6 +1313,9 @@ button.toolport-activity-filter {{
   border-radius: 999px;
   padding: 2px 8px;
 }}
+
+/* A chip that wraps: half its one-line height, so one line is still a pill. */
+.toolport-badge.toolport-badge-wraps {{ border-radius: 10px; }}
 
 .toolport-badge.success {{
   background-color: alpha(@toolport_success, 0.12);
@@ -1275,13 +1432,74 @@ button.toolport-catalog-action {{
 .toolport-state-card.error .toolport-state-icon {{ color: @toolport_error; }}
 
 .toolport-manual-code {{ background: @toolport_card; border: 1px solid @toolport_border; border-radius: 12px; padding: 16px; }}
+/* Spec §10 status card, as React's StatusCard: a 3px start bar for success and warning,
+   none for info, and a tile tinted to match. */
+.toolport-status-card {{ background: @toolport_card; border: 1px solid @toolport_border; border-radius: 12px; padding: 16px; }}
+.toolport-status-card.status-success {{ border-left: 3px solid @toolport_success; }}
+.toolport-status-card.status-warning {{ border-left: 3px solid @toolport_warning; }}
+.toolport-status-card.status-danger {{ border-left: 3px solid @toolport_error; }}
+/* A tool change group, as React's bordered box; red when a tool is blocked. */
+.toolport-tool-change-group {{ border: 1px solid @toolport_border; border-radius: 8px; padding: 12px; }}
+.toolport-tool-change-group.blocked {{ border-color: alpha(@toolport_error, 0.4); background-color: alpha(@toolport_error, 0.05); }}
+.toolport-tool-change-group label.toolport-tool-change-status.error {{ color: @toolport_error; }}
+.toolport-tool-change-group button.toolport-secondary-action {{ background-color: @toolport_raised; border: 1px solid @toolport_border; }}
+.toolport-tool-change-title {{ font-weight: 400; }}
+.toolport-card.toolport-activity-panel {{ background-color: @toolport_card; border: 1px solid @toolport_border; border-radius: 12px; padding: 12px 16px; }}
+.toolport-card.toolport-activity-panel:hover {{ background-color: @toolport_card; }}
+.toolport-status-card .toolport-status-tile {{ border-radius: 8px; }}
+.toolport-status-card.status-info .toolport-status-tile {{ background: alpha(@toolport_fg, 0.06); color: @toolport_text_secondary; }}
+.toolport-status-card.status-success .toolport-status-tile {{ background: alpha(@toolport_success, 0.12); color: @toolport_success; }}
+.toolport-status-card.status-warning .toolport-status-tile {{ background: alpha(@toolport_warning, 0.12); color: @toolport_warning; }}
+.toolport-status-card.status-danger .toolport-status-tile {{ background: alpha(@toolport_error, 0.12); color: @toolport_error; }}
+.toolport-status-title {{ font-size: 14px; font-weight: 600; }}
+.toolport-status-detail {{ font-size: 13px; }}
 .toolport-error-callout {{ background: @toolport_card; border: 1px solid @toolport_border; border-left: 3px solid @toolport_error; border-radius: 12px; padding: 16px; }}
 .toolport-error-tile {{ background: alpha(@toolport_error, 0.12); color: @toolport_error; border-radius: 8px; }}
+/* Spec §10 status card. Info has no status bar; the others add a 3px start bar. */
+.toolport-status-card {{ background: @toolport_card; border: 1px solid @toolport_border; border-radius: 12px; padding: 16px; }}
+.toolport-status-card .toolport-status-tile {{ border-radius: 8px; }}
+.toolport-status-card.info .toolport-status-tile {{ background: alpha(@toolport_fg, 0.06); color: @toolport_text_secondary; }}
+.toolport-status-title {{ font-size: 14px; font-weight: 600; }}
+.toolport-status-detail {{ font-size: 13px; }}
 .toolport-inline-error {{ font-size: 13px; color: @toolport_error; }}
+.toolport-inline-reason {{ font-size: 13px; color: @toolport_text_secondary; }}
 .toolport-skeleton-group {{ background: @toolport_card; border: 1px solid @toolport_border; border-radius: 12px; }}
 .toolport-skeleton {{ min-height: 24px; margin: 16px; border-radius: 8px; background: alpha(@toolport_fg, 0.06); }}
 toast {{ background: @toolport_raised; color: @toolport_fg; border: 1px solid @toolport_border; border-radius: 12px; }}
 statuspage.toolport-success image.icon {{ color: @toolport_success; opacity: 1; }}
+/* Review and connect: React's dialog title (20px, 600) and its success check. */
+/* Spec §2: a dialog title is 17/600, its description 13px secondary, paths mono 13. */
+.toolport-dialog-title {{ font-size: 17px; font-weight: 600; }}
+.toolport-dialog-lede {{ font-size: 13px; color: @toolport_text_secondary; }}
+.toolport-dialog-field {{ font-size: 13px; font-weight: 400; color: @toolport_fg; }}
+.toolport-path-text {{ font-family: monospace; font-size: 13px; font-weight: 400; }}
+image.toolport-success-icon {{ color: @toolport_success; opacity: 1; }}
+/* React's review item: the whole row is the toggle, with a 12px round dot that fills
+   green when selected and a green ring around the selected row. */
+button.toolport-review-item {{
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid @toolport_border;
+  background: transparent;
+  box-shadow: none;
+}}
+button.toolport-review-item:hover {{ background: alpha(@toolport_fg, 0.04); }}
+button.toolport-review-item:checked {{ background: transparent; border-color: alpha(@toolport_success, 0.6); }}
+button.toolport-review-item:checked:hover {{ background: alpha(@toolport_fg, 0.04); }}
+.toolport-select-dot {{
+  min-width: 12px;
+  min-height: 12px;
+  border-radius: 999px;
+  border: 1px solid @toolport_text_secondary;
+}}
+/* Button text is bold by default; React's entry text is regular with a medium name. */
+button.toolport-review-item label {{ font-weight: 400; }}
+button.toolport-review-item label.toolport-review-name {{ font-size: 14px; font-weight: 500; }}
+button.toolport-review-item label.toolport-review-command {{ font-size: 13px; }}
+button.toolport-review-item:checked .toolport-select-dot {{
+  background: @toolport_success;
+  border-color: @toolport_success;
+}}
 
 .toolport-native .title-2 {{ font-size: 22px; font-weight: 600; }}
 .toolport-native .title-3 {{ font-size: 17px; font-weight: 600; }}
@@ -1539,8 +1757,24 @@ button.toolport-skill-chip:hover {{ background-color: alpha(@toolport_fg, 0.13);
   color: @toolport_fg;
 }}
 .toolport-feedback .heading {{ color: @toolport_fg; }}
+/* React's info notice (the restart reminder): muted bar, bold title, muted text. */
+.toolport-feedback.info {{
+  border-color: @toolport_info;
+  background-color: alpha(@toolport_info, 0.08);
+  color: @toolport_info;
+}}
+.toolport-feedback.info .heading {{ font-weight: 600; }}
+.toolport-recovery-values {{ border-radius: 6px; }}
+.toolport-recovery-values:focus-within {{ outline: 2px solid alpha(@toolport_accent, 0.50); outline-offset: 2px; }}
+.toolport-recovery-values textview,
+.toolport-recovery-values textview text {{ background-color: transparent; color: @toolport_fg; }}
 .toolport-feedback + .toolport-feedback {{
   border-top: 1px solid @toolport_border;
+}}
+/* After Connect all, focus returns to the T3 Code card when it has no button left. */
+.toolport-t3-card-group:focus:focus-visible {{
+  outline: 2px solid @toolport_accent;
+  outline-offset: 2px;
 }}
 
 .toolport-native .toolport-badge {{
@@ -1555,6 +1789,25 @@ selection {{
 button.suggested-action {{
   background-color: @toolport_accent;
   color: @toolport_bg_dark;
+}}
+
+/* The T3 Code thread chip: a badge that copies the thread id, so it takes focus. */
+button.toolport-thread-chip {{
+  min-height: 0;
+  min-width: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: none;
+  box-shadow: none;
+  background-color: @toolport_info_tint;
+  color: @toolport_text_secondary;
+}}
+button.toolport-thread-chip:hover {{
+  background-color: mix(@toolport_info_tint, @toolport_fg, 0.08);
+}}
+button.toolport-thread-chip:focus:focus-visible {{
+  outline: 2px solid @toolport_accent;
+  outline-offset: 2px;
 }}
 
 /* Button levels (spec 5). Secondary: raised fill and a border, for every

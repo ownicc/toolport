@@ -4,6 +4,8 @@
 # For a from-source local build, use: docker build -f Dockerfile.source .
 
 FROM debian:bookworm-slim
+# The MCP registry checks this label against server.json's name before listing the image.
+LABEL io.modelcontextprotocol.server.name="io.github.btsouth/toolport"
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libssl3 libdbus-1-3 curl \
     && rm -rf /var/lib/apt/lists/*
@@ -35,6 +37,6 @@ VOLUME ["/data"]
 # and 503 when the gateway is serving the cached catalog only (INST-02). It is
 # unauthenticated and data-free so the healthcheck needs no token.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS -o /dev/null http://127.0.0.1:8765/healthz || exit 1
+    CMD curl -fsS -o /dev/null http://127.0.0.1:${TOOLPORT_HTTP_PORT:-${CONDUIT_HTTP_PORT:-8765}}/healthz || exit 1
 
 ENTRYPOINT ["docker-entrypoint.sh", "toolport-gateway", "--http", "8765"]

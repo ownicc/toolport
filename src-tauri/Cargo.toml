@@ -1,6 +1,6 @@
 [package]
 name = "conduit"
-version = "2.3.4"
+version = "2.3.8"
 description = "Local MCP gateway: manage all your MCP servers in one place, set up once and shared by every AI client, with tools found on demand for clients that load every definition"
 authors = ["South Forge AI"]
 edition = "2021"
@@ -112,6 +112,8 @@ subtle = "2.6"
 # build free of a C toolchain / FFI. `boa_gc` supplies the Trace impls host state needs.
 boa_engine = "0.21"
 boa_gc = "0.21"
+aho-corasick = "1"
+memchr = "2"
 base64 = "0.22"
 regex = "1"
 unicode-normalization = "0.1"
@@ -152,6 +154,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Credentials",
+    "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
@@ -168,6 +171,10 @@ keyring = { version = "3", features = ["apple-native"] }
 security-framework = "3"
 security-framework-sys = "2"
 core-foundation = "0.10"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Builds the D-Bus errors the keychain tests classify.
+dbus = "0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gio = { version = "0.18", optional = true }
@@ -211,6 +218,10 @@ required-features = ["test-support"]
 
 [[example]]
 name = "integrity-report"
+required-features = ["test-support"]
+
+[[example]]
+name = "secret-redact-performance"
 required-features = ["test-support"]
 
 # The search tests hash the 67 MB model file once per process. Unoptimized, that takes

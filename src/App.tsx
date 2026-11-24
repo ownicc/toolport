@@ -6,6 +6,7 @@ import { serverPostureCopy } from "@/lib/serverPosture";
 import { type SettingsSubpage } from "@/lib/settingsPages";
 import { visibleExecutionText } from "@/lib/visibleExecutionText";
 import { isPersonalSync } from "@/lib/personalSync";
+import { requestClientRecoveryScan } from "@/lib/clientRecoveryEvents";
 import {
   lazy,
   Suspense,
@@ -25,6 +26,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Server,
   ServerOff,
   Store,
   TriangleAlert,
@@ -111,6 +113,7 @@ import { Callout } from "@/components/Callout";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { GitHubStarPrompt, type StarSurface } from "@/components/GitHubStarPrompt";
 import { serverNameOrder } from "@/lib/serverOrder";
+import type { ConnectAllCard, T3CodeSeen } from "@/components/ClientsView";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -124,6 +127,7 @@ import { useTheme } from "@/lib/theme";
 import { fmtTs } from "@/lib/utils";
 import { createSingleFlight } from "@/lib/singleFlight";
 import {
+  modKey,
   resolveShortcut,
   shortcutHelp,
   SKILLS_REFRESH_EVENT,
@@ -140,6 +144,10 @@ function App() {
   const [registry, setRegistry] = useState<Registry | null>(null);
   const registryRef = useRef<Registry | null>(null);
   const [clients, setClients] = useState<DetectedClient[]>([]);
+  // The T3 Code settings revision these clients match; Clients unmounts behind details.
+  const t3Seen = useRef<T3CodeSeen>(null);
+  // Connect all's summary stays until dismissed, also while a client's details are open.
+  const [connectAllCard, setConnectAllCard] = useState<ConnectAllCard | null>(null);
   const [importPreview, setImportPreview] = useState<ImportItem[] | null>(null);
   const [importing, setImporting] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
@@ -176,6 +184,8 @@ function App() {
   const [query, setQuery] = useState("");
   const [headerActionsSlot, setHeaderActionsSlot] = useState<HTMLElement | null>(null);
   const [addingLocation, setAddingLocation] = useState(false);
+  const [checkingClientRecoveries, setCheckingClientRecoveries] = useState(false);
+  const clientScanPending = useRef(false);
   // Keyboard shortcuts (SBS-143). The app had none, which for a developer tool means
   // every interaction is mouse-only.
   const searchRef = useRef<HTMLInputElement>(null);
@@ -226,6 +236,16 @@ function App() {
   const [starSurface, setStarSurface] = useState<StarSurface>(null);
   const lastProbeRef = useRef(0);
   const probeFlightRef = useRef(createSingleFlight<ProbeResult[]>());
+  // Set by a Refresh or Retry the user chose: the next probe flight to start may
+  // ask to unlock the keyring. The window's own probes never do. It stays set
+  // until a flight starts, so a request queued behind an automatic probe, or
+  // coalesced with others, keeps the user's choice.
+  const interactiveProbeRef = useRef(false);
+  const takeInteractive = () => {
+    const interactive = interactiveProbeRef.current;
+    interactiveProbeRef.current = false;
+    return interactive;
+  };
   const loadedOnce = useRef(false);
 
   // Probe health quietly (no toast). Used on load and after authenticating, so
@@ -238,7 +258,7 @@ function App() {
       lastProbeRef.current = Date.now();
       setProbing(true);
       try {
-        const results = await probeServers();
+        const results = await probeServers(takeInteractive());
         setHealth(Object.fromEntries(results.map((r) => [r.serverId, r])));
         setBackendReachable(true);
         return results;
@@ -254,12 +274,13 @@ function App() {
   // Registry/auth mutations need a probe that starts after any older snapshot.
   // Multiple mutations during one active probe share a single trailing run.
   const reprobeAfterMutation = useCallback(
-    (): Promise<ProbeResult[]> =>
-      probeFlightRef.current.runAfterCurrent(async () => {
+    (interactive = false): Promise<ProbeResult[]> => {
+      if (interactive) interactiveProbeRef.current = true;
+      return probeFlightRef.current.runAfterCurrent(async () => {
         lastProbeRef.current = Date.now();
         setProbing(true);
         try {
-          const results = await probeServers();
+          const results = await probeServers(takeInteractive());
           setHealth(Object.fromEntries(results.map((r) => [r.serverId, r])));
           setBackendReachable(true);
           return results;
@@ -269,8 +290,15 @@ function App() {
         } finally {
           setProbing(false);
         }
-      }),
+      });
+    },
     [],
+  );
+
+  // A row's Retry: the user asked, so it may ask to unlock the keyring.
+  const retryProbe = useCallback(
+    (): Promise<ProbeResult[]> => reprobeAfterMutation(true),
+    [reprobeAfterMutation],
   );
 
   const applyRegistryChange = useCallback(
@@ -335,9 +363,10 @@ function App() {
 
   // `announce` is set by the manual Refresh button: it waits for the health probe
   // and reports a summary toast. The silent path (initial load, focus refresh)
-  // fires the probe without blocking or toasting.
+  // fires the probe without blocking or toasting. `interactive`: the user asked
+  // (Refresh, Ctrl+R), so its probe may ask to unlock the keyring.
   const load = useCallback(
-    async (announce = false) => {
+    async (announce = false, interactive = announce) => {
       setLoading(true);
       setError(null);
       setDetailError(null);
@@ -381,7 +410,7 @@ function App() {
         setActivityKey((k) => k + 1);
         if (announce) {
           try {
-            const results = await reprobeAfterMutation();
+            const results = await reprobeAfterMutation(interactive);
             if (results.length > 0) {
               const up = results.filter((r) => r.ok).length;
               toast.success(
@@ -396,6 +425,8 @@ function App() {
           } catch {
             toast.warning(translate("Refreshed, but couldn't check server health"));
           }
+        } else if (interactive) {
+          void reprobeAfterMutation(true).catch(() => {});
         } else {
           void reprobe().catch(() => {});
         }
@@ -418,6 +449,34 @@ function App() {
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- Start the backend load on mount without deferring its loading state.
     load();
+  }, [load]);
+
+  const manualRefresh = useCallback(async () => {
+    if (viewRef.current !== "clients") return load(true);
+    if (clientScanPending.current) return;
+    clientScanPending.current = true;
+    setCheckingClientRecoveries(true);
+    const focused = document.activeElement as HTMLElement | null;
+    try {
+      await Promise.all([requestClientRecoveryScan(), load(false, true)]);
+    } catch (cause: unknown) {
+      toastError(
+        typeof cause === "string"
+          ? cause
+          : translate(
+              "Recovery did not finish reporting its result. Choose Retry to check the current status.",
+            ),
+      );
+    } finally {
+      clientScanPending.current = false;
+      setCheckingClientRecoveries(false);
+      // Preserve a keyboard refresh trigger; never steal focus the user moved.
+      requestAnimationFrame(() => {
+        if (document.activeElement !== document.body) return;
+        if (focused?.isConnected) focused.focus();
+        else document.querySelector<HTMLButtonElement>("[data-client-refresh]")?.focus();
+      });
+    }
   }, [load]);
 
   useEffect(() => {
@@ -652,7 +711,7 @@ function App() {
           e.preventDefault();
           if (viewRef.current === "skills")
             window.dispatchEvent(new Event(SKILLS_REFRESH_EVENT));
-          else void load(true);
+          else void manualRefresh();
           break;
         case "help":
           e.preventDefault();
@@ -667,7 +726,7 @@ function App() {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [load]);
+  }, [load, manualRefresh]);
 
   const profileId = registry
     ? (registry.defaultAccessProfileId ?? registry.profiles[0]?.id)
@@ -710,15 +769,22 @@ function App() {
   // Keep these counts independent of `visible` so a filter cannot produce a
   // misleading "0 servers" action while hiding an affected row.
   const authAttention = attentionServers.filter((s) => health[s.id]?.authRequired);
-  const errorAttention = attentionServers.filter((s) => !health[s.id]?.authRequired);
+  // Not failing: not checked, because the keyring is locked.
+  const lockedAttention = attentionServers.filter(
+    (s) => !health[s.id]?.authRequired && health[s.id]?.keyringLocked,
+  );
+  const errorAttention = attentionServers.filter(
+    (s) => !health[s.id]?.authRequired && !health[s.id]?.keyringLocked,
+  );
 
-  // Count what would actually be imported: drop the gateway entry and anything
-  // already in the registry, then dedupe by name across clients (the backend
-  // import dedupes too). Using raw server counts here made the banner promise
-  // imports that the importer then correctly skipped.
+  // Count what would actually be imported: the backend's candidates, deduped
+  // across clients by connection as the import does. Using raw server counts here
+  // made the banner promise imports that the importer then correctly skipped.
   const importable = new Set(
-    clients.flatMap((c) =>
-      importableServers(c, registry).map((s) => s.name.toLowerCase()),
+    clients.flatMap(
+      (c) =>
+        c.importableKeys ??
+        importableServers(c, registry).map((s) => s.name.toLowerCase()),
     ),
   ).size;
   const selectedServer = selectedServerId
@@ -830,9 +896,8 @@ function App() {
     }
   }
 
-  async function handleToggleAll() {
+  async function handleToggleAll(enable: boolean) {
     if (!profileId || togglingAll) return;
-    const enable = enabledCount < servers.length;
     const pendingReview =
       enable && registry
         ? servers.filter((s) => needsTeamEnableReview(s) && !isEnabled(registry, s.id))
@@ -892,6 +957,10 @@ function App() {
       const before = registry?.servers.length ?? 0;
       const next = await importServers(selected);
       applyRegistryChange(next);
+      // Detection decides what each client still has to import; scan again.
+      void detectClients(false)
+        .then(setClients)
+        .catch(() => {});
       const added = next.servers.length - before;
       toast.success(
         added > 0
@@ -962,7 +1031,7 @@ function App() {
       onSwitchRef={registerServerSwitch}
       onRemove={() => handleRemove(server.id, server.name)}
       onRegistryChange={applyRegistryChange}
-      onReprobe={() => void reprobeAfterMutation().catch(() => {})}
+      onReprobe={() => void retryProbe().catch(() => {})}
     />
   );
 
@@ -1041,7 +1110,7 @@ function App() {
                         onChange={(e) => setQuery(e.target.value)}
                         placeholder={translate("Search servers")}
                         title={translate("Search servers (/ or {value1}F)", {
-                          value1: String(isMac ? "⌘" : "Ctrl"),
+                          value1: modKey(isMac),
                         })}
                         className="h-8 w-32 pl-8 sm:w-44"
                       />
@@ -1053,7 +1122,7 @@ function App() {
                         <Button
                           variant="outline"
 
-                          title={isMac ? t("Add server (⌘N)") : t("Add server (CtrlN)")}
+                          title={isMac ? t("Add server (⌘N)") : t("Add server (Ctrl+N)")}
                         >
                           <Plus className="size-4" /> {t("Add server")}{" "}
                         </Button>
@@ -1073,7 +1142,7 @@ function App() {
                         <Button
                           variant="ghost"
                           size="icon"
-                          aria-label={translate("More actions")}
+                          aria-label={translate("Import and server actions")}
                           title={translate("Import and server actions")}
                         >
                           <MoreHorizontal className="size-4" />
@@ -1086,43 +1155,51 @@ function App() {
                           <span>{t("Import")}</span>
                         </DropdownMenuItem>
 
+                        {/* Both bulk actions, named as in the GTK menu. They act on
+                            every server, so they stay off while a search hides some,
+                            and while a bulk change is running. */}
                         {servers.length > 0 && (
-                          <DropdownMenuItem
-                            onClick={() => {
-                              // "Disable all" only shows when every server is enabled,
-                              // so it turns off `servers.length`. Confirm when that's
-                              // more than a couple; "Enable all" and small sets go
-                              // straight through.
-                              const disabling = enabledCount >= servers.length;
-                              if (
-                                disabling &&
-                                servers.length > BULK_DISABLE_CONFIRM_MIN
-                              ) {
-                                setConfirmDisableAll(true);
-                              } else {
-                                void handleToggleAll();
+                          <>
+                            <DropdownMenuItem
+                              onClick={() => void handleToggleAll(true)}
+                              disabled={
+                                togglingAll ||
+                                busyId !== null ||
+                                query.trim() !== "" ||
+                                enabledCount >= servers.length
                               }
-                            }}
-                            // Gate on the flag handleToggleAll actually sets (togglingAll),
-                            // not just busyId, so it can't be re-fired mid-run. Disabled
-                            // while a search is active: it acts on ALL servers, so it must
-                            // not silently toggle ones hidden by the filter.
-                            disabled={
-                              togglingAll || busyId !== null || query.trim() !== ""
-                            }
-                            title={
-                              query.trim() !== ""
-                                ? t("Clear the search to enable or disable all servers")
-                                : undefined
-                            }
-                          >
-                            <ServerOff className="mr-2 size-4" />
-                            <span>
-                              {enabledCount < servers.length
-                                ? t("Enable all")
-                                : t("Disable all")}
-                            </span>
-                          </DropdownMenuItem>
+                              title={
+                                query.trim() !== ""
+                                  ? t("Clear the search to enable or disable all servers")
+                                  : undefined
+                              }
+                            >
+                              <Server className="mr-2 size-4" />
+                              <span>{t("Enable all reviewed servers")}</span>
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onClick={() => {
+                                // Turning off more than a couple asks first.
+                                if (enabledCount > BULK_DISABLE_CONFIRM_MIN)
+                                  setConfirmDisableAll(true);
+                                else void handleToggleAll(false);
+                              }}
+                              disabled={
+                                togglingAll ||
+                                busyId !== null ||
+                                query.trim() !== "" ||
+                                enabledCount === 0
+                              }
+                              title={
+                                query.trim() !== ""
+                                  ? t("Clear the search to enable or disable all servers")
+                                  : undefined
+                              }
+                            >
+                              <ServerOff className="mr-2 size-4" />
+                              <span>{t("Disable all servers")}</span>
+                            </DropdownMenuItem>
+                          </>
                         )}
                       </DropdownMenuContent>
                     </DropdownMenu>
@@ -1157,17 +1234,24 @@ function App() {
                   <Button
                     variant="ghost"
                     size="icon"
-                    aria-label={t("Refresh")}
+                    aria-label={
+                      view === "servers"
+                        ? t("Check servers again")
+                        : view === "activity"
+                          ? t("Refresh activity")
+                          : t("Refresh")
+                    }
+                    data-client-refresh={view === "clients" ? "" : undefined}
                     title={
                       isMac
                         ? t("Reload servers, clients, and health (⌘R)")
-                        : t("Reload servers, clients, and health (CtrlR)")
+                        : t("Reload servers, clients, and health (Ctrl+R)")
                     }
-                    onClick={() => load(true)}
-                    disabled={loading}
+                    onClick={() => void manualRefresh()}
+                    disabled={loading || checkingClientRecoveries}
                   >
                     <RefreshCw
-                      className={`size-4 ${String(loading || probing ? "animate-spin" : "")}`}
+                      className={`size-4 ${String(loading || probing || checkingClientRecoveries ? "animate-spin" : "")}`}
                     />
                   </Button>
                 )}
@@ -1192,7 +1276,9 @@ function App() {
                 variant="outline"
                 size="sm"
                 className="shrink-0"
-                onClick={() => void reprobe().catch(() => {})}
+                onClick={() => {
+                  void reprobeAfterMutation(true).catch(() => {});
+                }}
                 disabled={probing}
               >
                 {" "}
@@ -1246,6 +1332,9 @@ function App() {
                           error={error}
                           onSelectClient={selectClient}
                           onChanged={load}
+                          t3Seen={t3Seen}
+                          connectAllCard={connectAllCard}
+                          onConnectAllCard={setConnectAllCard}
                         />
                       )
                     ) : view === "skills" ? (
@@ -1266,7 +1355,7 @@ function App() {
                         registry={registry}
                         onRegistryChange={applyRegistryChange}
                         health={health}
-                        onReprobe={() => void reprobeAfterMutation().catch(() => {})}
+                        onReprobe={() => void retryProbe().catch(() => {})}
                         onOpenServers={() => selectView("servers")}
                       />
                     ) : view === "settings" ? (
@@ -1301,7 +1390,7 @@ function App() {
                               backFromDetail("servers");
                           }}
                           onRegistryChange={applyRegistryChange}
-                          onReprobe={() => void reprobeAfterMutation().catch(() => {})}
+                          onReprobe={() => void retryProbe().catch(() => {})}
                         />
                       ) : (
                         <SharedEmptyState
@@ -1346,6 +1435,7 @@ function App() {
                             <ServerNextAction
                               authServers={authAttention}
                               errorServers={errorAttention}
+                              lockedServers={lockedAttention}
                             />
                           ) : (
                             <ServerPosture
@@ -1460,11 +1550,11 @@ function App() {
         title={translate("Disable all servers?")}
         description={translate(
           "This turns off all {value1} servers for every client. Clients will lose their tools until you re-enable them.",
-          { value1: String(servers.length) },
+          { value1: String(enabledCount) },
         )}
         confirmLabel={translate("Disable all")}
         destructive
-        onConfirm={handleToggleAll}
+        onConfirm={() => handleToggleAll(false)}
       />
       <ConfirmDialog
         open={confirmEnableTeam !== null}
@@ -1635,12 +1725,54 @@ function ServerPosture({
 function ServerNextAction({
   authServers,
   errorServers,
+  lockedServers = [],
 }: {
   authServers: ServerEntry[];
   errorServers: ServerEntry[];
+  lockedServers?: ServerEntry[];
 }) {
   const { t } = useI18n();
   const authCount = authServers.length;
+  // Servers the window did not check because the keyring is locked: on their
+  // own they only need an unlock; alongside other problems they count with
+  // those that could not start.
+  const lockedOnly =
+    lockedServers.length > 0 && authCount === 0 && errorServers.length === 0;
+  if (lockedOnly) {
+    return (
+      <StatusCard
+        variant="warning"
+        icon={<KeyRound />}
+        title={t("Keyring locked")}
+        detail={t("Unlock your keyring, then choose Retry.")}
+      />
+    );
+  }
+  // Servers waiting for the keyring are named for that, as GTK's summary does,
+  // not counted with servers that couldn't start.
+  if (lockedServers.length > 0) {
+    const parts = [
+      authCount === 1
+        ? t("{value0} needs sign-in", { value0: authCount })
+        : authCount > 1
+          ? t("{value0} need sign-in", { value0: authCount })
+          : null,
+      errorServers.length > 0
+        ? t("{value0} failing", { value0: errorServers.length })
+        : null,
+      t("{value0} waiting for the keyring", { value0: lockedServers.length }),
+    ].filter((part): part is string => part !== null);
+    return (
+      <StatusCard
+        variant={errorServers.length > 0 ? "danger" : "warning"}
+        icon={<TriangleAlert />}
+        title={t("{value1} servers need a quick check", {
+          value1: authCount + errorServers.length + lockedServers.length,
+        })}
+        detail={parts.join(" · ")}
+      />
+    );
+  }
   const errorCount = errorServers.length;
   const title =
     authCount === 1 && errorCount === 0
@@ -1689,7 +1821,7 @@ function ServersEmptyState({
   return (
     <SharedEmptyState
       icon={<ServerOff />}
-      title={t("No servers in Toolport yet")}
+      title={t("No servers yet")}
       description={
         importable > 0
           ? importable === 1
@@ -1701,7 +1833,7 @@ function ServersEmptyState({
                 "Found {value1} servers in your installed clients. Import them to get started.",
                 { value1: importable },
               )
-          : t("Browse the catalog to add one, or import servers from a client.")
+          : t("Connect a local command or a remote endpoint once; every client gets it.")
       }
       action={
         <>

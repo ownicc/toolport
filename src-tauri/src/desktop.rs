@@ -34,7 +34,7 @@ use crate::remote;
 use crate::savings;
 use crate::searchtrace;
 use crate::secrets;
-use crate::server_runtime::{probe_one, probe_one_bounded, ProbeResult};
+use crate::server_runtime::{probe_one, ProbeResult};
 use crate::teams;
 use crate::vendors;
 
@@ -140,6 +140,18 @@ fn clear_update_http_bridge_intent_at(path: &std::path::Path) -> Result<(), Stri
     }
 }
 
+/// Test a saved server, as the GTK row menu does: reload its saved definition
+/// and give up after the probe timeout, so a stalled credential provider ends
+/// the test instead of leaving it spinning.
+#[tauri::command]
+async fn probe_registered(server_id: String) -> Result<ProbeResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::server_runtime::probe_registered(&server_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Connect to a possibly-unsaved server entry and report whether it came up and
 /// how many tools it exposes. Backs the "Test connection" button in the add/edit
 /// dialog, so the user learns a server is broken before saving it. Never
@@ -157,7 +169,7 @@ async fn test_server(entry: ServerEntry) -> Result<ProbeResult, String> {
 async fn detect_clients(
     state: State<'_, RegistryState>,
     inspect_configs: Option<bool>,
-) -> Result<Vec<clients::DetectedClient>, String> {
+) -> Result<Vec<serde_json::Value>, String> {
     // Reads several config files and scans plugin dirs - off the UI thread.
     let mut list = tauri::async_runtime::spawn_blocking(move || {
         clients::detect_clients_with_inspection(inspect_configs.unwrap_or(true))
@@ -178,7 +190,59 @@ async fn detect_clients(
         .client_managed_entries
         .clone();
     clients::apply_entry_states(&mut list, &managed);
-    Ok(list)
+    let registry = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    // Import candidates and managed names come from the one identity rule both
+    // shells share, so the client list never matches servers by name.
+    tauri::async_runtime::spawn_blocking(move || {
+        list.iter()
+            .map(|client| detected_client_value(client, &registry))
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn detected_client_value(
+    client: &clients::DetectedClient,
+    registry: &Registry,
+) -> Result<serde_json::Value, String> {
+    let mut value = serde_json::to_value(client).map_err(|e| e.to_string())?;
+    let (candidates, keys): (Vec<_>, Vec<_>) = clients::importable_server_slots(client, registry)
+        .into_iter()
+        .map(|(_, server, key)| (server, key))
+        .unzip();
+    // Opaque ids, parallel to `importableServers`, that import review items carry too.
+    value["importableKeys"] = serde_json::json!(keys);
+    value["importableServers"] = serde_json::to_value(&candidates).map_err(|e| e.to_string())?;
+    value["managedServerNames"] =
+        serde_json::json!(clients::managed_server_names(client, registry));
+    // Servers only the keychain could match: listed for review, never imported blind.
+    let (unconfirmed, keys): (Vec<_>, Vec<_>) = clients::unconfirmed_server_slots(client, registry)
+        .into_iter()
+        .map(|(_, server, key)| (server, key))
+        .unzip();
+    value["unconfirmedKeys"] = serde_json::json!(keys);
+    value["unconfirmedServers"] = serde_json::to_value(&unconfirmed).map_err(|e| e.to_string())?;
+    Ok(value)
+}
+
+/// A token that changes when T3 Code's provider instances may have changed, so an open
+/// Clients page can scan again. `None` without T3 Code settings. One `stat`.
+#[tauri::command]
+fn t3_code_revision() -> Option<String> {
+    clients::t3_code_revision()
+}
+
+/// T3 Code instances Toolport cannot connect, for the T3 Code card. Parsed only when the
+/// settings file changed.
+#[tauri::command]
+async fn t3_code_other_instances() -> Result<Vec<clients::T3CodeOther>, String> {
+    tauri::async_runtime::spawn_blocking(clients::t3_code_other_instances)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -237,7 +301,7 @@ fn selected_servers_to_import(
     detected: &[clients::DetectedClient],
     existing: &Registry,
     selected: Option<&std::collections::HashSet<String>>,
-) -> Result<Vec<ServerEntry>, String> {
+) -> Result<Vec<(ServerEntry, String)>, String> {
     crate::registry_controller::selected_servers_to_import(detected, existing, selected)
 }
 
@@ -306,14 +370,15 @@ async fn add_snippet_servers(
 fn parse_server_snippet(text: String) -> Result<Vec<clients::ParsedSnippetServer>, String> {
     const MAX_SNIPPET_BYTES: usize = 256 * 1024;
     if text.len() > MAX_SNIPPET_BYTES {
-        return Err(format!(
-            "Snippet is {} KB; limit is {} KB. Paste a single server config, not an entire file.",
-            text.len() / 1024,
-            MAX_SNIPPET_BYTES / 1024,
+        return Err(trf(
+            "Snippet is {value0} KB; limit is {value1} KB. Paste a single server config, not an entire file.",
+            &[
+                ("value0", &format!("{}", text.len() / 1024)),
+                ("value1", &format!("{}", MAX_SNIPPET_BYTES / 1024)),
+            ],
         ));
     }
-    clients::parse_snippet(&text)
-        .map_err(|_| "Could not read the pasted config. Check its syntax and retry.".into())
+    clients::parse_snippet_for_user(&text).map_err(clients::SnippetError::message)
 }
 
 #[tauri::command]
@@ -325,6 +390,29 @@ fn add_server(state: State<RegistryState>, mut entry: ServerEntry) -> Result<Reg
         prewarm_launcher(saved);
     }
     Ok(reg)
+}
+
+/// Add a server from the Add server dialog in one step: the entry, its values
+/// and references, and its launch inputs' secrets are saved together or not at
+/// all. Nothing is saved on an error, so the dialog keeps what was typed.
+#[tauri::command]
+async fn add_server_with_rows(
+    state: State<'_, RegistryState>,
+    entry: ServerEntry,
+) -> Result<serde_json::Value, String> {
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        crate::registry_controller::add_server_from_dialog(entry)
+    })
+    .await
+    .map_err(|_| "Saving the server stopped".to_string())??;
+    let reg = reload_into_state(state.inner())?;
+    if let Some(saved) = reg.servers.iter().find(|s| s.id == outcome.id) {
+        prewarm_launcher(saved);
+    }
+    Ok(serde_json::json!({
+        "registry": reg,
+        "declaredWithoutValue": outcome.declared_without_value,
+    }))
 }
 
 /// Fire-and-forget spawn of a just-added download-then-run server (npx, uvx, ...)
@@ -345,6 +433,8 @@ fn prewarm_launcher(server: &ServerEntry) {
     }
     let server = server.clone();
     std::thread::spawn(move || {
+        // Same registration as every other launch, before the child starts.
+        crate::secret_refs::register_inline_secrets(&server);
         let Ok(resolved) = crate::launch_inputs::resolve_args_for_prewarm(&server) else {
             return;
         };
@@ -567,57 +657,76 @@ async fn install_gateway(
     .map_err(|e| format!("install task join failed: {e}"))?
 }
 
-/// Drop the managed shared-HTTP bearer for this client (registry row, then vault).
-///
-/// `delete_secret` already treats a missing vault entry as success (WS3-4), so
-/// Disconnect is not blocked when the bearer was never stored. A real vault or
-/// `http_clients` persist failure is returned so uninstall cannot report Ok
-/// while the token is still live (SBS-845).
-fn revoke_client_http_token(state: &RegistryState, client_id: &str) -> Result<(), String> {
-    revoke_client_http_token_with(state, client_id, crate::secrets::delete_secret)
+#[tauri::command]
+async fn list_client_recoveries() -> Result<Vec<clients::recovery::ClientRecovery>, String> {
+    tauri::async_runtime::spawn_blocking(clients::recovery::list)
+        .await
+        .map_err(|_| clients::recovery::worker_error())?
 }
-
-/// [`revoke_client_http_token`] with the vault delete injected.
-///
-/// Split out because the real vault is not reachable on every platform the
-/// tests run on: headless Linux CI has no Secret Service, and the macOS
-/// data-protection keychain needs a signed build (the same reason
-/// `secrets::tests::set_get_delete_round_trip` is `ignore`d there). A test that
-/// called it would assert on the machine rather than on this function, so tests
-/// pass a stub while production passes [`crate::secrets::delete_secret`].
-fn revoke_client_http_token_with(
-    state: &RegistryState,
-    client_id: &str,
-    delete_vaulted_token: impl FnOnce(&str, &str) -> Result<(), String>,
-) -> Result<(), String> {
-    const VAULT_SERVER: &str = "__toolport_http_clients__";
-    let http_id = format!("client:{client_id}");
-    // Drop the registry row FIRST. `resolve_http_caller` authenticates a bearer
-    // through `http_client_for_token`, which matches the row's `token_sha256`;
-    // the vault copy is never consulted on the auth path. So the row is the
-    // thing that grants access, and removing it revokes the bearer even if the
-    // vault step below then fails. The reverse order fails open: a vault error
-    // would return early with the row still registered and the bearer still
-    // authenticating. An orphaned vault entry is a hygiene problem; a live
-    // bearer after a failed revoke is a security one.
-    write_registry(state, |reg| {
-        reg.http_clients.retain(|c| c.id != http_id);
-        Ok(())
-    })?;
-    // A failed persist above means nothing was revoked, so the vault copy is
-    // deliberately left alone: the bearer it belongs to is still registered.
-    // Past this point the bearer is already dead, but a vault failure is still
-    // returned, because uninstall must not report a clean Disconnect while a
-    // copy of the token is left on the machine.
-    delete_vaulted_token(VAULT_SERVER, client_id)?;
-    Ok(())
+#[tauri::command]
+async fn retry_client_recovery(id: String) -> Result<clients::recovery::RecoveryAttempt, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        clients::recovery::retry_with_report(&id)
+            .map_err(|error| clients::recovery::safe_action_error(&id, &error))
+    })
+    .await
+    .map_err(|_| clients::recovery::worker_error())?
+}
+#[tauri::command]
+async fn prepare_client_recovery_discard(
+    id: String,
+) -> Result<clients::recovery::DiscardConfirmation, String> {
+    let worker_id = id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        clients::recovery::prepare_discard(&id)
+            .map_err(|error| clients::recovery::safe_discard_error(&id, &error))
+    })
+    .await
+    .map_err(|_| clients::recovery::discard_worker_error(&worker_id))?
+}
+#[tauri::command]
+async fn discard_client_recovery(id: String, manifest: String) -> Result<String, String> {
+    let worker_id = id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        clients::recovery::discard_confirmed(&id, &manifest)
+            .map_err(|error| clients::recovery::safe_discard_error(&id, &error))
+    })
+    .await
+    .map_err(|_| clients::recovery::discard_worker_error(&worker_id))?
+}
+#[tauri::command]
+async fn refresh_client_recovery_notice(
+    previous_id: String,
+    client_id: String,
+    backup_path: String,
+) -> Result<clients::recovery::RecoveryListingUpdate, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        clients::recovery::refresh_notice(&previous_id, &client_id, &backup_path)
+    })
+    .await
+    .map_err(|_| clients::recovery::worker_error())?
+}
+#[tauri::command]
+async fn refresh_client_recovery_status() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(clients::recovery::refresh_status)
+        .await
+        .map_err(|_| clients::recovery::worker_error())?
+}
+#[tauri::command]
+async fn dismiss_client_recovery(id: String, dismissed: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        clients::recovery::dismiss(&id, dismissed)
+            .map_err(|error| clients::recovery::safe_action_error(&id, &error))
+    })
+    .await
+    .map_err(|_| clients::recovery::worker_error())?
 }
 
 /// Remove the Toolport gateway from a client.
 ///
 /// Runs on the blocking pool for the same reason as [`install_gateway`]
-/// (SBS-818): `revoke_client_http_token` deletes the vaulted bearer, which is a
-/// synchronous Secret Service round trip on Linux.
+/// (SBS-818): revoking a Shared HTTP bearer deletes it from the vault, which is
+/// a synchronous Secret Service round trip on Linux.
 #[tauri::command]
 async fn uninstall_gateway(
     app: AppHandle,
@@ -625,21 +734,38 @@ async fn uninstall_gateway(
 ) -> Result<clients::WriteOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<RegistryState>();
-        let outcome = clients::uninstall_gateway(&client_id)?;
-        // Config entry is gone; also revoke the bridge bearer so a leftover backup or
-        // stale token cannot keep authenticating (WS3-4). A vault or registry
-        // failure must fail Disconnect — the bearer is still live (SBS-845).
-        revoke_client_http_token(state.inner(), &client_id)?;
-        write_registry(state.inner(), |reg| {
-            reg.set_client_scope(&client_id, None);
-            reg.clear_client_managed_entry(&client_id);
-            Ok(())
-        })?;
-        clients::finish_uninstall(&client_id, &outcome)?;
-        Ok(outcome)
+        disconnect_client_in_app(state.inner(), &client_id, crate::secrets::delete_secret)
     })
     .await
     .map_err(|e| format!("uninstall task join failed: {e}"))?
+}
+
+/// The body of [`uninstall_gateway`]: the GTK shell's Disconnect
+/// ([`crate::registry_controller::disconnect_client_asking_to_unlock`]) with this app's registry
+/// writer, so the in-memory registry follows the write and a failed write rolls
+/// the client config back. The vault delete is injected for tests.
+fn disconnect_client_in_app(
+    state: &RegistryState,
+    client_id: &str,
+    delete_vaulted_token: impl FnOnce(&str, &str) -> Result<(), String>,
+) -> Result<clients::WriteOutcome, String> {
+    crate::registry_controller::disconnect_client_with_unlock(
+        client_id,
+        |apply| {
+            let (registry, ()) = write_registry(state, |registry| {
+                apply(registry);
+                Ok(())
+            })?;
+            Ok(registry)
+        },
+        || {
+            delete_vaulted_token(
+                crate::registry_controller::CLIENT_HTTP_VAULT_SERVER,
+                client_id,
+            )
+        },
+    )
+    .map(|result| result.outcome)
 }
 
 #[tauri::command]
@@ -738,12 +864,36 @@ struct MigrateResult {
 #[tauri::command]
 async fn preview_client_setup(
     client_id: String,
+    quiet: Option<bool>,
 ) -> Result<crate::registry_controller::ClientSetupReview, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::preview_client_setup(&client_id)
+        // `quiet`: a Connect all step after the keyring stayed locked (see `connect_step`).
+        crate::registry_controller::preview_step(&client_id, quiet.unwrap_or(false))
     })
     .await
     .map_err(|_| "Client review stopped".to_string())?
+}
+
+/// Whether a failed Connect all step left the keyring locked, so the rest of the run is
+/// quiet. Never asks to unlock.
+#[tauri::command]
+async fn keyring_locked_after(error: String) -> bool {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::registry_controller::keyring_locked_after(&error)
+    })
+    .await
+    .unwrap_or(true)
+}
+
+/// The client settings a connect or reset adds to Toolport's entry, as the TOML
+/// lines the confirmation lists. Empty when it adds none.
+#[tauri::command]
+async fn preview_gateway_settings(client_id: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        clients::codex_gateway_settings_for_connect(&client_id)
+    })
+    .await
+    .map_err(|_| "Client review stopped".to_string())
 }
 
 /// Migrate a client to Toolport: import its directly-configured servers into the
@@ -768,17 +918,20 @@ async fn migrate_client(
     credential_inputs: Option<
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     >,
+    quiet: Option<bool>,
 ) -> Result<MigrateResult, String> {
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        crate::registry_controller::migrate_client_reviewed_inputs(
-            &client_id,
-            profile.as_deref(),
-            force.unwrap_or(false),
-            &selected,
-            &revision,
-            &secret_choices.unwrap_or_default(),
-            &credential_inputs.unwrap_or_default(),
-        )
+        crate::registry_controller::connect_step(quiet.unwrap_or(false), || {
+            crate::registry_controller::migrate_client_reviewed_inputs(
+                &client_id,
+                profile.as_deref(),
+                force.unwrap_or(false),
+                &selected,
+                &revision,
+                &secret_choices.unwrap_or_default(),
+                &credential_inputs.unwrap_or_default(),
+            )
+        })
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -1183,6 +1336,15 @@ async fn get_security_events(limit: usize) -> Result<Vec<serde_json::Value>, Str
     .map_err(|e| format!("security events task join failed: {e}"))?
 }
 
+/// Whether Activity asks for tool-change reviews and whether Safety Off holds
+/// nothing (`integrity::activity_safety`), the same answer GTK reads.
+#[tauri::command]
+async fn activity_safety() -> Result<integrity::ActivitySafety, String> {
+    tauri::async_runtime::spawn_blocking(integrity::activity_safety)
+        .await
+        .map_err(|e| format!("activity safety task join failed: {e}"))
+}
+
 /// Most recent unresolved baseline warning for the current profile and policy.
 #[tauri::command]
 async fn get_baseline_notice() -> Result<Option<serde_json::Value>, String> {
@@ -1242,11 +1404,17 @@ fn last_lines(text: &str, n: usize) -> String {
 /// UI resolves each row independently instead of waiting for the slowest - a cold
 /// `npx` install used to leave the whole grid "checking" for 30-60s. Still returns
 /// the full batch for callers that want it. Issue #252.
+///
+/// The window's own checks (on load, after a change) never ask to unlock the
+/// keyring: a server that keeps values in a locked one reports it locked.
+/// `interactive` is a Refresh or Retry the user chose, which may ask.
 #[tauri::command]
 async fn probe_servers(
     app: tauri::AppHandle,
     state: State<'_, RegistryState>,
+    interactive: Option<bool>,
 ) -> Result<Vec<ProbeResult>, String> {
+    let interactive = interactive.unwrap_or(false);
     // Snapshot which servers to probe, then drop the lock before any I/O.
     let servers = {
         let reg = state
@@ -1257,21 +1425,79 @@ async fn probe_servers(
     // One worker thread per server. Each emits its result as soon as it's ready
     // (the UI listens for `server-probed`), then contributes to the returned batch.
     tauri::async_runtime::spawn_blocking(move || {
+        let check = crate::server_runtime::KeyringCheck::default();
         let handles: Vec<_> = servers
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|s| {
                 let app = app.clone();
+                let check = check.clone();
                 std::thread::spawn(move || {
-                    let result = probe_one_bounded(&s);
+                    let result = if interactive {
+                        crate::server_runtime::probe_one_bounded(&s)
+                    } else {
+                        crate::server_runtime::probe_health_checked(&s, &check)
+                    };
                     let _ = app.emit("server-probed", &result);
                     result
                 })
             })
             .collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        let results: Vec<ProbeResult> = handles.into_iter().filter_map(|h| h.join().ok()).collect();
+        recheck_locked_servers(&app, &servers, &results);
+        results
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Servers whose last check found the keyring locked, for
+/// [`crate::server_runtime::recheck_locked_once_open`].
+static LOCKED_SERVERS: Mutex<crate::server_runtime::LockedRecheck> =
+    Mutex::new(crate::server_runtime::LockedRecheck::new());
+
+/// A row shows "Keyring locked" until something checks it again, and the
+/// keyring may only have been busy: check those rows again (never asking) on
+/// the first poll that finds it open.
+fn recheck_locked_servers(
+    app: &tauri::AppHandle,
+    servers: &[crate::registry::ServerEntry],
+    results: &[ProbeResult],
+) {
+    let locked = servers
+        .iter()
+        .filter(|server| {
+            results
+                .iter()
+                .any(|result| result.server_id == server.id && result.keyring_locked)
+        })
+        .cloned()
+        .collect();
+    let start = LOCKED_SERVERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace(locked);
+    if !start {
+        return;
+    }
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("toolport-locked-recheck".into())
+        .spawn(move || {
+            crate::server_runtime::recheck_locked_once_open(
+                &LOCKED_SERVERS,
+                crate::http_bridge::KEYRING_POLL,
+                |result| {
+                    let _ = app.emit("server-probed", result);
+                },
+            )
+        });
+    if spawned.is_err() {
+        LOCKED_SERVERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stopped();
+    }
 }
 
 /// List the tools one server exposes (raw MCP tool objects: name, description,
@@ -1292,16 +1518,59 @@ async fn list_server_tools(
 /// the audit log, just like a call routed through the gateway.
 #[tauri::command]
 async fn call_tool(
+    app: tauri::AppHandle,
     _state: State<'_, RegistryState>,
     server_id: String,
     tool: String,
     arguments: serde_json::Value,
+    run_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::playground::call_tool(&server_id, &tool, arguments)
+    let run = crate::playground::ToolRun::new();
+    if let Some(id) = &run_id {
+        tool_runs().insert(id.clone(), run.clone());
+    }
+    let result = tauri::async_runtime::spawn_blocking({
+        let run = run.clone();
+        let run_id = run_id.clone();
+        move || {
+            crate::playground::call_tool_run(&server_id, &tool, arguments, &run, move |phase| {
+                let Some(run_id) = &run_id else { return };
+                let phase = match phase {
+                    crate::playground::RunPhase::Starting => "starting",
+                    crate::playground::RunPhase::Started => "started",
+                };
+                let _ = app.emit(
+                    "tool-run-progress",
+                    serde_json::json!({"runId": run_id, "phase": phase}),
+                );
+            })
+        }
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string());
+    if let Some(id) = &run_id {
+        tool_runs().remove(id);
+    }
+    result?
+}
+
+/// Runs the Tools tab can still cancel, by the id the frontend gave each one.
+fn tool_runs(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<String, crate::playground::ToolRun>> {
+    static RUNS: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, crate::playground::ToolRun>>,
+    > = std::sync::OnceLock::new();
+    RUNS.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Cancel a Tools tab Run, including one still waiting for its server to start.
+#[tauri::command]
+fn cancel_tool_call(run_id: String) {
+    if let Some(run) = tool_runs().remove(&run_id) {
+        run.cancel();
+    }
 }
 
 /// List the resources a server advertises (uri, name, mimeType). Connects on
@@ -1852,10 +2121,10 @@ fn write_registry<T>(
     Ok((reg, out))
 }
 
-/// Process-global test hook for SBS-845. Tests that set it must hold
-/// [`REVOKE_HOOK_LOCK`] so a leftover flag cannot leak into another case.
-/// The vault half of the revoke needs no hook: it is injected instead, via
-/// [`revoke_client_http_token_with`].
+/// Process-global test hook that fails the next [`write_registry`]. Tests that
+/// set it must hold [`REVOKE_HOOK_LOCK`] so a leftover flag cannot leak into
+/// another case. The vault delete needs no hook: it is injected instead, via
+/// [`disconnect_client_in_app`].
 #[cfg(test)]
 static FAIL_NEXT_REGISTRY_WRITE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -2131,38 +2400,41 @@ fn start_team_lifecycle(app: &tauri::AppHandle) {
                     failures = 0;
                     3
                 }
-                Ok(true) => {
-                    let result = teams::sync_wait(25);
-                    let _ = handle.emit("team-sync-status", crate::team_sync_status::current());
-                    match result {
-                        Ok(result) => {
-                            failures = 0;
-                            if stop.load(std::sync::atomic::Ordering::Acquire) {
-                                break;
+                Ok(true) => match teams::background_sync(25) {
+                    // The keyring is locked: no prompt, no error, the next tick tries again.
+                    None => 5,
+                    Some(result) => {
+                        let _ = handle.emit("team-sync-status", crate::team_sync_status::current());
+                        match result {
+                            Ok(result) => {
+                                failures = 0;
+                                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                                    break;
+                                }
+                                let state = handle.state::<RegistryState>();
+                                match finish_sync(&handle, state.inner(), result) {
+                                    Ok(fresh) => {
+                                        let _ = handle.emit("team-sync-registry", &fresh);
+                                    }
+                                    Err(error) => {
+                                        let _ = handle.emit("team-sync-error", &error);
+                                    }
+                                }
+                                teams::retry_delay_seconds(0)
                             }
-                            let state = handle.state::<RegistryState>();
-                            match finish_sync(&handle, state.inner(), result) {
-                                Ok(fresh) => {
+                            Err(error) => {
+                                failures = failures.saturating_add(1);
+                                let _ = handle.emit("team-sync-error", &error);
+                                if let Ok(fresh) = registry::load() {
                                     let _ = handle.emit("team-sync-registry", &fresh);
                                 }
-                                Err(error) => {
-                                    let _ = handle.emit("team-sync-error", &error);
-                                }
+                                registry::load()
+                                    .map(|r| teams::sync_retry_seconds(&r, failures))
+                                    .unwrap_or_else(|_| teams::retry_delay_seconds(failures))
                             }
-                            teams::retry_delay_seconds(0)
-                        }
-                        Err(error) => {
-                            failures = failures.saturating_add(1);
-                            let _ = handle.emit("team-sync-error", &error);
-                            if let Ok(fresh) = registry::load() {
-                                let _ = handle.emit("team-sync-registry", &fresh);
-                            }
-                            registry::load()
-                                .map(|r| teams::sync_retry_seconds(&r, failures))
-                                .unwrap_or_else(|_| teams::retry_delay_seconds(failures))
                         }
                     }
-                }
+                },
                 Err(error) => {
                     failures = failures.saturating_add(1);
                     eprintln!("Toolport: Teams registry unavailable: {error}");
@@ -2372,6 +2644,26 @@ fn personal_sync_portable(
     enabled: bool,
 ) -> Result<Registry, String> {
     crate::personal_sync::set_portable(&server_id, &kind, &key, enabled)?;
+    reload_into_state(state.inner())
+}
+#[derive(serde::Deserialize)]
+struct PortableMark {
+    kind: String,
+    key: String,
+    enabled: bool,
+}
+/// All of a server's portable marks in one registry write, so a failure saves none.
+#[tauri::command]
+fn personal_sync_portable_many(
+    state: State<RegistryState>,
+    server_id: String,
+    marks: Vec<PortableMark>,
+) -> Result<Registry, String> {
+    let marks: Vec<_> = marks
+        .into_iter()
+        .map(|m| (m.kind, m.key, m.enabled))
+        .collect();
+    crate::personal_sync::set_portable_many(&server_id, &marks)?;
     reload_into_state(state.inner())
 }
 #[tauri::command]
@@ -2840,11 +3132,18 @@ fn deliver_shared_import(handle: &tauri::AppHandle, id: String) {
     let _ = handle.emit("import-shared", id);
 }
 
-/// Import a shared setup. Adds servers not already present (by name); secret
-/// values are never included, so each new server is left for the user to vault.
+/// Import a shared setup. Adds servers not already present (by name), or only
+/// the reviewed names in `selected`; secret values are never included, so each
+/// new server is left for the user to vault.
 #[tauri::command]
-fn import_config(state: State<RegistryState>, json: String) -> Result<Registry, String> {
-    let (reg, _) = write_registry(state.inner(), |reg| apply_import(reg, &json))?;
+fn import_config(
+    state: State<RegistryState>,
+    json: String,
+    selected: Option<Vec<String>>,
+) -> Result<Registry, String> {
+    let (reg, _) = write_registry(state.inner(), |reg| {
+        apply_import(reg, &json, selected.as_deref())
+    })?;
     Ok(reg)
 }
 
@@ -2882,6 +3181,12 @@ struct ImportItem {
     reference_review: Vec<String>,
     credentials: Vec<crate::registry_controller::CredentialReview>,
     unsupported: Option<String>,
+    /// The client's own name when `name`, the name the import saves, differs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_name: Option<String>,
+    /// Opaque id matching `importableKeys` from `detect_clients`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connection: Option<String>,
 }
 
 /// Show exactly what the bulk client import would add without changing the
@@ -2910,6 +3215,8 @@ async fn preview_import_servers(
             is_new: true,
             credentials: server.credentials,
             unsupported: server.unsupported,
+            source_name: server.source_name,
+            connection: Some(server.connection),
         })
         .collect())
 }
@@ -2921,8 +3228,8 @@ fn preview_import(state: State<RegistryState>, json: String) -> Result<Vec<Impor
     struct Doc {
         servers: Vec<ServerEntry>,
     }
-    let doc: Doc = serde_json::from_str(&json)
-        .map_err(|e| format!("That doesn't look like a Toolport setup: {e}"))?;
+    let doc: Doc =
+        serde_json::from_str(&json).map_err(|e| crate::sharing_controller::not_a_setup(&e))?;
     let reg = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2945,6 +3252,8 @@ fn preview_import(state: State<RegistryState>, json: String) -> Result<Vec<Impor
                 is_new,
                 credentials: Vec::new(),
                 unsupported: None,
+                source_name: None,
+                connection: None,
             }
         })
         .collect())
@@ -2963,9 +3272,10 @@ fn build_export(
 }
 
 /// Merge a shared setup into the registry: add servers not already present (by
-/// name, case-insensitive), stripping any secret values. Pure (no Tauri state).
-fn apply_import(reg: &mut Registry, json: &str) -> Result<(), String> {
-    crate::sharing_controller::apply_import(reg, json)?;
+/// name, case-insensitive), or only the `selected` names, stripping any secret
+/// values. Pure (no Tauri state).
+fn apply_import(reg: &mut Registry, json: &str, selected: Option<&[String]>) -> Result<(), String> {
+    crate::sharing_controller::apply_import_selected(reg, json, selected)?;
     Ok(())
 }
 
@@ -3575,10 +3885,40 @@ async fn start_http_bridge(app: AppHandle, port: Option<u16>) -> Result<HttpBrid
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<HttpBridgeState>();
         let registry = app.state::<RegistryState>();
+        if let Some(held) = hold_http_bridge_turned_on(state.inner(), registry.inner(), port)? {
+            // Starts on the first unlock, like one left on; Retry may ask.
+            restore_http_bridge_on_start(app.clone());
+            return Ok(held);
+        }
         start_persisted_http_bridge(state.inner(), registry.inner(), port)
     })
     .await
     .map_err(|error| format!("HTTP endpoint task failed: {error}"))?
+}
+
+/// Turning the endpoint on while the keyring is locked saves the setting and
+/// waits, like an endpoint left on at start: it shows "Keyring locked", and
+/// only Retry may ask to unlock. `None`: the keyring would not ask; start it.
+fn hold_http_bridge_turned_on(
+    state: &HttpBridgeState,
+    registry: &RegistryState,
+    port: Option<u16>,
+) -> Result<Option<HttpBridgeStatus>, String> {
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if crate::http_bridge::status(state).running || !secrets::store_would_prompt() {
+        return Ok(None);
+    }
+    write_registry(registry, |reg| {
+        reg.http_bridge_enabled = true;
+        if port.is_some() {
+            reg.http_bridge_port = port;
+        }
+        Ok(())
+    })?;
+    crate::http_bridge::mark_waiting(state, true);
+    Ok(Some(crate::http_bridge::status(state)))
 }
 
 /// Start the endpoint and durably remember the user's intent. Shared HTTP client
@@ -3639,7 +3979,20 @@ fn start_http_bridge_with_token_at(
     port: Option<u16>,
     token: Option<String>,
 ) -> Result<HttpBridgeStatus, String> {
+    #[cfg(test)]
+    if FAKE_BRIDGE_START.with(std::cell::Cell::get) {
+        return Ok(HttpBridgeStatus::new(
+            port,
+            Some(token.unwrap_or_else(|| "minted-test-token".into())),
+        ));
+    }
     crate::http_bridge::start_with_token_at(state, port, token)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A start that "comes up" with the token it was given, or a new one.
+    static FAKE_BRIDGE_START: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn stop_http_bridge_with(
@@ -3653,37 +4006,135 @@ fn stop_http_bridge_with(
 #[tauri::command]
 async fn stop_http_bridge(app: AppHandle) -> Result<HttpBridgeStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let _lifecycle = HTTP_BRIDGE_LIFECYCLE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let registry = app.state::<RegistryState>();
-        clear_update_http_bridge_intent()?;
-        write_registry(registry.inner(), |reg| {
-            reg.http_bridge_enabled = false;
-            Ok(())
-        })?;
         let state = app.state::<HttpBridgeState>();
-        let mut bridge = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        stop_http_bridge_with(&mut bridge, std::process::Child::kill)
+        stop_persisted_http_bridge(state.inner(), registry.inner())
     })
     .await
     .map_err(|error| format!("HTTP endpoint task failed: {error}"))?
 }
 
+/// Turn the endpoint off and forget the user's intent. One waiting for the
+/// keyring is on too: this clears its saved setting and ends the wait, without
+/// reading the keyring, so an unlock never starts it.
+fn stop_persisted_http_bridge(
+    state: &HttpBridgeState,
+    registry: &RegistryState,
+) -> Result<HttpBridgeStatus, String> {
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    clear_update_http_bridge_intent()?;
+    write_registry(registry, |reg| {
+        reg.http_bridge_enabled = false;
+        Ok(())
+    })?;
+    let mut bridge = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    stop_http_bridge_with(&mut bridge, std::process::Child::kill)
+}
+
+/// At start: bring back an endpoint the user left on. Never asks to unlock
+/// the keyring: while it would, the endpoint shows as locked (`Ok(false)`),
+/// and [`restore_http_bridge_on_start`] starts it on the first unlock.
+#[cfg(test)]
 fn restore_persisted_http_bridge(state: &HttpBridgeState) -> Result<bool, String> {
+    match restore_http_bridge_once(state) {
+        crate::http_bridge::Restore::Running => Ok(true),
+        crate::http_bridge::Restore::Off | crate::http_bridge::Restore::Held => Ok(false),
+        crate::http_bridge::Restore::Failed(error) => Err(error),
+    }
+}
+
+/// One restore attempt at start: no keyring call in it may ask to unlock.
+fn restore_http_bridge_once(state: &HttpBridgeState) -> crate::http_bridge::Restore {
+    use crate::http_bridge::Restore;
+    match secrets::without_prompts(|| restore_saved_http_bridge(state, false)) {
+        Ok(true) => Restore::Running,
+        Ok(false) if crate::http_bridge::waiting_for_keyring(state) => Restore::Held,
+        Ok(false) => Restore::Off,
+        Err(error) => Restore::Failed(error),
+    }
+}
+
+/// `may_prompt` only for the user's Retry.
+fn restore_saved_http_bridge(state: &HttpBridgeState, may_prompt: bool) -> Result<bool, String> {
     let _lifecycle = HTTP_BRIDGE_LIFECYCLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let registry = registry::load()?;
     if !registry.http_bridge_enabled {
+        // Turned off between an attempt and its wait: no wait left to show.
+        crate::http_bridge::mark_waiting(state, false);
         return Ok(false);
     }
-    let token = secrets::get_secret_result(HTTP_BRIDGE_VAULT_SERVER, HTTP_BRIDGE_VAULT_KEY)?
-        .ok_or("The HTTP endpoint is enabled, but its saved bearer token is missing")?;
-    start_http_bridge_with_token_at(state, registry.http_bridge_port, Some(token))?;
+    if crate::http_bridge::status(state).running {
+        return Ok(true);
+    }
+    if !may_prompt && crate::http_bridge::hold_for_keyring(state) {
+        return Ok(false);
+    }
+    let saved = secrets::get_secret_result(HTTP_BRIDGE_VAULT_SERVER, HTTP_BRIDGE_VAULT_KEY)?;
+    let minted = saved.is_none();
+    let status = start_http_bridge_with_token_at(state, registry.http_bridge_port, saved)?;
+    if minted {
+        // Turned on while locked before any token was saved: save the new
+        // one, as a first start does.
+        let saved = status
+            .token
+            .as_deref()
+            .ok_or("The HTTP endpoint started without a bearer token")
+            .map_err(str::to_string)
+            .and_then(|token| {
+                secrets::set_secret(HTTP_BRIDGE_VAULT_SERVER, HTTP_BRIDGE_VAULT_KEY, token)
+            });
+        if let Err(error) = saved {
+            let mut bridge = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = stop_http_bridge_with(&mut bridge, std::process::Child::kill);
+            return Err(format!("Could not save the HTTP endpoint token: {error}"));
+        }
+    }
     Ok(true)
+}
+
+/// Restore the saved endpoint at start: if the keyring is locked, again as
+/// soon as it is unlocked; if it fails, again a few times while it shows the
+/// wait.
+fn restore_http_bridge_on_start(app: AppHandle) {
+    fn state_of(app: &AppHandle) -> &HttpBridgeState {
+        app.state::<HttpBridgeState>().inner()
+    }
+    fn attempt(app: &AppHandle) -> crate::http_bridge::Restore {
+        restore_http_bridge_once(state_of(app))
+    }
+    match crate::http_bridge::restore_with_retries(app, state_of, attempt, 1) {
+        crate::http_bridge::Restore::Running => {
+            eprintln!("toolport: restored the saved HTTP endpoint")
+        }
+        crate::http_bridge::Restore::Held => {
+            eprintln!("toolport: the saved HTTP endpoint waits for the keyring to unlock")
+        }
+        crate::http_bridge::Restore::Off => {}
+        crate::http_bridge::Restore::Failed(error) => {
+            eprintln!("toolport: could not restore the saved HTTP endpoint yet: {error}")
+        }
+    }
+}
+
+/// The user's Retry on an endpoint that waited for the keyring. It may ask to
+/// unlock it.
+#[tauri::command]
+async fn retry_http_bridge(app: AppHandle) -> Result<HttpBridgeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<HttpBridgeState>();
+        restore_saved_http_bridge(state.inner(), true)?;
+        Ok(crate::http_bridge::status(state.inner()))
+    })
+    .await
+    .map_err(|error| format!("HTTP endpoint task failed: {error}"))?
 }
 
 /// Make an update-restored endpoint durable before its one-shot recovery marker
@@ -3714,6 +4165,14 @@ fn resume_http_bridge_after_update(
         return Ok(false);
     };
     ensure_http_bridge_at(state, intent.port, Some(intent.token.clone()))?;
+    if crate::secrets::write_would_ask() {
+        // Saving the token would ask to unlock the keyring. The endpoint runs
+        // from the update's marker, which stays until a start can save it.
+        eprintln!(
+            "toolport: restored the HTTP endpoint after the update; it is saved once the keyring is unlocked"
+        );
+        return Ok(true);
+    }
     if let Err(error) = persist_restored_http_bridge(registry, intent.port, &intent.token) {
         eprintln!(
             "toolport: restored the HTTP endpoint, but could not save its persistent state: {error}"
@@ -3729,13 +4188,17 @@ fn resume_http_bridge_after_update(
 }
 
 /// Report whether the HTTP bridge is running, reaping it if it has exited.
+/// Off the main thread: a start holds the bridge's state while it waits for
+/// the endpoint to come up.
 #[tauri::command]
-fn http_bridge_status(state: State<HttpBridgeState>) -> Result<HttpBridgeStatus, String> {
-    let mut bridge = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    http_bridge_alive(&mut bridge);
-    Ok(HttpBridgeStatus::new(bridge.port, bridge.token.clone()))
+async fn http_bridge_status(app: AppHandle) -> Result<HttpBridgeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(crate::http_bridge::status(
+            app.state::<HttpBridgeState>().inner(),
+        ))
+    })
+    .await
+    .map_err(|error| format!("HTTP endpoint task failed: {error}"))?
 }
 
 /// macOS only: show the Dock icon when a window is visible, and drop it (Accessory
@@ -4313,6 +4776,15 @@ fn open_external(url: String) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before anything can resolve a secret: the shell's stderr (a terminal, the
+    // journal, or a console) and its children's are redacted from here on.
+    crate::daemon_log::install_stderr_redaction();
+    // The relay can only remove values it knows: learn the inline ones now,
+    // off the startup path. Vault values are learned when first read for use,
+    // so a hidden start never raises a keyring prompt.
+    let _ = std::thread::Builder::new()
+        .name("toolport-secret-preload".into())
+        .spawn(crate::secret_refs::preload_inline_secrets);
     let _ = crate::i18n::initialize();
     // `generate_context!()` must expand exactly once in this crate: on macOS dev
     // builds each expansion embeds a `_EMBED_INFO_PLIST` byte section, and two
@@ -4419,6 +4891,15 @@ pub fn run() {
         .manage(RestartAdvice::default())
         .invoke_handler(crate::activity_revision_ipc::handler(tauri::generate_handler![
             detect_clients,
+            list_client_recoveries,
+            retry_client_recovery,
+            prepare_client_recovery_discard,
+            discard_client_recovery,
+            refresh_client_recovery_notice,
+            refresh_client_recovery_status,
+            dismiss_client_recovery,
+            t3_code_revision,
+            t3_code_other_instances,
             client_location_types,
             add_client_location,
             remove_client_location,
@@ -4432,6 +4913,7 @@ pub fn run() {
             parse_server_snippet,
             add_snippet_servers,
             add_server,
+            add_server_with_rows,
             update_server,
             remove_server,
             set_server_enabled,
@@ -4451,6 +4933,8 @@ pub fn run() {
             remove_toolport_data,
             migrate_client,
             preview_client_setup,
+            keyring_locked_after,
+            preview_gateway_settings,
             set_secret,
             set_secret_reference,
             test_secret_reference,
@@ -4468,11 +4952,13 @@ pub fn run() {
             get_client_sessions,
             audit_stats,
             get_security_events,
+            activity_safety,
             get_baseline_notice,
             savings_summary,
             gather_diagnostics,
             probe_servers,
             test_server,
+            probe_registered,
             list_server_tools,
             list_server_resources,
             list_server_prompts,
@@ -4481,6 +4967,7 @@ pub fn run() {
             add_http_client,
             remove_http_client,
             call_tool,
+            cancel_tool_call,
             set_tool_enabled,
             set_tool_pinned,
             set_safety_level,
@@ -4506,6 +4993,7 @@ pub fn run() {
             set_client_discovery,
             personal_sync_local_only,
             personal_sync_portable,
+            personal_sync_portable_many,
             reconnect_sync,
             personal_sync_resolve_conflict,
             personal_sync_finish_selection,
@@ -4559,6 +5047,7 @@ pub fn run() {
             start_http_bridge,
             stop_http_bridge,
             http_bridge_status,
+            retry_http_bridge,
             stop_spawned_gateways,
             recover_update_gateways,
             stop_stale_gateways,
@@ -4678,21 +5167,14 @@ pub fn run() {
                         "toolport: could not restore the HTTP endpoint after the in-app update: {error}"
                     ),
                 }
-                match restore_persisted_http_bridge(
-                    migrate_handle.state::<HttpBridgeState>().inner(),
-                ) {
-                    Ok(true) => eprintln!("toolport: restored the saved HTTP endpoint"),
-                    Ok(false) => {}
-                    Err(error) => eprintln!(
-                        "toolport: could not restore the saved HTTP endpoint: {error}"
-                    ),
-                }
+                restore_http_bridge_on_start(migrate_handle.clone());
                 // Ownership map from disk (this launch thread has no RegistryState handle).
                 if !isolated_data_dir {
                     let managed_snapshot = registry::load()
                         .map(|r| r.client_managed_entries)
                         .unwrap_or_default();
                     let repoint = clients::repoint_stale_gateways(&managed_snapshot);
+                    clients::backup_vault::note_startup_deferred(!repoint.deferred.is_empty());
                     if !repoint.repointed.is_empty() {
                         let ids: Vec<&str> = repoint
                             .repointed
@@ -4890,6 +5372,8 @@ pub fn run() {
             if matches!(event, tauri::RunEvent::Exit) {
                 // Land any queued audit/savings/search-trace lines before the app exits.
                 crate::telemetry::shutdown();
+                // Quitting with no client connected leaves no gateway behind.
+                crate::daemon::stop_when_idle_on_app_quit();
                 if let Some(stop) = app_handle.try_state::<TeamLifecycleStop>() {
                     stop.0.store(true, std::sync::atomic::Ordering::Release);
                 }
@@ -4897,6 +5381,9 @@ pub fn run() {
                 if let Some(broker) = app_handle.try_state::<approval_broker::ApprovalBroker>() {
                     broker.clear_endpoint();
                 }
+                // Tauri exits the process after this event; land the last
+                // redacted stderr lines first.
+                crate::daemon_log::flush_stderr_relay(std::time::Duration::from_millis(500));
             }
         });
 }
@@ -4955,6 +5442,151 @@ mod tests {
         ))
     }
 
+    /// Failure mode: with the endpoint left on, every start read its saved
+    /// bearer token, and a locked keyring asked to be unlocked.
+    #[test]
+    fn a_start_with_the_endpoint_left_on_never_asks_to_unlock_the_keyring() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry {
+                http_bridge_enabled: true,
+                http_bridge_port: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+            let state = HttpBridgeState::default();
+            let mut restored = None;
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                restored = Some(restore_persisted_http_bridge(&state));
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            assert_eq!(restored, Some(Ok(false)));
+            assert!(!crate::http_bridge::status(&state).running);
+        });
+    }
+
+    /// Failure mode: an endpoint waiting for the keyring showed as off, and
+    /// its switch started it instead of turning it off; the saved setting
+    /// stayed on and the first unlock started it.
+    #[test]
+    fn turning_off_an_endpoint_that_waits_for_the_keyring_clears_it_for_good() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry {
+                http_bridge_enabled: true,
+                http_bridge_port: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+            let state = HttpBridgeState::default();
+            let registry_state = Mutex::new(registry::load().unwrap());
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                assert_eq!(restore_persisted_http_bridge(&state), Ok(false));
+                assert!(crate::http_bridge::status(&state).keyring_locked);
+                let stopped = stop_persisted_http_bridge(&state, &registry_state).unwrap();
+                assert!(!stopped.running && !stopped.keyring_locked, "{stopped:?}");
+            });
+            assert!(
+                prompts.is_empty(),
+                "turning it off read the keyring: {prompts:?}"
+            );
+            assert!(!registry::load().unwrap().http_bridge_enabled);
+            assert!(!crate::http_bridge::waiting_for_keyring(&state));
+            // A late restore (the waiter after an unlock) keeps it off.
+            assert_eq!(restore_persisted_http_bridge(&state), Ok(false));
+            assert!(!crate::http_bridge::status(&state).running);
+        });
+    }
+
+    /// A token read that fails at start (here: the store refuses it) is a
+    /// failed attempt the caller retries while it shows the wait, never a read
+    /// that asks to unlock.
+    #[test]
+    fn a_restore_whose_token_read_fails_is_a_failed_attempt() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry {
+                http_bridge_enabled: true,
+                http_bridge_port: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+            let state = HttpBridgeState::default();
+            let outcome = crate::secrets::tests::with_failed_read(HTTP_BRIDGE_VAULT_KEY, || {
+                restore_http_bridge_once(&state)
+            });
+            assert!(
+                matches!(outcome, crate::http_bridge::Restore::Failed(_)),
+                "{outcome:?}"
+            );
+            assert!(!crate::http_bridge::status(&state).running);
+        });
+    }
+
+    /// Failure mode: turned on for the first time while locked, the endpoint
+    /// had no saved token, and every Retry failed with "saved bearer token is
+    /// missing". Retry now starts it with a new token and saves it.
+    #[test]
+    fn retry_starts_an_endpoint_turned_on_before_any_token_was_saved() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry::default()).unwrap();
+            let state = HttpBridgeState::default();
+            let registry_state = Mutex::new(registry::load().unwrap());
+            crate::secrets::locked_store::prompts_during(|| {
+                hold_http_bridge_turned_on(&state, &registry_state, Some(1))
+                    .unwrap()
+                    .expect("held while locked");
+            });
+            FAKE_BRIDGE_START.with(|fake| fake.set(true));
+            let retried = restore_saved_http_bridge(&state, true);
+            FAKE_BRIDGE_START.with(|fake| fake.set(false));
+            assert_eq!(retried, Ok(true));
+            assert_eq!(
+                secrets::get_secret(HTTP_BRIDGE_VAULT_SERVER, HTTP_BRIDGE_VAULT_KEY).as_deref(),
+                Some("minted-test-token")
+            );
+            crate::http_bridge::mark_waiting(&state, false);
+        });
+    }
+
+    /// Failure mode: a Stop between a failed attempt and its wait left the
+    /// wait set with the setting off; the desktop restore read that as held,
+    /// so it showed "Keyring locked" and polled for good.
+    #[test]
+    fn a_desktop_restore_that_finds_it_off_clears_the_wait() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry::default()).unwrap();
+            let state = HttpBridgeState::default();
+            crate::http_bridge::mark_waiting(&state, true);
+            assert_eq!(
+                restore_http_bridge_once(&state),
+                crate::http_bridge::Restore::Off
+            );
+            assert!(!crate::http_bridge::status(&state).keyring_locked);
+        });
+    }
+
+    /// Turning it on while the keyring is locked never asks: it saves the
+    /// setting and shows the wait; Retry is the one that may ask.
+    #[test]
+    fn turning_the_endpoint_on_while_the_keyring_is_locked_waits() {
+        crate::secrets::tests::with_isolated_vault(|| {
+            registry::save(&Registry::default()).unwrap();
+            let state = HttpBridgeState::default();
+            let registry_state = Mutex::new(registry::load().unwrap());
+            let mut held = None;
+            let prompts = crate::secrets::locked_store::prompts_during(|| {
+                held = Some(hold_http_bridge_turned_on(&state, &registry_state, None));
+            });
+            assert!(prompts.is_empty(), "{prompts:?}");
+            let held = held.unwrap().unwrap().expect("held while locked");
+            assert!(held.keyring_locked && !held.running, "{held:?}");
+            assert!(registry::load().unwrap().http_bridge_enabled);
+            // Unlocked: nothing to hold, so the switch starts it.
+            assert!(hold_http_bridge_turned_on(&state, &registry_state, None)
+                .unwrap()
+                .is_none());
+            crate::http_bridge::mark_waiting(&state, false);
+        });
+    }
+
     #[test]
     fn close_hides_only_with_a_created_tray_and_registered_host() {
         assert!(close_to_tray(true, true));
@@ -4985,6 +5617,7 @@ mod tests {
             port: Some(9876),
             token: Some("preserved-secret-token".to_string()),
             proxy_mode: false,
+            waiting_for_keyring: false,
         };
 
         let error = stop_http_bridge_with(&mut bridge, |_| {
@@ -5178,6 +5811,7 @@ mod tests {
             url: None,
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -5195,7 +5829,7 @@ mod tests {
         let mut server = plain_server("bogus", "Bogus");
         server.command = Some("toolport-no-such-binary-xyz".into());
         let start = std::time::Instant::now();
-        let r = probe_one_bounded(&server);
+        let r = crate::server_runtime::probe_one_bounded(&server);
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "a fast failure must not wait on the timeout"
@@ -5217,6 +5851,7 @@ mod tests {
             url: None,
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -5230,7 +5865,7 @@ mod tests {
         clients::McpServer {
             name: name.into(),
             transport: "stdio".into(),
-            command: Some("x".into()),
+            command: Some(name.to_lowercase()),
             args: vec![],
             env_keys: vec![],
             url: None,
@@ -5267,6 +5902,7 @@ mod tests {
             name: id.into(),
             uses_connectors: false,
             location_removable: false,
+            location_kept_by_t3_code: false,
             config_path: String::new(),
             config_exists: true,
             app_present: true,
@@ -5279,6 +5915,7 @@ mod tests {
             entry_state: clients::GatewayEntryState::Absent,
             error: None,
             claude_profile: None,
+            t3_code: Vec::new(),
         }
     }
 
@@ -5320,11 +5957,18 @@ mod tests {
     #[test]
     fn selected_servers_to_import_respects_the_reviewed_keys() {
         let detected = vec![detected_client("cursor", vec!["linear", "github"], vec![])];
-        let selected = std::collections::HashSet::from(["name:github".to_string()]);
+        let selected =
+            std::collections::HashSet::from([crate::registry_controller::import_review_key(
+                &crate::registry_controller::server_from_detected(
+                    &detected_mcp_server("github"),
+                    "cursor",
+                ),
+                "github",
+            )]);
         let picked =
             selected_servers_to_import(&detected, &Registry::default(), Some(&selected)).unwrap();
         assert_eq!(picked.len(), 1);
-        assert_eq!(picked[0].name, "github");
+        assert_eq!(picked[0].0.name, "github");
     }
 
     #[test]
@@ -5359,14 +6003,16 @@ mod tests {
     #[test]
     fn servers_to_import_keeps_same_package_under_distinct_names() {
         // A multi-account setup runs the SAME package twice under different
-        // names (e.g. a personal and a work token). Keying on the package alone
-        // would collapse them and silently drop one; the name tiebreaker keeps
-        // both while still distinguishing different packages (see the test above).
+        // names, each with its own token in env (a personal and a work token).
+        // Keying on the package alone would collapse them and silently drop one;
+        // the name tiebreaker keeps both while still distinguishing different
+        // packages (see the test above).
+        let account = |name: &str| clients::McpServer {
+            env_keys: vec!["GITHUB_TOKEN".into()],
+            ..detected_mcp_server_with_args(name, "npx", &["-y", "@mcp/server-github"])
+        };
         let mut client = detected_client("claude", vec![], vec![]);
-        client.servers = vec![
-            detected_mcp_server_with_args("github-personal", "npx", &["-y", "@mcp/server-github"]),
-            detected_mcp_server_with_args("github-work", "npx", &["-y", "@mcp/server-github"]),
-        ];
+        client.servers = vec![account("github-personal"), account("github-work")];
         let picked = servers_to_import(&[client], &Registry::default());
         assert_eq!(picked.len(), 2);
         let names: std::collections::HashSet<_> =
@@ -5378,6 +6024,25 @@ mod tests {
     }
 
     #[test]
+    fn servers_to_import_offers_one_server_listed_twice_without_credentials() {
+        // With nothing in env or headers the two entries cannot differ, so one
+        // connection imports once whatever the names, in one pass or two.
+        let mut client = detected_client("claude", vec![], vec![]);
+        client.servers = vec![
+            detected_mcp_server_with_args("gh", "npx", &["-y", "@mcp/server-github"]),
+            detected_mcp_server_with_args("github", "npx", &["-y", "@mcp/server-github"]),
+        ];
+        let picked = servers_to_import(&[client], &Registry::default());
+        assert_eq!(
+            picked
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            ["gh"]
+        );
+    }
+
+    #[test]
     fn servers_to_import_skips_existing_and_own_gateway_entry() {
         let detected = vec![detected_client(
             "cursor",
@@ -5385,7 +6050,9 @@ mod tests {
             vec!["new-one"],
         )];
         let mut reg = Registry::default();
-        reg.add_server(plain_server("x", "already-here"));
+        let mut existing = plain_server("x", "already-here");
+        existing.command = Some("already-here".into());
+        reg.add_server(existing);
         let picked = servers_to_import(&detected, &reg);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].name, "new-one");
@@ -5726,6 +6393,7 @@ mod tests {
             url: None,
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -5837,6 +6505,7 @@ mod tests {
             url: Some("https://user:hunter2@mcp.example.com/mcp".into()),
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -5910,6 +6579,7 @@ mod tests {
             url: None,
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -5965,6 +6635,7 @@ mod tests {
             url: None,
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -6010,6 +6681,7 @@ mod tests {
             url: None,
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -6019,7 +6691,7 @@ mod tests {
         });
         let json = serde_json::to_string(&build_export(&reg, None, None, None)).unwrap();
         let mut recipient = Registry::default();
-        apply_import(&mut recipient, &json).unwrap();
+        apply_import(&mut recipient, &json, None).unwrap();
         let imported = recipient
             .servers
             .iter()
@@ -6033,6 +6705,22 @@ mod tests {
     }
 
     #[test]
+    fn import_keeps_only_the_reviewed_names() {
+        let mut reg = Registry::default();
+        let doc = r#"{"kind":"conduit-setup","version":1,"servers":[
+            {"name":"Linear","transport":"stdio","command":"npx"},
+            {"name":"Stripe","transport":"http","url":"https://x"}
+        ]}"#;
+        apply_import(&mut reg, doc, Some(&["stripe".to_string()])).unwrap();
+        let names = reg
+            .servers
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Stripe"]);
+    }
+
+    #[test]
     fn import_dedups_by_name_and_nulls_secrets() {
         let mut reg = Registry::default();
         reg.add_server(github_with_secret());
@@ -6041,7 +6729,7 @@ mod tests {
             {"name":"Stripe","transport":"http","url":"https://x",
              "env":[{"key":"K","value":"shh","secret":true}]}
         ]}"#;
-        apply_import(&mut reg, doc).unwrap();
+        apply_import(&mut reg, doc, None).unwrap();
 
         // "github" is deduped case-insensitively; only Stripe is added.
         assert_eq!(
@@ -6059,7 +6747,7 @@ mod tests {
     #[test]
     fn import_rejects_garbage() {
         let mut reg = Registry::default();
-        assert!(apply_import(&mut reg, "{not json").is_err());
+        assert!(apply_import(&mut reg, "{not json", None).is_err());
     }
 
     #[test]
@@ -6129,6 +6817,7 @@ mod tests {
             url: None,
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -6148,6 +6837,7 @@ mod tests {
             url: Some("https://user:hunter2@mcp.example.com/mcp".into()),
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -7081,14 +7771,6 @@ mod tests {
         assert_eq!(supplied_secret(None), None);
     }
 
-    // ----- SBS-845: Disconnect must not succeed while the bearer is still live --
-    //
-    // These drive `revoke_client_http_token_with` rather than the real vault:
-    // headless Linux CI has no Secret Service, so a real `delete_secret` fails
-    // there and every case would assert on the runner instead of on the revoke
-    // logic. What is under test is which failures propagate and what each one
-    // leaves behind, so the vault result is injected.
-
     fn fail_next_registry_write() {
         FAIL_NEXT_REGISTRY_WRITE.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -7097,42 +7779,43 @@ mod tests {
         FAIL_NEXT_REGISTRY_WRITE.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Scratch data dir + seeded `http_clients` row. Holds the process-global
-    /// hook lock and `data_dir_test_lock` so persist and injected failures cannot
-    /// interleave with another test.
-    ///
-    /// Field order IS drop order (unlike locals, struct fields drop in declaration
-    /// order), so the override is declared before the guards that protect it. The
-    /// other way round, teardown released `data_dir_test_lock` while this fixture's
-    /// `DataDirOverride` was still installed; the next test could take the lock and
-    /// install its own override, only for this drop to land and clear it. That
-    /// test's `registry::load()` then read the REAL data dir, where its seeded
-    /// `http_clients` row does not exist.
-    ///
-    /// `_generation` is held for the same reason, but against a different race:
-    /// this fixture's revoke path calls `write_registry`, which bumps the global
-    /// `REGISTRY_GENERATION`. The watcher tests sample that counter before their
-    /// load and refuse to publish if it moved, so a revoke landing in that window
-    /// turned their `Applied` into `LostRace`. Acquired first and declared last,
-    /// so it is taken before and released after the other two.
-    struct RevokeFixture {
+    // ----- React Disconnect goes through the registry controller -------------
+    //
+    // `disconnect_client_in_app` is the body of the `uninstall_gateway` command.
+    // These drive it against a scratch Claude Code config and data dir. The
+    // vault delete is injected: headless Linux CI has no Secret Service, so a
+    // real `delete_secret` would assert on the runner instead of on Disconnect.
+
+    /// Scratch Claude Code home and data dir with Toolport connected through the
+    /// stdio adapter. `GEN_TEST_LOCK` is held because `write_registry` bumps the
+    /// registry generation the watcher tests sample; the rest follow the
+    /// controller's `MoveFixture` order. Fields drop in declaration order, so the
+    /// env vars and data dir are put back before the locks are released.
+    struct DisconnectFixture {
+        root: std::path::PathBuf,
+        _vars: Vec<clients::EnvRestore>,
         _override: crate::registry::DataDirOverride,
+        _env: std::sync::MutexGuard<'static, ()>,
+        _registry_env: std::sync::MutexGuard<'static, ()>,
         _data_dir: std::sync::MutexGuard<'static, ()>,
         _hooks: std::sync::MutexGuard<'static, ()>,
         _generation: std::sync::MutexGuard<'static, ()>,
         state: RegistryState,
-        client_id: String,
-        http_id: String,
+        connected: String,
     }
 
-    impl Drop for RevokeFixture {
+    impl Drop for DisconnectFixture {
         fn drop(&mut self) {
             clear_revoke_hooks();
+            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 
-    impl RevokeFixture {
-        fn new(label: &str) -> Self {
+    impl DisconnectFixture {
+        const CLIENT: &'static str = "claude-code";
+        const ORIGINAL: &'static str = "{\"mcpServers\":{}}";
+
+        fn new(label: &str, shared_http: bool) -> Self {
             let generation = GEN_TEST_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -7141,113 +7824,195 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             clear_revoke_hooks();
             let data_dir = crate::registry::data_dir_test_lock();
-            let dir = unique_update_test_dir(label);
-            std::fs::create_dir_all(&dir).unwrap();
-            let over = crate::registry::DataDirOverride::set(&dir);
-            let client_id = "cursor".to_string();
-            let http_id = format!("client:{client_id}");
+            let registry_env = crate::registry::REGISTRY_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let env = clients::env_test_lock();
+            let root = unique_update_test_dir(label);
+            for dir in ["data", "claude"] {
+                std::fs::create_dir_all(root.join(dir)).unwrap();
+            }
+            let over = crate::registry::DataDirOverride::set(root.join("data"));
+            let vars = vec![
+                clients::EnvRestore::set("CLAUDE_CONFIG_DIR", &root.join("claude")),
+                clients::EnvRestore::set(
+                    "TOOLPORT_SECRET_KEY",
+                    std::path::Path::new("synthetic-disconnect-fixture"),
+                ),
+            ];
             let mut reg = Registry::default();
-            reg.http_clients.push(registry::HttpClient {
-                id: http_id.clone(),
-                label: format!("Client: {client_id}"),
-                token_sha256: registry::sha256_hex("leftover-bearer"),
-                profile: String::new(),
-                unknown_fields: Default::default(),
-            });
+            if shared_http {
+                reg.http_clients.push(registry::HttpClient {
+                    id: format!("client:{}", Self::CLIENT),
+                    label: "Claude Code".into(),
+                    token_sha256: registry::sha256_hex("synthetic-bearer"),
+                    profile: String::new(),
+                    unknown_fields: Default::default(),
+                });
+            }
             registry::save(&reg).unwrap();
+            let config = root.join("claude").join(".claude.json");
+            std::fs::write(&config, Self::ORIGINAL).unwrap();
+            let outcome = clients::install_gateway(Self::CLIENT, None).unwrap();
+            registry::update(|reg| {
+                reg.set_client_unscoped(Self::CLIENT);
+                reg.set_client_managed_entry(Self::CLIENT, outcome.managed.clone().unwrap());
+                Ok(())
+            })
+            .unwrap();
+            let connected = std::fs::read_to_string(&config).unwrap();
+            assert_ne!(connected, Self::ORIGINAL);
             Self {
+                root,
+                _vars: vars,
                 _override: over,
+                _env: env,
+                _registry_env: registry_env,
                 _data_dir: data_dir,
                 _hooks: hooks,
                 _generation: generation,
-                state: Mutex::new(reg),
-                client_id,
-                http_id,
+                state: Mutex::new(registry::load().unwrap()),
+                connected,
             }
         }
 
-        fn http_row_present(&self) -> bool {
-            let on_disk = registry::load().expect("scratch registry loads");
-            on_disk.http_clients.iter().any(|c| c.id == self.http_id)
+        fn config(&self) -> String {
+            std::fs::read_to_string(self.root.join("claude").join(".claude.json")).unwrap()
+        }
+
+        fn client_registered(reg: &Registry) -> bool {
+            reg.client_scopes.contains_key(Self::CLIENT)
+                || reg.client_managed_entries.contains_key(Self::CLIENT)
+        }
+
+        fn http_row_present(reg: &Registry) -> bool {
+            let http_id = format!("client:{}", Self::CLIENT);
+            reg.http_clients.iter().any(|c| c.id == http_id)
+        }
+
+        fn cached(&self) -> Registry {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
     }
 
+    /// F1 for the React shell: a registry write that fails after Disconnect
+    /// changed the client config puts the config back from the backup this
+    /// Disconnect took, instead of leaving the client half disconnected.
     #[test]
-    fn revoke_client_http_token_fails_when_vault_delete_fails() {
-        let fixture = RevokeFixture::new("sbs-845-vault-delete");
-        let err = revoke_client_http_token_with(
-            &fixture.state,
-            &fixture.client_id,
-            |_server, _client| Err("the keychain is locked".into()),
-        )
-        .expect_err("a failed vault delete must not look like a successful disconnect");
-        assert!(
-            err.contains("the keychain is locked"),
-            "the vault failure must reach the caller verbatim, got: {err}"
-        );
-        // The point of the ordering: the row is dropped before the vault is
-        // touched, so a keychain failure still revokes the bearer. The caller
-        // is told the disconnect was not clean (an orphaned vault entry is
-        // left), but the token can no longer authenticate.
-        assert!(
-            !fixture.http_row_present(),
-            "the bearer must be revoked even when the vault delete fails"
-        );
+    fn react_disconnect_rolls_the_client_config_back_when_the_registry_write_fails() {
+        let fixture = DisconnectFixture::new("react-disconnect-rollback", false);
+        fail_next_registry_write();
+        let err =
+            disconnect_client_in_app(&fixture.state, DisconnectFixture::CLIENT, |_, _| Ok(()))
+                .expect_err("a failed registry write must fail Disconnect");
+        assert!(err.contains("injected registry write"), "{err}");
+        assert!(err.contains("rolled back"), "{err}");
+        assert_eq!(fixture.config(), fixture.connected);
+        let on_disk = registry::load().unwrap();
+        assert!(DisconnectFixture::client_registered(&on_disk));
+        assert!(DisconnectFixture::client_registered(&fixture.cached()));
     }
 
     #[test]
-    fn revoke_client_http_token_fails_when_registry_write_fails() {
-        let fixture = RevokeFixture::new("sbs-845-registry-write");
+    fn react_disconnect_returns_the_outcome_and_clears_the_client() {
+        let fixture = DisconnectFixture::new("react-disconnect-success", false);
         let vault_called = std::cell::Cell::new(false);
-        fail_next_registry_write();
-        let err = revoke_client_http_token_with(
-            &fixture.state,
-            &fixture.client_id,
-            |_server, _client| {
+        let outcome =
+            disconnect_client_in_app(&fixture.state, DisconnectFixture::CLIENT, |_, _| {
                 vault_called.set(true);
+                Ok(())
+            })
+            .expect("Disconnect succeeds");
+        let config = fixture.root.join("claude").join(".claude.json");
+        assert_eq!(outcome.path, config.display().to_string());
+        assert!(outcome.restored.is_empty(), "{:?}", outcome.restored);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let after: serde_json::Value = serde_json::from_str(&fixture.config()).unwrap();
+        assert!(after["mcpServers"]
+            .get(clients::GATEWAY_ENTRY_NAME)
+            .is_none());
+        let on_disk = registry::load().unwrap();
+        assert!(!DisconnectFixture::client_registered(&on_disk));
+        // The app's cached registry follows the write.
+        assert!(!DisconnectFixture::client_registered(&fixture.cached()));
+        // A stdio client has no Shared HTTP bearer to revoke.
+        assert!(!vault_called.get());
+    }
+
+    /// React can still disconnect a Shared HTTP client: the bearer row goes in
+    /// the same registry write as the scope, then the vault copy is deleted.
+    #[test]
+    fn react_disconnect_of_a_shared_http_client_revokes_the_bearer() {
+        let fixture = DisconnectFixture::new("react-disconnect-http", true);
+        let deleted = std::cell::RefCell::new(Vec::new());
+        let outcome = disconnect_client_in_app(
+            &fixture.state,
+            DisconnectFixture::CLIENT,
+            |server, client| {
+                deleted
+                    .borrow_mut()
+                    .push((server.to_string(), client.to_string()));
                 Ok(())
             },
         )
-        .expect_err("a failed http_clients persist must not look like a successful disconnect");
-        assert!(
-            err.contains("injected registry write"),
-            "expected the injected registry failure, got: {err}"
-        );
-        assert!(
-            fixture.http_row_present(),
-            "a failed persist must leave the http_clients row registered"
-        );
-        // Nothing was revoked, so the vault copy must survive: it still belongs
-        // to a bearer that is registered and can authenticate. Deleting it here
-        // would strip Toolport's own record of a token that still works.
-        assert!(
-            !vault_called.get(),
-            "a failed persist must not delete the vaulted bearer"
-        );
-    }
-
-    #[test]
-    fn revoke_client_http_token_drops_the_http_clients_row() {
-        let fixture = RevokeFixture::new("sbs-845-success");
-        let deleted = std::cell::RefCell::new(Vec::new());
-        revoke_client_http_token_with(&fixture.state, &fixture.client_id, |server, client| {
-            deleted
-                .borrow_mut()
-                .push((server.to_string(), client.to_string()));
-            Ok(())
-        })
-        .expect("a successful vault delete must not block Disconnect");
+        .expect("a Shared HTTP client can be disconnected");
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
         assert_eq!(
             deleted.into_inner(),
             vec![(
                 "__toolport_http_clients__".to_string(),
-                fixture.client_id.clone()
-            )],
-            "the vaulted bearer must be deleted under the shared-HTTP namespace"
+                DisconnectFixture::CLIENT.to_string()
+            )]
         );
+        let on_disk = registry::load().unwrap();
+        assert!(!DisconnectFixture::http_row_present(&on_disk));
+        assert!(!DisconnectFixture::client_registered(&on_disk));
+        assert!(!DisconnectFixture::http_row_present(&fixture.cached()));
+    }
+
+    /// A failed vault delete after the row is gone no longer fails Disconnect:
+    /// the bearer cannot authenticate, the config and registry already changed,
+    /// so the leftover keychain copy is reported as a warning (same as GTK).
+    #[test]
+    fn react_disconnect_reports_a_failed_vault_delete_as_a_warning() {
+        let fixture = DisconnectFixture::new("react-disconnect-vault", true);
+        let outcome =
+            disconnect_client_in_app(&fixture.state, DisconnectFixture::CLIENT, |_, _| {
+                Err("the keychain is locked".into())
+            })
+            .expect("the bearer is revoked even when the vault delete fails");
         assert!(
-            !fixture.http_row_present(),
-            "success means the bearer is gone from the registry"
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("the keychain is locked")),
+            "{:?}",
+            outcome.warnings
         );
+        let on_disk = registry::load().unwrap();
+        assert!(!DisconnectFixture::http_row_present(&on_disk));
+    }
+
+    /// A failed registry write on a Shared HTTP client keeps the bearer row and
+    /// its vault copy, and rolls the config back.
+    #[test]
+    fn react_disconnect_of_a_shared_http_client_keeps_the_bearer_when_the_write_fails() {
+        let fixture = DisconnectFixture::new("react-disconnect-http-rollback", true);
+        let vault_called = std::cell::Cell::new(false);
+        fail_next_registry_write();
+        let err = disconnect_client_in_app(&fixture.state, DisconnectFixture::CLIENT, |_, _| {
+            vault_called.set(true);
+            Ok(())
+        })
+        .expect_err("a failed registry write must fail Disconnect");
+        assert!(err.contains("rolled back"), "{err}");
+        assert_eq!(fixture.config(), fixture.connected);
+        let on_disk = registry::load().unwrap();
+        assert!(DisconnectFixture::http_row_present(&on_disk));
+        assert!(DisconnectFixture::client_registered(&on_disk));
+        assert!(!vault_called.get());
     }
 }

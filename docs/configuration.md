@@ -19,6 +19,13 @@ written automatically when you connect:
 - `TOOLPORT_DATA_DIR=<path>` - override the full Toolport data directory. A desktop
   launch with this override keeps its startup migration within that instance:
   it does not rewrite client configs or agent hooks in the user's normal home.
+  On Linux, Toolport also writes it into the entry of every row that is not a
+  client's main config (a T3 Code home or a location you added), because such a
+  client may set its own `XDG_CONFIG_HOME` and the gateway would otherwise look
+  for its data there. macOS and Windows entries never get it. Toolport changes
+  that value later only if it wrote it itself, so a folder you set by hand, or
+  one another Toolport on its own data folder wrote, stays. See
+  [T3 Code](t3-code.md#the-data-folder-in-a-rows-entry) for the limits.
 - `TOOLPORT_RESULT_BUDGET=<bytes>` - cap oversized tool results at this many bytes
   (0 disables it). Optional; default budget applies when unset.
 - `TOOLPORT_HTTP=<port>` (with optional `TOOLPORT_HTTP_HOST`, default `127.0.0.1`,
@@ -103,6 +110,34 @@ scope, approval, content-defense, and rate-limit checks. On failure, completed c
 and the last checkpoint remain available; calls already in flight are cancelled where
 supported and must not be automatically retried.
 
+**Code mode signatures.** While code mode is on, each `toolport_search_tools` hit ends
+with a TypeScript-style signature for its script call, for example
+`servers.github.create_issue(args: {body?: string; owner: string; repo: string; title: string}): ToolResult`.
+A menu row gains it as a trailing string; an exact-name definition gains a `signature`
+field. A script written from a signature is valid against the tool's schema: types may
+be wider than the schema (`string` for a pattern, `unknown` for what TypeScript cannot
+spell), but a required argument is never shown as optional. `allOf` branches are
+merged, `anyOf` and `oneOf` become unions of the merged shapes, and `args?` appears
+only when the schema accepts `{}`. Signatures are capped at 240 characters. A longer
+one is shortened in steps: nested objects become `object`, the typed return becomes
+plain `ToolResult`, optional parameters fold into `...+N optional`, enums become their
+base type, and required parameters keep their names with an `unknown` type or fold
+into `...+N required`. When the upstream tool declares an `outputSchema`, the return
+reads `ToolResult<...>` and types `structuredContent`, because calls inside a script
+are not shaped. The schema itself stays out of `tools/list` and search results. Names
+without a `__` separator, such as Grok's dashed `server-tool` spelling, get `servers.*`
+stubs too; a name with no server part is shown as `toolport.call("name", args)`, and
+one too long for the cap as `toolport.call(name, args)`, where `name` is the hit's
+name. A recursive type is named in the hit, with a note that `toolport.describe` has
+its definition. In a script, `toolport.describe(name)` (or
+`toolport.describe(servers.s.tool)`) returns `{name, signature, inputSchema, truncated}`
+with the complete signature, recursive types written as `type Name = ...;` lines ahead
+of it, or `null` for a name outside your scope. `truncated` is true, with a
+`truncatedReason`, only when a schema is past the renderer's guards. A description too
+large for the code mode frame comes back as `{name, error, size, limit}` for that call
+only. Describe sees exactly the tools search can return. It costs no call budget and
+works in `validate` dry runs. With code mode off, search output is unchanged.
+
 **Semantic search (optional).** Lazy discovery ranks tools lexically by default. Point it
 at any `/v1/embeddings` endpoint (LM Studio, Ollama, or a cloud provider) to blend in
 embedding similarity for paraphrased queries: `TOOLPORT_SEMANTIC=on`,
@@ -149,6 +184,10 @@ process-local sessions.
 A connection failure retries in the background with exponential backoff from
 two seconds to five minutes, with jitter. A demand call can retry once 15 seconds
 have passed since the last attempt. Reaching Ready resets the failure count.
+
+For a local MCP endpoint tied to a running 1C session, see
+[Vanessa Automation across Enterprise restarts](vanessa.md).
+
 Sign-in failures wait for credentials to change. Registry edits reuse servers
 whose effective connection spec is unchanged, preserving their processes and
 calls in flight. Changed servers get a new supervisor and start on their next
@@ -156,5 +195,27 @@ use, or immediately when they have active resource subscriptions. The new
 connection restores those subscriptions. Policy-only edits do not restart
 connections. Fresh catalogs pass the integrity gate before calls can use them.
 
-For a local MCP endpoint tied to a running 1C session, see
-[Vanessa Automation across Enterprise restarts](vanessa.md).
+### Hiding a server's prompts
+
+Some clients, including Claude Code, show MCP prompts as slash commands. A server
+that ships prompts you never use can crowd that menu. To keep a server's tools
+but drop its prompts, turn on **Hide prompts** when you edit the server, or set
+`hidePrompts` on its entry in `registry.json`:
+
+```json
+{
+  "id": "docs",
+  "name": "Docs",
+  "transport": "stdio",
+  "command": "npx",
+  "args": ["-y", "example-docs-mcp"],
+  "hidePrompts": true
+}
+```
+
+Hidden prompts are left out of `prompts/list`, and `prompts/get` and prompt
+completion refuse them. The server's tools and resources are unaffected. The
+setting is a policy edit, so it applies to connected clients without restarting
+the server, and Toolport sends `notifications/prompts/list_changed` so clients
+that support it refresh their list. It is off by default and stays on this
+machine: team and personal sync neither share it nor reset it.

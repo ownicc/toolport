@@ -17,6 +17,10 @@ pub(super) struct ActivityView {
     pub(super) client: Option<String>,
     pub(super) client_id: Option<String>,
     pub(super) client_label: Option<String>,
+    /// The app hosting the client (`t3-code`), display only. Unknown hosts are dropped.
+    pub(super) host: Option<String>,
+    /// The host's thread id, kept only alongside a known host.
+    pub(super) host_thread: Option<String>,
     pub(super) approval_decision: Option<String>,
     pub(super) cold: Option<bool>,
     pub(super) dispatch_ms: Option<u64>,
@@ -78,7 +82,28 @@ pub(super) struct ActivitySnapshot {
     /// busiest first; each row carries its per-tool breakdown.
     pub(super) server_stats: Vec<serde_json::Value>,
     pub(super) telemetry_notices: Vec<String>,
+    /// Why the audit log could not be read. The other panels still load, as in React.
+    pub(super) audit_error: Option<String>,
+    /// The audit read failed and the rows shown are the last ones read successfully.
+    pub(super) audit_stale: bool,
+    /// Why security events could not be read: unknown, never an all-clear.
+    pub(super) security_error: Option<String>,
+    /// The security read failed and the events shown are the last ones read successfully.
+    pub(super) security_stale: bool,
+    pub(super) search_traces_error: Option<String>,
+    pub(super) inspect_error: Option<String>,
+    /// Live inspection is on, so the inspector panel shows (React reads `liveInspect`).
+    pub(super) live_inspect: bool,
+    /// `Registry::tool_change_reviews_enabled`; true when the registry is unreadable.
+    pub(super) tool_change_reviews: bool,
+    /// `integrity::ActivitySafety::blocks_nothing`: Activity may say Safety is Off.
+    pub(super) blocks_nothing: bool,
+    /// `integrity::ActivitySafety::reviews_confirmed`: Activity may say protection is active.
+    pub(super) reviews_confirmed: bool,
 }
+
+/// How many recent entries Activity reads and lists: React's `getAuditLog(200)`.
+pub(super) const ACTIVITY_ROW_LIMIT: usize = 200;
 
 impl ActivitySnapshot {
     fn from_entries(entries: Vec<serde_json::Value>, recent_limit: usize) -> Self {
@@ -131,6 +156,10 @@ impl ActivitySnapshot {
                         .get("clientLabel")
                         .and_then(serde_json::Value::as_str)
                         .and_then(crate::approval::sanitize_client_label),
+                    host: activity_host(&entry),
+                    host_thread: activity_host(&entry)
+                        .and(entry["hostThread"].as_str())
+                        .and_then(crate::host_attribution::valid_thread),
                     cold: entry["cold"].as_bool(),
                     dispatch_ms: entry["dispatchMs"].as_u64(),
                     failure_kind: entry["failureKind"].as_str().map(str::to_string),
@@ -147,7 +176,7 @@ impl ActivitySnapshot {
                         .get("error")
                         .and_then(serde_json::Value::as_str)
                         .filter(|value| !value.is_empty())
-                        .map(activity_error_summary),
+                        .map(activity_error_text),
                     pii_replaced: entry.get("piiReplaced").and_then(serde_json::Value::as_u64),
                     pii_incomplete: entry
                         .get("piiIncomplete")
@@ -194,8 +223,25 @@ impl ActivitySnapshot {
             tool_identities_error: None,
             server_stats: Vec::new(),
             telemetry_notices: Vec::new(),
+            audit_error: None,
+            audit_stale: false,
+            security_error: None,
+            security_stale: false,
+            search_traces_error: None,
+            inspect_error: None,
+            live_inspect: false,
+            tool_change_reviews: true,
+            blocks_nothing: false,
+            reviews_confirmed: false,
         }
     }
+}
+
+fn activity_host(entry: &serde_json::Value) -> Option<String> {
+    entry["host"]
+        .as_str()
+        .filter(|host| crate::host_attribution::valid_host(host))
+        .map(str::to_owned)
 }
 
 fn activity_server(entry: &serde_json::Value) -> String {
@@ -257,19 +303,16 @@ pub(super) fn format_token_count(tokens: u64) -> String {
     }
 }
 
-fn activity_error_summary(error: &str) -> String {
-    const MAX_CHARS: usize = 180;
-    let readable = serde_json::from_str::<serde_json::Value>(error)
+/// A failed call's error, read out of a JSON body when it is one. The whole
+/// text: the expanded row wraps it, as React shows `error` in full (the audit
+/// log already bounds its length).
+fn activity_error_text(error: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(error)
         .ok()
         .and_then(|value| activity_error_message(&value).map(str::to_string))
-        .unwrap_or_else(|| error.to_string());
-    let collapsed = readable.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= MAX_CHARS {
-        return collapsed;
-    }
-    let mut summary = collapsed.chars().take(MAX_CHARS).collect::<String>();
-    summary.push('…');
-    summary
+        .unwrap_or_else(|| error.to_string())
+        .trim()
+        .to_string()
 }
 
 fn activity_error_message(value: &serde_json::Value) -> Option<&str> {
@@ -290,35 +333,59 @@ fn activity_error_message(value: &serde_json::Value) -> Option<&str> {
 }
 
 pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
-    let mut entries = crate::audit::read_all()
-        .map_err(|error| format!("could not read retained activity: {error}"))?;
-    for entry in &mut entries {
-        let server = activity_server(entry);
-        let needs_server = entry
-            .get("server")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(|server| server.trim().is_empty());
-        if needs_server {
-            if let Some(object) = entry.as_object_mut() {
-                object.insert("server".to_string(), serde_json::Value::String(server));
+    // Each panel reads on its own, as React's do: an unreadable audit log shows its
+    // error where the calls go, while protection, discovery and identities still
+    // show their real state.
+    let (mut snapshot, audit_error) = match crate::audit::read_all() {
+        Ok(mut entries) => {
+            for entry in &mut entries {
+                let server = activity_server(entry);
+                let needs_server = entry
+                    .get("server")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|server| server.trim().is_empty());
+                if needs_server {
+                    if let Some(object) = entry.as_object_mut() {
+                        object.insert("server".to_string(), serde_json::Value::String(server));
+                    }
+                }
             }
+            let server_stats = crate::audit::stats_for_entries(&entries)
+                .get("servers")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut snapshot = ActivitySnapshot::from_entries(entries, ACTIVITY_ROW_LIMIT);
+            snapshot.server_stats = server_stats;
+            (snapshot, None)
         }
-    }
-    let server_stats = crate::audit::stats_for_entries(&entries)
-        .get("servers")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut snapshot = ActivitySnapshot::from_entries(entries, 100);
-    snapshot.server_stats = server_stats;
+        // The same words the Tauri command rejects with, so both shells show one cause.
+        Err(error) => (
+            ActivitySnapshot::from_entries(Vec::new(), ACTIVITY_ROW_LIMIT),
+            Some(format!("Couldn't read the activity log: {error}")),
+        ),
+    };
+    snapshot.audit_error = audit_error;
     snapshot.telemetry_notices =
         crate::telemetry::activity_notices(&crate::telemetry::activity_health());
-    snapshot.security_events = crate::integrity::review_events(2000)
-        .map_err(|error| format!("could not read security events: {error}"))?;
-    snapshot.search_traces = crate::searchtrace::read_recent(25)
-        .map_err(|error| format!("could not read discovery traces: {error}"))?;
-    snapshot.inspect_calls = crate::inspect::read_recent(25)
-        .map_err(|error| format!("could not read inspector captures: {error}"))?;
+    match crate::integrity::review_events(2000) {
+        Ok(events) => snapshot.security_events = events,
+        Err(error) => {
+            snapshot.security_error = Some(format!("could not read security events: {error}"))
+        }
+    }
+    match crate::searchtrace::read_recent(100) {
+        Ok(traces) => snapshot.search_traces = traces,
+        Err(error) => {
+            snapshot.search_traces_error = Some(format!("could not read discovery traces: {error}"))
+        }
+    }
+    match crate::inspect::read_recent(50) {
+        Ok(calls) => snapshot.inspect_calls = calls,
+        Err(error) => {
+            snapshot.inspect_error = Some(format!("could not read inspector captures: {error}"))
+        }
+    }
     let savings = crate::savings::try_summary()
         .map_err(|error| format!("could not read catalog telemetry: {error}"))?;
     let savings_number = |key: &str| {
@@ -360,6 +427,12 @@ pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
     match crate::registry::load()
         .map_err(|error| format!("could not read the registry for tool identities: {error}"))
         .and_then(|registry| {
+            snapshot.live_inspect = registry.live_inspect;
+            // The same source-aware decision React reads through `activity_safety`.
+            let safety = crate::integrity::activity_safety();
+            snapshot.tool_change_reviews = safety.tool_change_reviews;
+            snapshot.blocks_nothing = safety.blocks_nothing;
+            snapshot.reviews_confirmed = safety.reviews_confirmed;
             annotate_security_server_names(&mut snapshot.security_events, &registry.servers);
             crate::integrity::tool_identities(&registry.servers, &registry.profiles)
                 .map_err(|error| format!("could not read the tool identity stores: {error}"))
@@ -394,8 +467,20 @@ pub(super) enum ClientGatewayState {
 }
 
 /// Detail inventory stays out of debug logs, just as it did before details existed.
+/// The second field is what Import would add, each named as it would be saved, marked
+/// when it came from a plugin, and with the connection id its review item carries.
+/// The third lists, the same way, servers only the keychain could match to Toolport's.
 #[derive(Clone)]
-pub(super) struct ClientDetailData(pub(super) crate::clients::DetectedClient);
+pub(super) struct ClientDetailData(
+    pub(super) crate::clients::DetectedClient,
+    pub(super) Vec<(crate::clients::McpServer, bool, String)>,
+    pub(super) Vec<(crate::clients::McpServer, bool, String)>,
+);
+impl ClientDetailData {
+    pub(super) fn new(client: crate::clients::DetectedClient) -> Self {
+        Self(client, Vec::new(), Vec::new())
+    }
+}
 impl std::fmt::Debug for ClientDetailData {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ClientDetailData(<private>)")
@@ -434,14 +519,40 @@ pub(super) struct ClientView {
     pub(super) inherited_discovery: Option<String>,
     pub(super) config_error: bool,
     pub(super) location_removable: bool,
+    /// See [`crate::clients::DetectedClient::location_kept_by_t3_code`].
+    pub(super) location_kept_by_t3_code: bool,
     /// Set when several Claude Code profiles are listed, to tell them apart.
     pub(super) claude_profile: Option<crate::clients::ClaudeProfile>,
+    /// The T3 Code provider instances that use this config. Empty without T3 Code.
+    pub(super) t3_code: Vec<crate::clients::T3CodeUse>,
+}
+
+/// The order Clients lists rows in, and so Connect all's steps: installed apps first, then
+/// by Unicode lowercase name, then by id. React's `compareClientNames` is the same rule.
+pub(super) fn client_order(left: &ClientView, right: &ClientView) -> std::cmp::Ordering {
+    right
+        .app_present
+        .cmp(&left.app_present)
+        .then_with(|| name_order(&left.name, &left.id, &right.name, &right.id))
+}
+
+/// Text Clients sorts by, such as a row's name or a profile's folder: by Unicode
+/// lowercase, then by id. React's `compareClientNames` is the same rule.
+pub(super) fn name_order(
+    left: &str,
+    left_id: &str,
+    right: &str,
+    right_id: &str,
+) -> std::cmp::Ordering {
+    left.to_lowercase()
+        .cmp(&right.to_lowercase())
+        .then_with(|| left_id.cmp(right_id))
 }
 
 impl ClientView {
     fn from_detected(client: crate::clients::DetectedClient) -> Self {
         Self {
-            detected: Some(ClientDetailData(client.clone())),
+            detected: Some(ClientDetailData::new(client.clone())),
             imported_names: Vec::new(),
             id: client.id,
             name: client.name,
@@ -476,7 +587,9 @@ impl ClientView {
             inherited_discovery: None,
             config_error: client.error.is_some(),
             location_removable: client.location_removable,
+            location_kept_by_t3_code: client.location_kept_by_t3_code,
             claude_profile: client.claude_profile,
+            t3_code: client.t3_code,
         }
     }
 }
@@ -486,6 +599,8 @@ pub(super) struct ClientSnapshot {
     pub(super) profiles: Vec<ProfileView>,
     pub(super) sessions: Vec<serde_json::Value>,
     pub(super) sessions_error: bool,
+    /// T3 Code instances Toolport can't connect, for the T3 Code card.
+    pub(super) t3_others: Vec<crate::clients::T3CodeOther>,
 }
 
 fn default_access_display_label(registry: &Registry) -> String {
@@ -501,8 +616,10 @@ fn default_access_display_label(registry: &Registry) -> String {
         .and_then(|id| registry.profiles.iter().find(|profile| profile.id == id))
         .map(|profile| profile.name.as_str())
         .filter(|name| !name.trim().eq_ignore_ascii_case("default"));
+    // "Default access" next to a set named "Default" reads as the same
+    // choice, so the unnamed label says where the default comes from.
     name.map(|name| trf("Default access ({name})", &[("name", name)]))
-        .unwrap_or_else(|| tr("Default access"))
+        .unwrap_or_else(|| tr("Default access (from Settings)"))
 }
 
 fn client_access_label(registry: &Registry, scope: Option<&str>) -> String {
@@ -570,6 +687,27 @@ fn unreadable_session_history_is_optional_to_client_detection() {
     assert!(error);
 }
 
+/// Import candidates, counts and managed names under the one identity rule React gets
+/// from `detect_clients`, never by matching names.
+pub(super) fn apply_import_state(client: &mut ClientView, registry: &crate::registry::Registry) {
+    let Some(detected) = client.detected.as_mut() else {
+        return;
+    };
+    let configured = detected.servers.len();
+    let slots = crate::clients::importable_server_slots(&detected.0, registry);
+    // `movable_server_count` stays what the move migrates: every config server but
+    // the gateway, in Toolport already or not, as React counts it.
+    client.imported_names = crate::clients::managed_server_names(&detected.0, registry);
+    detected.1 = slots
+        .into_iter()
+        .map(|(index, server, key)| (server, index >= configured, key))
+        .collect();
+    detected.2 = crate::clients::unconfirmed_server_slots(&detected.0, registry)
+        .into_iter()
+        .map(|(index, server, key)| (server, index >= configured, key))
+        .collect();
+}
+
 pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
     let mut clients = crate::clients::detect_clients_for_display()?;
     let registry = crate::registry::load()?;
@@ -584,11 +722,7 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
         .map(ClientView::from_detected)
         .collect::<Vec<_>>();
     for client in &mut clients {
-        client.imported_names = registry
-            .servers
-            .iter()
-            .map(|s| s.name.to_lowercase())
-            .collect();
+        apply_import_state(client, &registry);
         client.shared_http = shared_http_clients.contains(&client.id);
         client.scope_id = registry
             .client_scopes
@@ -599,18 +733,15 @@ pub(super) fn detect_client_views() -> Result<ClientSnapshot, String> {
         client.discovery_mode = registry.client_discovery.get(&client.id).cloned();
         client.inherited_discovery = registry.chosen_global_discovery_mode().map(str::to_string);
     }
-    clients.sort_by(|left, right| {
-        right
-            .app_present
-            .cmp(&left.app_present)
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-    });
+    clients.sort_by(client_order);
     let (sessions, sessions_error) = client_session_history();
     Ok(ClientSnapshot {
         clients,
         profiles: client_access_options(&registry),
         sessions,
         sessions_error,
+        // Read off the main thread: it may look at an instance's home folder.
+        t3_others: crate::clients::t3_code_other_instances(),
     })
 }
 
@@ -627,6 +758,7 @@ pub(super) struct ServerView {
     pub(super) url: Option<String>,
     pub(super) cwd: Option<String>,
     pub(super) inherit_env: bool,
+    pub(super) hide_prompts: bool,
     pub(super) secret_keys: Vec<String>,
     /// Nonsecret environment values, editable in Edit server.
     pub(super) plain_env: Vec<PlainEnvView>,
@@ -748,6 +880,7 @@ impl RegistrySnapshot {
                     url: server.url.clone(),
                     cwd: server.cwd.clone(),
                     inherit_env: server.inherit_env,
+                    hide_prompts: server.hide_prompts,
                     secret_references: server
                         .env
                         .iter()
@@ -996,7 +1129,138 @@ fn connect_reload(monitor: &gio::FileMonitor, controller: Weak<RegistryControlle
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
+    fn mcp(
+        name: &str,
+        command: Option<&str>,
+        args: &[&str],
+        url: Option<&str>,
+    ) -> crate::clients::McpServer {
+        crate::clients::McpServer {
+            name: name.into(),
+            transport: if url.is_some() { "http" } else { "stdio" }.into(),
+            command: command.map(str::to_string),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            env_keys: Vec::new(),
+            url: url.map(str::to_string),
+        }
+    }
+
+    pub(in crate::linux_native) fn detected_fixture(
+        servers: Vec<crate::clients::McpServer>,
+        plugin_servers: Vec<crate::clients::McpServer>,
+    ) -> crate::clients::DetectedClient {
+        crate::clients::DetectedClient {
+            discovery: crate::clients::discovery_capabilities("fixture"),
+            id: "fixture".into(),
+            name: "Fixture".into(),
+            uses_connectors: false,
+            location_removable: false,
+            location_kept_by_t3_code: false,
+            config_path: String::new(),
+            config_exists: true,
+            app_present: true,
+            servers,
+            plugin_servers,
+            gateway_installed: false,
+            entry_state: crate::clients::GatewayEntryState::Absent,
+            error: None,
+            claude_profile: None,
+            t3_code: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn import_counts_and_names_follow_the_connection_not_the_name() {
+        let mut registry = crate::registry::Registry::default();
+        for (name, command, args) in [
+            (
+                "github",
+                "npx",
+                vec!["-y", "@modelcontextprotocol/server-github"],
+            ),
+            ("notes", "notes-mcp", vec![]),
+        ] {
+            let mut entry = crate::registry_controller::server_from_detected(
+                &mcp(name, Some(command), &args, None),
+                "other",
+            );
+            entry.id = name.into();
+            registry.servers.push(entry);
+        }
+        // Imported earlier with its token moved to the keychain.
+        let mut docs = crate::registry_controller::server_from_detected(
+            &mcp("docs", None, &[], Some("https://docs.example.invalid/mcp")),
+            "other",
+        );
+        docs.id = "docs".into();
+        docs.unknown_fields.insert(
+            "importedUrlKey".into(),
+            crate::secrets::IMPORTED_URL_KEY.into(),
+        );
+        registry.servers.push(docs);
+        let detected = detected_fixture(
+            vec![
+                mcp(
+                    "docs",
+                    None,
+                    &[],
+                    Some("https://docs.example.invalid/mcp?token=synthetic"),
+                ),
+                mcp(
+                    "github",
+                    None,
+                    &[],
+                    Some("https://api.githubcopilot.com/mcp/"),
+                ),
+                // Already in Toolport under another name.
+                mcp("my-notes", Some("notes-mcp"), &[], None),
+                mcp(
+                    crate::clients::GATEWAY_ENTRY_NAME,
+                    Some("toolport-gateway"),
+                    &[],
+                    None,
+                ),
+            ],
+            vec![
+                mcp("github", Some("npx"), &["-y", "@acme/github-mcp"], None),
+                mcp("linear", Some("linear-mcp"), &[], None),
+            ],
+        );
+        let mut client = super::ClientView::from_detected(detected);
+        super::apply_import_state(&mut client, &registry);
+        // "Move N servers" counts what the move migrates: every config server, those
+        // already in Toolport and the one only the keychain could match too, as React
+        // does. The gateway is not one.
+        assert_eq!(client.movable_server_count, 3);
+        assert_eq!(client.imported_names, ["my-notes"]);
+        // Only the keychain could tell; listed for review, not imported or counted.
+        let unconfirmed = &client.detected.as_ref().unwrap().2;
+        assert_eq!(
+            unconfirmed
+                .iter()
+                .map(|(server, plugin, _)| (server.name.as_str(), *plugin))
+                .collect::<Vec<_>>(),
+            [("docs", false)]
+        );
+        let importable = client
+            .detected
+            .as_ref()
+            .unwrap()
+            .1
+            .iter()
+            .map(|(server, plugin, _)| (server.name.as_str(), *plugin))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            importable,
+            [
+                ("github (2)", false),
+                ("github (3)", true),
+                ("linear", true)
+            ]
+        );
+    }
+
     #[test]
     fn snapshot_conversion_does_not_open_the_sync_receipt() {
         let data = crate::registry::DataDirTestEnv::new("gtk-snapshot-no-io");
@@ -1032,6 +1296,27 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("snapshot conversion must not wait for the receipt FIFO");
         assert_eq!(snapshot.servers[0].origin_label, "Sync conflict");
+    }
+
+    /// A Run from a server's Tools tab, as the gateway records it: GTK names it
+    /// as Toolport's Tools tab, not the process or the gateway it spawned.
+    #[test]
+    fn a_tools_tab_run_is_named_as_toolport() {
+        let snapshot = super::ActivitySnapshot::from_entries(
+            vec![serde_json::json!({
+                "client": "adapter:toolport-tools-tab",
+                "clientName": "toolport-gtk",
+                "clientLabel": "toolport-gateway 2.3.6",
+                "server": "slow", "tool": "echo", "ok": true, "durationMs": 9200,
+            })],
+            10,
+        );
+        let row = &snapshot.recent[0];
+        assert_eq!(row.client.as_deref(), Some("Toolport Tools tab"));
+        assert_eq!(row.client_label, None);
+        let detail = super::super::activity_detail(row);
+        assert!(detail.starts_with("Toolport Tools tab · "), "{detail}");
+        assert!(!detail.contains("toolport-"), "{detail}");
     }
 
     #[test]
@@ -1112,6 +1397,7 @@ mod tests {
             cwd: None,
             source: None,
             disabled_tools: Vec::new(),
+            hide_prompts: false,
             client_credentials: None,
             request_timeout_ms: None,
             initialize_timeout_ms: None,
@@ -1137,18 +1423,28 @@ mod tests {
     #[test]
     fn client_access_labels_show_migrated_default_all_and_missing_sets() {
         let mut registry = Registry::default();
-        assert_eq!(client_access_label(&registry, None), "Default access");
+        assert_eq!(
+            client_access_label(&registry, None),
+            "Default access (from Settings)"
+        );
         registry.default_access_profile_id = Some("default".into());
-        // The migrated set is named "Default", which would only repeat itself.
-        assert_eq!(client_access_label(&registry, None), "Default access");
+        // The migrated set is named "Default": "Default access" beside it would
+        // read as the same choice, so the label says where it comes from.
+        assert_eq!(
+            client_access_label(&registry, None),
+            "Default access (from Settings)"
+        );
         let options = client_access_options(&registry);
         assert_eq!(options[0].id, "");
-        assert_eq!(options[0].name, "Default access");
+        assert_eq!(options[0].name, "Default access (from Settings)");
         assert_eq!(options[1].id, "@all-enabled");
         registry.default_access_profile_id = None;
         registry.default_access_context_id = Some("default".into());
         registry.default_access_legacy_policy = true;
-        assert_eq!(client_access_label(&registry, Some("")), "Default access");
+        assert_eq!(
+            client_access_label(&registry, Some("")),
+            "Default access (from Settings)"
+        );
         assert_eq!(
             client_access_label(&registry, Some(crate::registry::ALL_ENABLED_ACCESS)),
             "All enabled servers"
@@ -1171,7 +1467,9 @@ mod tests {
             unknown_fields: Default::default(),
         });
         registry.servers.push(local);
-        registry.servers.push(server("remote", "GitHub", "http"));
+        let mut remote = server("remote", "GitHub", "http");
+        remote.hide_prompts = true;
+        registry.servers.push(remote);
         registry.set_global_server_enabled("remote", true).unwrap();
 
         let fingerprints = registry
@@ -1198,6 +1496,7 @@ mod tests {
                     url: None,
                     cwd: None,
                     inherit_env: false,
+                    hide_prompts: false,
                     secret_keys: vec!["TOKEN".into()],
                     plain_env: Vec::new(),
                     secret_references: Default::default(),
@@ -1219,6 +1518,7 @@ mod tests {
                     url: None,
                     cwd: None,
                     inherit_env: false,
+                    hide_prompts: true,
                     secret_keys: Vec::new(),
                     plain_env: Vec::new(),
                     secret_references: Default::default(),
@@ -1254,6 +1554,7 @@ mod tests {
             name: "Codex".into(),
             uses_connectors: false,
             location_removable: false,
+            location_kept_by_t3_code: false,
             discovery: crate::clients::discovery_capabilities("codex"),
             config_path: "/private/config.toml".into(),
             config_exists: true,
@@ -1271,6 +1572,7 @@ mod tests {
             entry_state: crate::clients::GatewayEntryState::Managed,
             error: None,
             claude_profile: None,
+            t3_code: Vec::new(),
         };
 
         let view = ClientView::from_detected(detected);
@@ -1281,6 +1583,50 @@ mod tests {
         assert!(!rendered.contains("/private"));
         assert!(!rendered.contains("secret-command"));
         assert!(!rendered.contains("SECRET_TOKEN"));
+    }
+
+    #[test]
+    fn activity_view_keeps_a_known_host_and_its_thread() {
+        let snapshot = ActivitySnapshot::from_entries(
+            vec![
+                serde_json::json!({
+                    "ts": 1, "server": "github", "tool": "a", "ok": true,
+                    "clientName": "Claude Code", "host": "t3-code",
+                    "hostThread": "465774fd-c52e-4b7e-9d5c-3f0f3a6f0a11"
+                }),
+                serde_json::json!({
+                    "ts": 2, "server": "github", "tool": "b", "ok": true,
+                    "clientName": "Codex", "host": "t3-code"
+                }),
+                serde_json::json!({
+                    "ts": 3, "server": "github", "tool": "c", "ok": true,
+                    "clientName": "Codex", "host": "elsewhere", "hostThread": "abc"
+                }),
+                serde_json::json!({
+                    "ts": 4, "server": "github", "tool": "d", "ok": true,
+                    "clientName": "Codex", "host": "t3-code", "hostThread": "bad id"
+                }),
+            ],
+            100,
+        );
+        let hosts = snapshot
+            .recent
+            .iter()
+            .map(|row| (row.host.as_deref(), row.host_thread.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hosts,
+            [
+                (
+                    Some("t3-code"),
+                    Some("465774fd-c52e-4b7e-9d5c-3f0f3a6f0a11")
+                ),
+                (Some("t3-code"), None),
+                (None, None),
+                (Some("t3-code"), None),
+            ]
+        );
+        assert_eq!(snapshot.recent[0].client.as_deref(), Some("Claude Code"));
     }
 
     #[test]
@@ -1400,15 +1746,14 @@ mod tests {
     }
 
     #[test]
-    fn activity_errors_are_single_line_and_bounded_for_cards() {
+    fn activity_errors_keep_their_whole_text_for_the_expanded_row() {
         let error = format!("first line\n{}", "private-ish detail ".repeat(30));
-        let summary = activity_error_summary(&error);
+        let text = activity_error_text(&error);
 
-        assert!(!summary.contains('\n'));
-        assert!(summary.chars().count() <= 181);
-        assert!(summary.ends_with('…'));
+        assert_eq!(text, error.trim());
+        assert!(!text.ends_with('…'));
         assert_eq!(
-            activity_error_summary(r#"{"errors":[{"message":"Authentication error"}]}"#),
+            activity_error_text(r#"{"errors":[{"message":"Authentication error"}]}"#),
             "Authentication error"
         );
     }

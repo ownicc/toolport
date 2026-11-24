@@ -5,11 +5,14 @@ import {
   eventSeverity,
   securityKey,
   selectSecurityEvents,
+  toolChangeAsksReview,
 } from "@/lib/securityReview";
 import { ToolChanges } from "./ToolChanges";
-import { activityClientName, clientIdentityTooltip } from "@/lib/clientIdentity";
+import { activityClientSegments, clientIdentityTooltip } from "@/lib/clientIdentity";
+import { hostedClientName } from "@/lib/hostAttribution";
+import { HostThreadChip } from "@/components/HostThreadChip";
 import { useWindowVisible } from "@/lib/windowVisible";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -24,6 +27,8 @@ import {
   Share2,
   ShieldAlert,
   ShieldCheck,
+  Ban,
+  Check,
   ShieldX,
   Clock,
   Undo2,
@@ -63,8 +68,10 @@ import {
   getSavingsSummary,
   getSearchTraces,
   getSecurityEvents,
+  getActivitySafety,
   getToolIdentities,
   openGatewayLog,
+  type ActivitySafety,
   type SecurityEvent,
 } from "@/lib/api";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -87,6 +94,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 /** A badge describing one security event by kind. */
 function eventBadge(e: SecurityEvent): { label: string; cls: string } {
@@ -203,17 +216,42 @@ function addDismissed(prev: Set<string>, keys: string[]): Set<string> {
 function SecurityResting() {
   const { t: tr } = useI18n();
   return (
-    <div className="mb-4 flex items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-2.5 text-meta text-muted-foreground">
-      <ShieldCheck className="size-4 shrink-0 text-owned" />
-      <span>
-        <span className="block font-semibold text-foreground">
-          {tr("Protection active.")}
-        </span>{" "}
-        {tr(
-          "Toolport is watching tool definitions and results. Nothing needs your attention right now.",
-        )}
-      </span>
-    </div>
+    <StatusCard
+      variant="success"
+      icon={<Check />}
+      title={tr("Protection active.")}
+      detail={tr(
+        "Toolport is watching tool definitions and results. Nothing needs your attention right now.",
+      )}
+      className="mb-4"
+    />
+  );
+}
+
+/** Safety Off with nothing blocked or held: say the state, never claim protection.
+ * Spec §4: Off is `ban`. */
+function SafetyOffNotice() {
+  const { t: tr } = useI18n();
+  return (
+    <StatusCard
+      icon={<Ban />}
+      title={tr("Safety is Off.")}
+      detail={tr("Toolport records tool changes but does not block them.")}
+      className="mb-4"
+    />
+  );
+}
+
+/** A collapsed list of tool-change records, the same bordered panel GTK draws. */
+function ToolChangeRecords({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <details className="group mb-4 rounded-xl border border-border bg-card px-4 py-3">
+      <summary className="flex cursor-pointer list-none items-center gap-2 text-sm [&::-webkit-details-marker]:hidden">
+        <ChevronRight className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
+        {label}
+      </summary>
+      <div className="mt-3">{children}</div>
+    </details>
   );
 }
 
@@ -486,6 +524,8 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
   const { t: tr, locale } = useI18n();
   const hasCatalog = (savings.tokenizedLoads ?? 0) > 0;
   const discovered = (savings.discoveryCount ?? 0) > 0;
+  // The signed formula stays exact; a negative result is labeled as a change, not savings.
+  const negative = savings.tokensSaved < 0;
   const method = tr(
     "The baseline is the full-mode tools array for the same allowed servers and policies at the first tools/list in each session. We count compact JSON and search response text with cl100k_base, then subtract every tools/list and search response. Sessionless HTTP, initial catalogs above known client limits, and older records are excluded. Client caching and formatting may change model usage; this is not a billing figure.",
   );
@@ -494,7 +534,9 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
     try {
       await navigator.clipboard.writeText(
         tr(
-          "Toolport measured {tokens} net tokens saved across {sessions} client sessions. Full catalog baselines minus all catalog and search responses, counted locally with cl100k_base; not a billing figure. toolport.app",
+          negative
+            ? "Toolport measured a net token change of {tokens} across {sessions} client sessions. Full catalog baselines minus all catalog and search responses, counted locally with cl100k_base; not a billing figure. toolport.app"
+            : "Toolport measured {tokens} net tokens saved across {sessions} client sessions. Full catalog baselines minus all catalog and search responses, counted locally with cl100k_base; not a billing figure. toolport.app",
           {
             tokens: fmtTokens(savings.tokensSaved),
             sessions: savings.tokenizedLoads ?? 0,
@@ -506,10 +548,16 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
       toastError(tr("Couldn't copy to clipboard"));
     }
   };
+  // Green only for a real saving; a net cost reads neutral, as in GTK.
+  const cost = hasCatalog && negative;
   return (
-    <div className="mb-6 toolport-alert border-success bg-success/8 p-4">
+    <div
+      className={`mb-6 toolport-alert p-4 ${cost ? "border-border bg-muted/20" : "border-success bg-success/8"}`}
+    >
       <div className="flex items-center gap-2">
-        <Sparkles className="size-4 text-success" />
+        <Sparkles
+          className={`size-4 ${cost ? "text-muted-foreground" : "text-success"}`}
+        />
         <span className="text-sm font-medium text-muted-foreground">
           {hasCatalog
             ? tr("Net tool description savings")
@@ -519,14 +567,23 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
         </span>
       </div>
       <div className="mt-2 flex flex-wrap items-end gap-x-6 gap-y-1">
-        <span className="text-3xl font-semibold tabular-nums text-success" title={method}>
+        <span
+          className={`text-3xl font-semibold tabular-nums ${cost ? "text-foreground" : "text-success"}`}
+          title={method}
+        >
           {hasCatalog
             ? fmtTokens(savings.tokensSaved)
             : discovered
               ? fmtBytes(savings.discoveryResponseBytes ?? 0)
               : tr("Not measured yet")}{" "}
           <span className="text-base font-normal text-muted-foreground">
-            {hasCatalog ? tr("net tokens saved") : discovered ? tr("discovery text") : ""}
+            {hasCatalog
+              ? negative
+                ? tr("net token change")
+                : tr("net tokens saved")
+              : discovered
+                ? tr("discovery text")
+                : ""}
           </span>
         </span>
       </div>
@@ -569,7 +626,9 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
           {hasCatalog && (
             <p>
               {tr(
-                "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net tokens saved.",
+                negative
+                  ? "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net token change. A negative change means responses used more tokens than the baseline."
+                  : "{baseline} baseline tokens − {catalog} catalog response tokens − {search} search response tokens = {net} net tokens saved.",
                 {
                   baseline: exact(savings.fullTokens),
                   catalog: exact(savings.exposedTokens),
@@ -628,7 +687,7 @@ function errCell(errors: number, errorRate: number) {
 
 /** One server row that expands to reveal its per-tool breakdown. */
 function ServerRow({ s }: { s: ServerStat }) {
-  const { t: tr } = useI18n();
+  const { t: tr, locale } = useI18n();
   const [open, setOpen] = useState(false);
   const tools = s.tools ?? [];
   const expandable = tools.length > 0;
@@ -651,11 +710,14 @@ function ServerRow({ s }: { s: ServerStat }) {
                 setOpen((o) => !o);
               }}
               aria-expanded={open}
-              className="flex min-w-0 items-center gap-1.5 rounded-sm text-left focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+              title={s.server}
+              // Bounded so a long name truncates instead of pushing the numbers
+              // out of a narrow window; the title keeps it whole.
+              className="flex max-w-[25vw] min-w-0 items-center gap-1.5 rounded-sm text-left focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
             >
               <ChevronRight
                 aria-hidden="true"
-                className={`size-3.5 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`}
+                className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`}
               />
               <span className="truncate">{s.server}</span>
               <span className="sr-only">
@@ -665,13 +727,18 @@ function ServerRow({ s }: { s: ServerStat }) {
               </span>
             </button>
           ) : (
-            <span className="flex min-w-0 items-center gap-1.5">
-              <span className="inline-block size-3.5" />
+            <span
+              title={s.server}
+              className="flex max-w-[25vw] min-w-0 items-center gap-1.5"
+            >
+              <span className="inline-block size-3.5 shrink-0" />
               <span className="truncate">{s.server}</span>
             </span>
           )}
         </td>
-        <td className="px-3 py-2 text-right tabular-nums">{s.calls}</td>
+        <td className="px-3 py-2 text-right tabular-nums">
+          {s.calls.toLocaleString(locale)}
+        </td>
         <td
           className={`px-3 py-2 text-right tabular-nums ${
             s.errors > 0 ? "text-destructive" : "text-muted-foreground"
@@ -696,7 +763,7 @@ function ServerRow({ s }: { s: ServerStat }) {
               {t.tool}
             </td>
             <td className="px-3 py-1.5 text-right text-xs tabular-nums text-muted-foreground">
-              {t.calls}
+              {t.calls.toLocaleString(locale)}
             </td>
             <td
               className={`px-3 py-1.5 text-right text-xs tabular-nums ${
@@ -798,8 +865,11 @@ function CallRow({ e }: { e: AuditEntry }) {
         ? { label: msg("Succeeded"), variant: "success" }
         : { label: msg("Failed"), variant: "destructive" };
   const duration = approvalOutcome ? e.heldMs : e.durationMs;
-  const meta = [
-    activityClientName(e),
+  // The client name truncates on its own so the time and duration stay visible.
+  const clientName = activityClientSegments(e, (name) => hostedClientName(name, e)).join(
+    " · ",
+  );
+  const when = [
     fmtAgo(e.ts),
     ...(e.failureKind ? [e.failureKind.replace(/_/g, " ")] : []),
     ...(duration == null
@@ -810,13 +880,14 @@ function CallRow({ e }: { e: AuditEntry }) {
             : fmtMs(duration),
         ]),
   ].join(" · ");
+  const meta = [clientName, when].filter(Boolean).join(" · ");
   const hasDetail = !approvalOutcome && !e.ok && (!!e.error || !!e.runId);
   return (
     <div
       className={`border-b border-border text-sm last:border-b-0 ${e.kind === "internal" ? "bg-muted/30" : ""}`}
     >
       <div
-        className={`flex min-h-14 items-center gap-3 px-4 py-3 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus-visible:outline-none ${
+        className={`@container flex min-h-14 items-center gap-3 px-4 py-3 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus-visible:outline-none ${
           hasDetail ? "cursor-pointer hover:bg-foreground/[0.04]" : ""
         }`}
         role={hasDetail ? "button" : undefined}
@@ -847,39 +918,50 @@ function CallRow({ e }: { e: AuditEntry }) {
         <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
           <RowIcon aria-hidden="true" className="size-4" />
         </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 items-center gap-2">
-            <span className="min-w-0 truncate font-medium">
-              {e.kind === "internal" ? internalActivityLabel(e.tool) : e.server}
-            </span>
-            {e.kind !== "internal" && (
-              <span className="min-w-0 truncate font-mono text-meta text-muted-foreground">
-                {e.tool}
+        {/* Narrow rows put the chips under the title and let the detail line wrap, so
+            neither squeezes the title. */}
+        <div className="flex min-w-0 flex-1 flex-col gap-1.5 @xl:flex-row @xl:items-center @xl:gap-3">
+          <div className="min-w-0 @xl:flex-1">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="min-w-0 truncate font-medium">
+                {e.kind === "internal" ? internalActivityLabel(e.tool) : e.server}
               </span>
-            )}
+              {e.kind !== "internal" && (
+                <span className="min-w-0 truncate font-mono text-meta text-muted-foreground">
+                  {e.tool}
+                </span>
+              )}
+            </div>
+            <div
+              className="mt-1 break-words text-meta text-muted-foreground @xl:flex @xl:min-w-0 @xl:overflow-hidden @xl:whitespace-nowrap"
+              title={[
+                meta,
+                clientIdentityTooltip(e),
+                e.client && tr("Client: {value}", { value: e.client }),
+                e.sessionId && tr("Session: {value}", { value: e.sessionId }),
+                e.runId && tr("Run: {value}", { value: e.runId }),
+                e.cold != null && (e.cold ? tr("cold catalog") : tr("warm catalog")),
+                e.dispatchMs != null &&
+                  tr("dispatch {duration}", { duration: fmtMs(e.dispatchMs) }),
+                e.kind === "internal" && tr("Toolport: {tool}", { tool: e.tool }),
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            >
+              <span className="@xl:min-w-0 @xl:truncate" dir="auto">
+                {clientName}
+              </span>
+              <span className="@xl:shrink-0 @xl:whitespace-pre">
+                {clientName ? ` · ${when}` : when}
+              </span>
+            </div>
           </div>
-          <div
-            className="mt-1 truncate text-meta text-muted-foreground"
-            title={[
-              meta,
-              clientIdentityTooltip(e),
-              e.client && tr("Client: {value}", { value: e.client }),
-              e.sessionId && tr("Session: {value}", { value: e.sessionId }),
-              e.runId && tr("Run: {value}", { value: e.runId }),
-              e.cold != null && (e.cold ? tr("cold catalog") : tr("warm catalog")),
-              e.dispatchMs != null &&
-                tr("dispatch {duration}", { duration: fmtMs(e.dispatchMs) }),
-              e.kind === "internal" && tr("Toolport: {tool}", { tool: e.tool }),
-            ]
-              .filter(Boolean)
-              .join(" · ")}
-            dir="auto"
-          >
-            {meta}
+          <div className="flex flex-wrap items-center gap-2 @xl:shrink-0 @xl:flex-nowrap">
+            <HostThreadChip row={e} />
+            <PiiBadge entry={e} />
+            <Badge variant={status.variant}>{tr(status.label)}</Badge>
           </div>
         </div>
-        <PiiBadge entry={e} />
-        <Badge variant={status.variant}>{tr(status.label)}</Badge>
       </div>
       {open && hasDetail && (
         <div className="border-t border-border bg-destructive/5 py-2 pr-4 pl-[86px]">
@@ -981,10 +1063,9 @@ export function TelemetryNotice({
 
 function StatsPanel({ stats }: { stats: AuditStats }) {
   const { t: tr, locale } = useI18n();
-  // The three summary cards are the glanceable health check and stay visible; the full
-  // per-server table (can be 20+ rows) collapses by default so it stops being a wall
-  // below the security lane. It's one tap when you actually want the breakdown.
-  const [tableOpen, setTableOpen] = useState(false);
+  // The per-server table is part of the page's main content, so it starts open (as in
+  // GTK); one tap folds it away.
+  const [tableOpen, setTableOpen] = useState(true);
   if (stats.total === 0) return null;
   const errPct = fmtPercent(stats.errorRate, { floorNonZero: stats.errors > 0 });
   // Surface how many servers have errors on the collapsed toggle: the aggregate error % can
@@ -1006,7 +1087,7 @@ function StatsPanel({ stats }: { stats: AuditStats }) {
           <div
             className={`text-2xl font-semibold tabular-nums ${stats.errors > 0 ? "text-destructive" : ""}`}
           >
-            {stats.errors}
+            {stats.errors.toLocaleString(locale)}
           </div>
           <div className="text-meta text-muted-foreground">
             {tr("errors ({value1})", { value1: errPct })}
@@ -1014,7 +1095,7 @@ function StatsPanel({ stats }: { stats: AuditStats }) {
         </div>
         <div className="rounded-lg border p-3">
           <div className="text-2xl font-semibold tabular-nums">
-            {stats.servers.length}
+            {stats.servers.length.toLocaleString(locale)}
           </div>
           <div className="text-meta text-muted-foreground">{tr("servers used")}</div>
         </div>
@@ -1859,13 +1940,23 @@ export function ActivityView({
   const [errorsOnly, setErrorsOnly] = useState(false);
   const [security, setSecurity] = useState<SecurityEvent[]>([]);
   const [securityLoadStatus, setSecurityLoadStatus] = useState<LoadStatus>("loading");
+  // Unknown keeps reviews on and claims neither Safety Off nor active protection.
+  const [safety, setSafety] = useState<ActivitySafety>({
+    toolChangeReviews: true,
+    blocksNothing: false,
+    reviewsConfirmed: false,
+  });
+  const reviewsEnabled = safety.toolChangeReviews;
   const [dismissed, setDismissed] = useState<Set<string>>(loadDismissed);
-  const [logOpen, setLogOpen] = useState(false);
+  // The call list is the page's main content: open by default, as in GTK.
+  const [logOpen, setLogOpen] = useState(true);
   // Distinguish a load FAILURE (gateway unreachable / audit log unreadable) from a
   // genuinely empty log: both leave `entries` empty, but only one is an error. Without
   // this, a first-run backend failure renders the friendly "No tool calls yet" state
   // and hides that anything is wrong.
   const [auditLoadStatus, setAuditLoadStatus] = useState<LoadStatus>("loading");
+  // The real cause of a failed audit read, shown as the error's cause line.
+  const [auditError, setAuditError] = useState<string | null>(null);
   // Local reload trigger: bumped after a "Clear retained activity" so the panels
   // refetch (they'd otherwise keep showing the just-deleted rows until the parent's
   // refreshKey next changes).
@@ -1998,9 +2089,12 @@ export function ActivityView({
         if (!alive || generation !== auditGeneration.current) return;
         setEntries(e);
         setAuditLoadStatus("ready");
+        setAuditError(null);
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (!alive || generation !== auditGeneration.current) return;
+        // Tauri rejects with the command's message; an Error carries it in `message`.
+        setAuditError(error instanceof Error ? error.message : String(error));
         // Never replace a last-known audit trail with a false empty state.
         setAuditLoadStatus((status) =>
           status === "ready" || status === "stale" ? "stale" : "error",
@@ -2021,41 +2115,51 @@ export function ActivityView({
           status === "ready" || status === "stale" ? "stale" : "error",
         );
       });
-    getSecurityEvents(2000)
-      .then((s) => {
+    // Safety and security events land in one render: the Off card hides when a
+    // tool is held, so it must never pair fresh events with an older Safety
+    // answer. Rust decides from the registry on disk; any failure keeps reviews on.
+    void Promise.allSettled([getActivitySafety(), getSecurityEvents(2000)]).then(
+      ([safetyResult, eventsResult]) => {
         if (!alive) return;
-        setSecurity((previous) =>
-          JSON.stringify(previous) === JSON.stringify(s) ? previous : s,
-        );
-        setSecurityLoadStatus("ready");
-      })
-      .catch(() => {
-        if (!alive) return;
-        // A failed refresh must preserve prior findings and must never produce the
-        // reassuring verified-empty state.
-        setSecurityLoadStatus((status) =>
-          status === "ready" || status === "stale" ? "stale" : "error",
-        );
-      });
+        const answer = safetyResult.status === "fulfilled" ? safetyResult.value : null;
+        setSafety({
+          toolChangeReviews: answer?.toolChangeReviews !== false,
+          blocksNothing:
+            answer?.toolChangeReviews === false && answer.blocksNothing === true,
+          reviewsConfirmed:
+            answer?.toolChangeReviews === true && answer.reviewsConfirmed === true,
+        });
+        if (eventsResult.status === "fulfilled") {
+          const s = eventsResult.value;
+          setSecurity((previous) =>
+            JSON.stringify(previous) === JSON.stringify(s) ? previous : s,
+          );
+          setSecurityLoadStatus("ready");
+        } else {
+          // A failed refresh must preserve prior findings and must never produce
+          // the reassuring verified-empty state.
+          setSecurityLoadStatus((status) =>
+            status === "ready" || status === "stale" ? "stale" : "error",
+          );
+        }
+      },
+    );
     return () => {
       alive = false;
     };
   }, [liveKey, reloadTick, windowVisible]);
 
-  // Export the full retained audit log. The save dialog offers CSV and JSON; the
-  // chosen extension picks the format. CSV is formula-injection-safe in the backend.
-  async function exportLog() {
+  // Export the full retained audit log in the format picked from the Export menu;
+  // the save dialog offers that format only. CSV is formula-injection-safe in the
+  // backend.
+  async function exportLog(format: "csv" | "json") {
     try {
       const path = await save({
         title: tr("Export activity log"),
-        defaultPath: "toolport-activity.csv",
-        filters: [
-          { name: "CSV", extensions: ["csv"] },
-          { name: "JSON", extensions: ["json"] },
-        ],
+        defaultPath: `toolport-activity.${format}`,
+        filters: [{ name: format.toUpperCase(), extensions: [format] }],
       });
       if (!path) return;
-      const format = path.toLowerCase().endsWith(".json") ? "json" : "csv";
       await exportAuditToPath(path, format);
       toast.success(tr("Exported activity log"));
     } catch (e) {
@@ -2082,13 +2186,33 @@ export function ActivityView({
     e.type !== "tool_poison_flag" &&
     e.type !== "result_injection" &&
     e.type !== "result_injection_blocked";
+  // With nothing able to block, verified-unblocked tool changes are plain history.
   const toolChanges = useMemo(
-    () => liveSecurity.filter((e) => e.type === "tool_drift" && !e.historical),
-    [liveSecurity],
+    () =>
+      liveSecurity.filter(
+        (e) =>
+          e.type === "tool_drift" &&
+          !e.historical &&
+          toolChangeAsksReview(e, reviewsEnabled),
+      ),
+    [liveSecurity, reviewsEnabled],
   );
   const olderToolChanges = useMemo(
-    () => liveSecurity.filter((e) => e.type === "tool_drift" && e.historical),
-    [liveSecurity],
+    () =>
+      liveSecurity.filter(
+        (e) =>
+          e.type === "tool_drift" &&
+          e.historical &&
+          toolChangeAsksReview(e, reviewsEnabled),
+      ),
+    [liveSecurity, reviewsEnabled],
+  );
+  const recordedToolChanges = useMemo(
+    () =>
+      liveSecurity.filter(
+        (e) => e.type === "tool_drift" && !toolChangeAsksReview(e, reviewsEnabled),
+      ),
+    [liveSecurity, reviewsEnabled],
   );
   const highSecurity = liveSecurity.filter(
     (e) => e.type !== "tool_drift" && eventSeverity(e) === "high" && !isNewTool(e),
@@ -2117,6 +2241,16 @@ export function ActivityView({
       {securityLoadStatus !== "ready" ? (
         <SecurityLoadNotice status={securityLoadStatus} onRetry={retryLoads} />
       ) : null}
+      {/* Safety Off says what state you are in first, and only while nothing on this
+          screen or in the stores is blocked or held. Notices block nothing at Off,
+          so they follow the card. */}
+      {!reviewsEnabled &&
+      safety.blocksNothing &&
+      securityLoadStatus === "ready" &&
+      toolChanges.length === 0 &&
+      olderToolChanges.length === 0 ? (
+        <SafetyOffNotice />
+      ) : null}
       {toolChanges.length > 0 ? (
         <ToolChanges
           events={toolChanges}
@@ -2126,22 +2260,36 @@ export function ActivityView({
         />
       ) : null}
       {olderToolChanges.length > 0 ? (
-        <details className="mb-4 rounded-lg border border-border p-4">
-          <summary className="cursor-pointer text-sm">
-            {olderToolChanges.length}{" "}
-            {tr("older tool-change records. Open history to review them.")}
-          </summary>
+        <ToolChangeRecords
+          label={`${olderToolChanges.length} ${tr("older tool-change records. Open history to review them.")}`}
+        >
           <ToolChanges
             events={olderToolChanges}
             registry={registry}
             onAccept={dismissAllSecurity}
             onReview={onReviewQuarantine}
           />
-        </details>
+        </ToolChangeRecords>
+      ) : null}
+      {recordedToolChanges.length > 0 ? (
+        <ToolChangeRecords
+          label={tr("{value0} tool-change records", {
+            value0: recordedToolChanges.length,
+          })}
+        >
+          <ToolChanges
+            events={recordedToolChanges}
+            registry={registry}
+            onAccept={dismissAllSecurity}
+            history
+          />
+        </ToolChangeRecords>
       ) : null}
       {highSecurity.length > 0 ? (
         <SecurityNotices events={highSecurity} onDismiss={dismissSecurity} />
-      ) : securityLoadStatus === "ready" && toolChanges.length === 0 ? (
+      ) : safety.reviewsConfirmed &&
+        securityLoadStatus === "ready" &&
+        toolChanges.length === 0 ? (
         <SecurityResting />
       ) : null}
       {infoSecurity.length > 0 ? (
@@ -2168,21 +2316,65 @@ export function ActivityView({
         (savings.previousReportedTokensSaved ?? 0) !== 0) ? (
         <SavingsBanner savings={savings} />
       ) : null}
+      {/* Both count reloadTick, so Clear empties them too (both keys only grow). */}
       <DiscoveryTraces
-        refreshKey={liveKey}
+        refreshKey={liveKey + reloadTick}
         searches={
           (entries ?? []).filter((e) => e.kind === "internal" && e.tool === "search")
             .length
         }
       />
       <ToolIdentities refreshKey={liveKey} />
-      {registry?.liveInspect ? <LiveInspector refreshKey={liveKey} /> : null}
+      {registry?.liveInspect ? <LiveInspector refreshKey={liveKey + reloadTick} /> : null}
     </>
   );
 
   const servers = useMemo(
     () => [...new Set((entries ?? []).map((e) => e.server))].sort(),
     [entries],
+  );
+
+  // Export and Clear stay in the page header on every Activity state, as in GTK.
+  const headerActions = (
+    <PageHeaderActions>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            variant="outline"
+            title={tr("Export the full activity log to a file (CSV or JSON)")}
+          >
+            <Download className="size-4" aria-hidden="true" />
+            {tr("Export")}
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuItem onSelect={() => void exportLog("json")}>
+            {tr("Export JSON")}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => void exportLog("csv")}>
+            {tr("Export CSV")}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <ConfirmDialog
+        trigger={
+          <Button
+            variant="destructive"
+            title={tr("Delete all retained activity kept on this device")}
+          >
+            <Trash2 className="size-4" aria-hidden="true" />
+            {tr("Clear")}
+          </Button>
+        }
+        title={tr("Clear retained activity?")}
+        description={tr(
+          "Permanently deletes everything Toolport keeps on this device: the audit log, discovery search traces, live-inspection captures, and the savings tally (including its running total). Nothing is sent anywhere; each log starts fresh on the next event. This can't be undone.",
+        )}
+        confirmLabel={tr("Clear activity")}
+        destructive
+        onConfirm={clearActivity}
+      />
+    </PageHeaderActions>
   );
 
   const visible = (entries ?? []).filter(
@@ -2194,6 +2386,7 @@ export function ActivityView({
   if (entries === null && auditLoadStatus === "loading") {
     return (
       <div>
+        {headerActions}
         {banner}
         <SkeletonRows label={tr("Loading activity…")} />
       </div>
@@ -2203,12 +2396,11 @@ export function ActivityView({
   if (entries === null && auditLoadStatus === "error") {
     return (
       <div>
+        {headerActions}
         {banner}
         <ErrorCallout
           title={tr("Couldn't load activity")}
-          cause={tr(
-            "Toolport couldn't reach the gateway or read the audit log. This is not an empty log, if the gateway isn't running, start it and refresh.",
-          )}
+          cause={auditError ?? undefined}
           onRetry={retryLoads}
           retryAriaLabel={tr("Retry activity log")}
           onViewLog={() =>
@@ -2224,6 +2416,7 @@ export function ActivityView({
   if (entries === null) {
     return (
       <div>
+        {headerActions}
         {banner}
         <ErrorCallout
           title={tr("Activity status is unavailable. Retry the activity log.")}
@@ -2238,6 +2431,7 @@ export function ActivityView({
     // One card: the stale notice already says the refresh failed and offers Retry.
     return (
       <div>
+        {headerActions}
         {banner}
         <StatusCard
           role="alert"
@@ -2265,6 +2459,7 @@ export function ActivityView({
   if (entries.length === 0) {
     return (
       <div>
+        {headerActions}
         {banner}
         <EmptyState
           icon={<ScrollText />}
@@ -2284,6 +2479,7 @@ export function ActivityView({
 
   return (
     <div>
+      {headerActions}
       {banner}
       {auditLoadStatus === "stale" && <AuditStaleNotice onRetry={retryLoads} />}
       {stats && <StatsPanel stats={stats} />}
@@ -2302,38 +2498,12 @@ export function ActivityView({
             {tr("latest {count}", { count: entries.length })}
           </span>
         </button>
-        <PageHeaderActions>
-          <Button
-            variant="outline"
-            onClick={() => void exportLog()}
-            title={tr("Export the full activity log to a file (CSV or JSON)")}
-          >
-            <Download className="size-4" aria-hidden="true" />
-            {tr("Export")}
-          </Button>
-          <ConfirmDialog
-            trigger={
-              <Button
-                variant="destructive"
-                title={tr("Delete all retained activity kept on this device")}
-              >
-                <Trash2 className="size-4" aria-hidden="true" />
-                {tr("Clear")}
-              </Button>
-            }
-            title={tr("Clear retained activity?")}
-            description={tr(
-              "Permanently deletes everything Toolport keeps on this device: the audit log, discovery search traces, live-inspection captures, and the savings tally (including its running total). Nothing is sent anywhere; each log starts fresh on the next event. This can't be undone.",
-            )}
-            confirmLabel={tr("Clear activity")}
-            destructive
-            onConfirm={clearActivity}
-          />
-        </PageHeaderActions>
       </div>
 
       <p className="mb-2 text-meta text-muted-foreground">
-        {stats
+        {/* The total only when the log holds more calls than the list has entries,
+            so the two numbers never contradict (as in GTK). */}
+        {stats && stats.total > entries.length
           ? tr(
               stats.total === 1
                 ? "{count} call recorded on this computer. "
@@ -2343,16 +2513,24 @@ export function ActivityView({
           : ""}
         {logOpen
           ? visible.length === entries.length
-            ? tr("Showing the latest {count}.", {
-                count: visible.length.toLocaleString(locale),
-              })
-            : tr("Showing {matching} matching rows from the latest {total}.", {
-                matching: visible.length.toLocaleString(locale),
-                total: entries.length.toLocaleString(locale),
-              })
-          : tr("Latest {count} available.", {
-              count: entries.length.toLocaleString(locale),
-            })}
+            ? entries.length === 1
+              ? tr("Showing the latest entry.")
+              : tr("Showing the latest {count} entries.", {
+                  count: visible.length.toLocaleString(locale),
+                })
+            : visible.length === 1
+              ? tr("Showing 1 matching entry from the latest {total}.", {
+                  total: entries.length.toLocaleString(locale),
+                })
+              : tr("Showing {matching} matching entries from the latest {total}.", {
+                  matching: visible.length.toLocaleString(locale),
+                  total: entries.length.toLocaleString(locale),
+                })
+          : entries.length === 1
+            ? tr("Latest entry available.")
+            : tr("Latest {count} entries available.", {
+                count: entries.length.toLocaleString(locale),
+              })}
       </p>
 
       {logOpen && (
@@ -2396,9 +2574,11 @@ export function ActivityView({
                 icon={<Search />}
                 title={
                   errorsOnly && !serverFilter
-                    ? tr("No errors in the last {value1} calls.", {
-                        value1: entries.length,
-                      })
+                    ? entries.length === 1
+                      ? tr("No errors in the latest entry.")
+                      : tr("No errors in the latest {count} entries.", {
+                          count: entries.length.toLocaleString(locale),
+                        })
                     : tr("No calls match this filter.")
                 }
                 action={

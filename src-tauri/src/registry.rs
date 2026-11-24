@@ -264,7 +264,10 @@ pub(crate) fn append_lines_with_outcome(
     };
     let mut bytes = String::new();
     for line in lines {
-        bytes.push_str(line);
+        // The persistence boundary for every locked append-only log: no resolved
+        // secret value is written, whatever field carried it.
+        let line = crate::secret_redact::redact_line_for(path, line);
+        bytes.push_str(&line);
         if !line.ends_with('\n') {
             bytes.push('\n');
         }
@@ -825,6 +828,13 @@ pub struct ServerEntry {
     /// an empty list means every tool the server advertises is exposed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_tools: Vec<String>,
+    /// Keep this server's MCP prompts out of the gateway's `prompts/list` and
+    /// refuse `prompts/get` for them, while its tools and resources stay
+    /// available. Clients such as Claude Code turn prompts into slash commands,
+    /// so this lets a user drop a server's commands without losing its tools.
+    /// Default (false, omitted on save) exposes prompts as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hide_prompts: bool,
     /// Headless outbound OAuth for an HTTP server (SBS-524). Presence of this
     /// block is what selects the client-credentials flow; absence leaves
     /// interactive OAuth and pasted-token behaviour exactly as before.
@@ -1462,6 +1472,12 @@ pub struct ManagedEntry {
     /// Unix epoch seconds when we last wrote this entry.
     #[serde(default)]
     pub updated_at: u64,
+    /// Codex entry settings Toolport has already handled for this entry: written
+    /// once, or found set by the user. Startup repair adds only keys missing from this
+    /// list, so a key the user later deletes stays deleted. Kept here, in Toolport's
+    /// own state, never in the client's config.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codex_settings: Vec<String>,
     /// Fields from newer builds, preserved on every registry save.
     #[serde(flatten)]
     pub unknown_fields: serde_json::Map<String, serde_json::Value>,
@@ -1509,6 +1525,7 @@ impl ManagedEntry {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            codex_settings: Vec::new(),
             unknown_fields: Default::default(),
         }
     }
@@ -2724,6 +2741,16 @@ impl Registry {
             || self.team_forced_block_on_injection
             || self.kept().block_on_injection
     }
+    /// Whether Activity asks the user to review or accept tool changes. Only when
+    /// nothing can be blocked (effective level Off, no kept or team-forced
+    /// quarantine or injection block) are changes shown as plain history, and only
+    /// those verified unblocked (`integrity::tool_change_asks_review`). Both shells
+    /// read it through `tool_change_reviews_now`.
+    pub fn tool_change_reviews_enabled(&self) -> bool {
+        self.safety_level_effective() != SafetyLevel::Off
+            || self.quarantine_on_drift_effective()
+            || self.block_on_injection_effective()
+    }
     /// Whether this server should fail closed on a high-confidence injection hit:
     /// block mode effective, and the server is not on the exempt list.
     pub fn should_block_injection_for(&self, server: &str) -> bool {
@@ -3227,6 +3254,18 @@ impl Drop for DataDirOverride {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
+}
+
+/// The installed [`DataDirOverride`], if any. Never resolves the real directory.
+#[cfg(any(debug_assertions, test, feature = "test-support"))]
+pub(crate) fn data_dir_override() -> Option<PathBuf> {
+    if !DATA_DIR_OVERRIDE_ACTIVE.load(Ordering::SeqCst) {
+        return None;
+    }
+    DATA_DIR_OVERRIDE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// Resolve the data dir and cache it: the container check and the UNC
@@ -4769,19 +4808,23 @@ impl Drop for LockTimeoutOverride {
     }
 }
 
-fn lock_for(path: &Path, timeout: std::time::Duration) -> Result<FileLock, String> {
+fn open_lock_file(path: &Path) -> Result<std::fs::File, String> {
     let lock_error = |error| {
         format!("Could not open the registry lock at {}: {error}. Toolport requires a writable data directory to load safely. Check directory permissions or choose a writable TOOLPORT_DATA_DIR, then try again.", lock_path(path).display())
     };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(lock_error)?;
     }
-    let file = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(lock_path(path))
-        .map_err(lock_error)?;
+        .map_err(lock_error)
+}
+
+fn lock_for(path: &Path, timeout: std::time::Duration) -> Result<FileLock, String> {
+    let file = open_lock_file(path)?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match file.try_lock_exclusive() {
@@ -4847,7 +4890,78 @@ pub fn update_authoritative<T>(
 /// agent toggle (which interleaves audit + early returns), and the integrity pins/quarantine
 /// stores (SOU-165). Hold the returned guard across the entire read-decide-write.
 pub fn lock_at(path: &Path) -> Result<FileLock, String> {
+    if TRIES_LOCKS_ONCE.get() {
+        return try_lock_once(path);
+    }
     lock_for(path, registry_lock_timeout())
+}
+
+thread_local! {
+    static TRIES_LOCKS_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LOCK_BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make [`lock_at`] on the calling thread try each lock once instead of waiting
+/// up to the store deadline. Only the telemetry writer sets this. A holder that
+/// rotates a log fsyncs the rewrite under the lock, which on slow storage (macOS
+/// `F_FULLFSYNC` on a busy disk) can outlast any fixed deadline. Giving up there
+/// dropped the batch, and waiting there stalled every other log behind it. The
+/// writer instead keeps a busy log's batch for a later pass, checking
+/// [`take_lock_busy`] to tell contention apart from a failed write.
+pub(crate) fn try_locks_once_on_this_thread() {
+    TRIES_LOCKS_ONCE.set(true);
+}
+
+/// Whether the last [`lock_at`] on this thread found its lock held elsewhere,
+/// clearing the flag. Meaningful only after [`try_locks_once_on_this_thread`].
+pub(crate) fn take_lock_busy() -> bool {
+    LOCK_BUSY.replace(false)
+}
+
+fn try_lock_once(path: &Path) -> Result<FileLock, String> {
+    let file = open_lock_file(path)?;
+    #[cfg(test)]
+    let result = match injected_lock_error(path) {
+        Some(error) => Err(error),
+        None => file.try_lock_exclusive(),
+    };
+    #[cfg(not(test))]
+    let result = file.try_lock_exclusive();
+    result.map_err(|error| {
+        // Only contention is worth a retry. Any other failure (ENOLCK on a
+        // network share, for one) is a failed write and is counted as one.
+        let busy = error.raw_os_error().is_some()
+            && error.raw_os_error() == fs2::lock_contended_error().raw_os_error();
+        LOCK_BUSY.set(busy);
+        format!(
+            "Could not take the lock at {}: {error}",
+            lock_path(path).display()
+        )
+    })?;
+    Ok(FileLock(file))
+}
+
+/// Lock paths whose next try-once attempts fail with the given OS error.
+#[cfg(test)]
+static INJECTED_LOCK_ERRORS: std::sync::Mutex<Vec<(PathBuf, i32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn inject_lock_error_for_test(path: &Path, raw_os_error: i32) {
+    INJECTED_LOCK_ERRORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((path.to_path_buf(), raw_os_error));
+}
+
+#[cfg(test)]
+fn injected_lock_error(path: &Path) -> Option<std::io::Error> {
+    INJECTED_LOCK_ERRORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(injected, _)| injected == path)
+        .map(|(_, code)| std::io::Error::from_raw_os_error(*code))
 }
 
 /// Acquire an explicit-path lock with a caller-appropriate contention deadline.
@@ -4870,6 +4984,105 @@ pub fn update_at<T>(
     crate::personal_sync::record(&before, &mut reg)?;
     save_to(path, &reg)?;
     Ok((reg, out))
+}
+
+/// `Registry::tool_change_reviews_enabled` for the registry on disk. Reviews stop
+/// only when the primary registry file itself was read: a load failure, a backup
+/// or a first-run default keeps them on, so an older saved Off never hides one.
+pub fn tool_change_reviews_now() -> bool {
+    tool_change_reviews_state().0
+}
+
+/// `(reviews, confirmed)` from one load. `reviews` is [`tool_change_reviews_now`];
+/// `confirmed` is true only when an authoritative read (the file, or a genuine
+/// first run) found reviews on, so Activity may say protection is active.
+pub fn tool_change_reviews_state() -> (bool, bool) {
+    match load_resolved_with_source() {
+        Ok((registry, LoadSource::File)) => {
+            let reviews = registry.tool_change_reviews_enabled();
+            (reviews, reviews)
+        }
+        Ok((registry, LoadSource::FirstRun)) => (true, registry.tool_change_reviews_enabled()),
+        _ => (true, false),
+    }
+}
+
+/// Largest registry read whole for change detection; a bigger file contributes
+/// its length plus its first and last chunks.
+const REGISTRY_STAMP_CAP: u64 = 4 * 1024 * 1024;
+const REGISTRY_STAMP_CHUNK: usize = 64 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes [`registry_content_stamp`] read on this thread, for the size cap test.
+    pub(crate) static REGISTRY_STAMP_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A digest of the resolved registry's content for Activity change detection.
+/// A Safety change can keep the file's length and land in one timestamp tick, so
+/// metadata alone can miss it. Never blocks (non-blocking open, regular files only)
+/// and never reads more than the cap. A missing registry is stable; anything that
+/// cannot be read safely returns a fresh value, so caches re-read instead of
+/// trusting stale state.
+pub fn registry_content_stamp() -> u64 {
+    use std::hash::{Hash, Hasher};
+    use std::io::{Read, Seek, SeekFrom};
+    static CHANGED: AtomicU64 = AtomicU64::new(0);
+    let changed = || {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        ("unreadable", CHANGED.fetch_add(1, Ordering::Relaxed)).hash(&mut hash);
+        hash.finish()
+    };
+    let Some(path) = resolved_path() else {
+        return 0;
+    };
+    let mut options = std::fs::File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A FIFO or device at the registry path must not block Activity.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(_) => return changed(),
+    };
+    // Check the opened handle, not the path, so a swap cannot slip in a FIFO.
+    let Ok(metadata) = file.metadata() else {
+        return changed();
+    };
+    if !metadata.is_file() {
+        return changed();
+    }
+    let len = metadata.len();
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    len.hash(&mut hash);
+    let capped = len > REGISTRY_STAMP_CAP;
+    if capped {
+        metadata.modified().ok().hash(&mut hash);
+    }
+    let mut read = |file: &mut std::fs::File, limit: u64| -> std::io::Result<()> {
+        let mut bytes = Vec::new();
+        file.take(limit).read_to_end(&mut bytes)?;
+        #[cfg(test)]
+        REGISTRY_STAMP_READ.with(|read| read.set(read.get() + bytes.len() as u64));
+        bytes.hash(&mut hash);
+        Ok(())
+    };
+    let chunk = REGISTRY_STAMP_CHUNK as u64;
+    let result = if !capped {
+        read(&mut file, REGISTRY_STAMP_CAP)
+    } else {
+        read(&mut file, chunk)
+            .and_then(|()| file.seek(SeekFrom::End(-(chunk as i64))).map(|_| ()))
+            .and_then(|()| read(&mut file, chunk))
+    };
+    match result {
+        Ok(()) => hash.finish(),
+        Err(_) => changed(),
+    }
 }
 
 /// The path the registry actually resolves to, honoring `TOOLPORT_REGISTRY`
@@ -5564,6 +5777,7 @@ pub(crate) mod tests {
             url: None,
             source: Some("manual".to_string()),
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -6208,6 +6422,7 @@ pub(crate) mod tests {
             transport: "stdio".into(),
             url: None,
             updated_at: 42,
+            codex_settings: Vec::new(),
             unknown_fields: Default::default(),
         };
         r.set_client_managed_entry("claude-desktop", entry.clone());
@@ -6551,6 +6766,33 @@ pub(crate) mod tests {
         assert!(json.contains("\"inheritEnv\":true"), "{json}");
         let back: ServerEntry = serde_json::from_str(&json).unwrap();
         assert!(back.inherit_env);
+        assert_eq!(back, on);
+    }
+
+    /// `hidePrompts` is additive like `inheritEnv`: an entry written before it
+    /// existed loads with prompts exposed and saves without the key, and an
+    /// entry that opts in keeps the `true`. It must never land in
+    /// `unknown_fields`, or the gateway would ignore it.
+    #[test]
+    fn hide_prompts_is_additive_and_round_trips() {
+        let server = sample_server("avalonia-docs");
+        assert!(!server.hide_prompts);
+        let json = serde_json::to_string(&server).unwrap();
+        assert!(
+            !json.contains("hidePrompts"),
+            "unset hidePrompts must not be serialized: {json}"
+        );
+        let loaded: ServerEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, server);
+        assert_eq!(serde_json::to_string(&loaded).unwrap(), json);
+
+        let mut on = server;
+        on.hide_prompts = true;
+        let json = serde_json::to_string(&on).unwrap();
+        assert!(json.contains("\"hidePrompts\":true"), "{json}");
+        let back: ServerEntry = serde_json::from_str(&json).unwrap();
+        assert!(back.hide_prompts);
+        assert!(!back.unknown_fields.contains_key("hidePrompts"));
         assert_eq!(back, on);
     }
 
@@ -7767,6 +8009,7 @@ pub(crate) mod tests {
             url: None,
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -7835,6 +8078,76 @@ pub(crate) mod tests {
             std::fs::read_to_string(backup_path(&path)).unwrap(),
             good_bytes
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_content_stamp_never_blocks_and_caps_its_read() {
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("reg-content-stamp");
+        let path = dir.join("registry.json");
+        assert_eq!(resolved_path().as_deref(), Some(path.as_path()));
+        // Missing is stable; content changes of the same length count.
+        assert_eq!(registry_content_stamp(), registry_content_stamp());
+        std::fs::write(&path, r#"{"safetyLevel":"ask"}"#).unwrap();
+        let ask = registry_content_stamp();
+        assert_eq!(registry_content_stamp(), ask);
+        std::fs::write(&path, r#"{"safetyLevel":"off"}"#).unwrap();
+        assert_ne!(registry_content_stamp(), ask);
+        // A FIFO at the registry path returns at once, as "changed" each time.
+        std::fs::remove_file(&path).unwrap();
+        let fifo = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (done, finished) = std::sync::mpsc::channel();
+        // The override is process-global, so the worker sees the scratch dir.
+        std::thread::spawn(move || {
+            let _ = done.send((registry_content_stamp(), registry_content_stamp()));
+        });
+        let (first, second) = finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a FIFO registry must not block the stamp");
+        assert_ne!(first, second);
+        std::fs::remove_file(&path).unwrap();
+        // An oversized file reads only its first and last chunks.
+        let big = std::fs::File::create(&path).unwrap();
+        big.set_len(REGISTRY_STAMP_CAP + 1024 * 1024).unwrap();
+        drop(big);
+        REGISTRY_STAMP_READ.with(|read| read.set(0));
+        let stamp = registry_content_stamp();
+        assert_eq!(
+            REGISTRY_STAMP_READ.with(std::cell::Cell::get),
+            2 * REGISTRY_STAMP_CHUNK as u64
+        );
+        assert_eq!(registry_content_stamp(), stamp);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tool_change_reviews_stay_on_unless_the_primary_registry_was_read() {
+        let _data = data_dir_test_lock();
+        let (dir, _override) = scratch_data_dir("reg-reviews-source");
+        let path = dir.join("registry.json");
+        assert_eq!(resolved_path().as_deref(), Some(path.as_path()));
+        let mut reg = Registry::default();
+        reg.set_safety_level(SafetyLevel::Off);
+        save_to(&path, &reg).unwrap();
+        assert!(
+            !tool_change_reviews_now(),
+            "a read Off primary stops reviews"
+        );
+        reg.set_safety_level(SafetyLevel::Ask);
+        save_to(&path, &reg).unwrap();
+        assert!(tool_change_reviews_now());
+        // The backup now holds the earlier Off. An unreadable Ask primary (here a
+        // directory, so the read fails without root bypassing it) must not let
+        // that backup turn reviews off.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let (backup, source) = load_resolved_with_source().unwrap();
+        assert_eq!(source, LoadSource::Backup);
+        assert!(!backup.tool_change_reviews_enabled());
+        assert!(tool_change_reviews_now(), "a backup read keeps reviews on");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -8725,6 +9038,7 @@ mod registry_version_tests {
             url: None,
             source: Some("manual".to_string()),
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -9177,6 +9491,60 @@ mod safety_level_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tool_change_reviews_stop_only_when_nothing_can_block() {
+        let off = || {
+            let mut r = Registry::default();
+            r.set_safety_level(SafetyLevel::Off);
+            r
+        };
+        assert!(!off().tool_change_reviews_enabled());
+        for level in [SafetyLevel::Ask, SafetyLevel::Strict] {
+            let mut r = Registry::default();
+            r.set_safety_level(level);
+            assert!(r.tool_change_reviews_enabled(), "{level:?}");
+        }
+        for floor in [SafetyLevel::Ask, SafetyLevel::Strict] {
+            let mut r = off();
+            r.team_min_safety_level = floor;
+            assert!(r.tool_change_reviews_enabled(), "team floor {floor:?}");
+        }
+        let mut r = off();
+        r.team_forced_human_approval = true;
+        assert!(r.tool_change_reviews_enabled());
+        let mut r = off();
+        r.team_forced_quarantine_on_drift = true;
+        assert!(r.tool_change_reviews_enabled());
+        let mut r = off();
+        r.team_forced_block_on_injection = true;
+        assert!(r.tool_change_reviews_enabled());
+        for kept in [
+            KeptV1Safety {
+                quarantine_on_drift: true,
+                ..Default::default()
+            },
+            KeptV1Safety {
+                block_on_injection: true,
+                ..Default::default()
+            },
+        ] {
+            let mut r = off();
+            r.kept_v1_safety = Some(kept);
+            assert!(r.tool_change_reviews_enabled(), "{kept:?}");
+        }
+        // A 1.x registry that has not migrated: approval off, quarantine on.
+        let mut v1 = Registry {
+            version: 1,
+            safety_level: None,
+            human_approval: false,
+            confirm_destructive: false,
+            ..Registry::default()
+        };
+        assert!(!v1.tool_change_reviews_enabled());
+        v1.quarantine_on_drift = true;
+        assert!(v1.tool_change_reviews_enabled());
     }
 
     #[test]

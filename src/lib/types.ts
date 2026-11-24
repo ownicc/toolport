@@ -29,6 +29,8 @@ export type GatewayEntryState = "managed" | "customized" | "absent";
 
 export interface DetectedClient {
   locationRemovable?: boolean;
+  /** A T3 Code home T3 Code still lists: Remove location is shown disabled, with why. */
+  locationKeptByT3Code?: boolean;
   id: string;
   name: string;
   usesConnectors: boolean;
@@ -56,6 +58,51 @@ export interface DetectedClient {
   error: string | null;
   /** Set on each Claude Code profile when this machine has several of them. */
   claudeProfile?: ClaudeProfile;
+  /** T3 Code instances that run this client as a provider. Omitted when none. */
+  t3Code?: T3CodeUse[];
+  /** What Import would add under the backend's connection identity rule, each named
+   * as it would be saved (`github (2)` beside an unrelated `github`). */
+  importableServers?: McpServer[];
+  /** Connection keys of `importableServers`, comparable across clients. */
+  importableKeys?: string[];
+  /** Lowercased names of this client's servers already in Toolport. */
+  managedServerNames?: string[];
+  /** Servers only the keychain could match to Toolport's; review checks them. */
+  unconfirmedServers?: McpServer[];
+  /** Connection keys of `unconfirmedServers`, as review items carry them. */
+  unconfirmedKeys?: string[];
+}
+
+/** A T3 Code instance that uses a client row (src-tauri/src/clients/t3code.rs). */
+export interface T3CodeUse {
+  instanceId: string;
+  displayName: string;
+  enabled: boolean;
+}
+
+/** A T3 Code instance Toolport cannot connect (src-tauri/src/clients/t3code.rs). */
+export interface T3CodeOther {
+  instanceId: string;
+  /** The provider as T3 Code names it, such as "Muse Code". */
+  providerName: string;
+  displayName: string;
+  enabled: boolean;
+  /** `unsupported`: no Toolport client yet. `unreadable`: T3 Code's settings file can't be read.
+   * `malformed`: this instance's entry or config can't be read. `hiddenHome`: its home
+   * folder variable is sensitive or not plain text. `relativeHome`: its home folder is a
+   * relative path. `outsideHome`: its home folder isn't inside the user's home (judged by
+   * its text alone). `linkedHome`: its home folder or config file is a link or not a plain
+   * folder or file. `missingHome`: its home folder doesn't exist yet. `providerName` is
+   * empty when the driver can't be shown. */
+  gap:
+    | "unsupported"
+    | "unreadable"
+    | "malformed"
+    | "hiddenHome"
+    | "relativeHome"
+    | "outsideHome"
+    | "linkedHome"
+    | "missingHome";
 }
 
 /** What tells one Claude Code profile apart (src-tauri/src/clients/claude_profiles.rs). */
@@ -84,6 +131,10 @@ export interface ClientSetupReview {
   backupDir: string;
   revision: string;
   items: ImportItem[];
+  /** TOML lines Toolport adds to its own entry for this client, each only when unset. */
+  gatewaySettings?: string[];
+  /** Reading this review asked to unlock the keyring and the ask was dismissed. */
+  keyringAsked?: boolean;
 }
 
 export interface MigrateResult {
@@ -96,8 +147,15 @@ export interface MigrateResult {
   outcome: WriteOutcome;
 }
 
+/** The app hosting a client, such as `t3-code`, and its thread id. Display only; the
+ * stored `client` id is unchanged. */
+export interface HostAttribution {
+  host?: string | null;
+  hostThread?: string | null;
+}
+
 /** Retained transport observations. Reported labels are never app identity. */
-export interface ClientSession {
+export interface ClientSession extends HostAttribution {
   sessionId: string;
   client?: string;
   clientName: string;
@@ -119,9 +177,13 @@ export interface ClientActivity extends Partial<ClientSession> {
   lastActiveMs?: number;
   callsToday?: number | null;
   sessionCount?: number;
+  /** Some of this client's retained activity came through T3 Code. */
+  viaT3Code?: boolean;
+  /** How many of its sessions T3 Code hosted, when `viaT3Code`. */
+  t3CodeSessions?: number;
 }
 
-export interface AuditEntry {
+export interface AuditEntry extends HostAttribution {
   /** Approval outcomes are Activity events, never dispatched calls. */
   kind?: string;
   decision?: string;
@@ -261,6 +323,8 @@ export interface ProbeResult {
       | "conflict";
     target?: string;
   } | null;
+  /** Not checked: the server keeps values in a locked keyring. */
+  keyringLocked?: boolean;
 }
 
 /** A tool as advertised by a downstream MCP server (raw `tools/list` entry). */
@@ -419,9 +483,13 @@ export interface ImportItem {
   command: string | null;
   args: string[];
   url: string | null;
-  /** False if a server with this name is already present (import skips it). */
+  /** False if a server with this connection is already in Toolport (import skips it). */
   isNew: boolean;
   updates?: string[];
+  /** The client's own name when `name`, the name the import saves, differs. */
+  sourceName?: string;
+  /** Opaque connection id matching `DetectedClient.importableKeys`. */
+  connection?: string;
 }
 
 export interface CatalogSearch {
@@ -533,6 +601,9 @@ export interface ServerEntry {
   /** Pass the user's whole shell environment to this stdio server instead of
    * the default allowlist. Servers migrated from 1.x start with it on. */
   inheritEnv?: boolean;
+  /** Keep this server's MCP prompts out of clients' prompt lists (often shown
+   * as slash commands) while its tools stay available. Unset = exposed. */
+  hidePrompts?: boolean;
   /** Headless outbound OAuth (SBS-524). Present = this server uses the
    * client-credentials flow instead of the interactive browser one. */
   clientCredentials?: ClientCredentials | null;
@@ -578,7 +649,7 @@ export interface FolderProfile {
 }
 
 /** A tool call held awaiting a human decision (the HITL approval queue). */
-export interface PendingApproval {
+export interface PendingApproval extends HostAttribution {
   id: string;
   clientName?: string;
   client: string | null;
@@ -824,11 +895,14 @@ export function hasLegacyBearerArgv(server: McpServer): boolean {
 
 /** Servers a client has (config + plugins) that Toolport doesn't manage yet.
  * These are the only client-side entries worth surfacing - they're import
- * candidates. Toolport's own gateway entry is never importable. */
+ * candidates. Toolport's own gateway entry is never importable. Detection sends
+ * them from the backend, which matches connections rather than names; the name
+ * match below only serves clients without that field (test fixtures). */
 export function importableServers(
   client: DetectedClient,
   registry: Registry | null,
 ): McpServer[] {
+  if (client.importableServers) return client.importableServers;
   const have = new Set((registry?.servers ?? []).map((s) => s.name.toLowerCase()));
   return [...client.servers, ...client.pluginServers].filter(
     (server) =>

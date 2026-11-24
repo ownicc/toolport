@@ -2272,6 +2272,80 @@
       }
     },
     {
+      "id": "workbuddy",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://www.workbuddy.ai/docs/zh/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/Connector",
+      "observedSessionKind": null,
+      "clientVersion": null,
+      "recordedAt": null,
+      "uncaptured": {
+        "recordedAt": "2026-11-18",
+        "clientVersion": null,
+        "reason": "WorkBuddy is a signed-in desktop app with no headless CLI, so no unattended capture was recorded."
+      },
+      "evidenceLevel": "documentation only",
+      "features": {
+        "roots": {
+          "status": "unverified"
+        },
+        "sampling": {
+          "status": "unverified"
+        },
+        "elicitation": {
+          "status": "unverified"
+        },
+        "resources": {
+          "status": "unverified"
+        },
+        "prompts": {
+          "status": "unverified"
+        }
+      }
+    },
+    {
+      "id": "workbuddy-ai",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://www.workbuddy.ai/docs/workbuddy/From-Beginner-to-Expert-Guide/Function-Description/Connector",
+      "observedSessionKind": null,
+      "clientVersion": null,
+      "recordedAt": null,
+      "uncaptured": {
+        "recordedAt": "2026-11-18",
+        "clientVersion": null,
+        "reason": "WorkBuddy AI is a signed-in desktop app with no headless CLI, so no unattended capture was recorded."
+      },
+      "evidenceLevel": "documentation only",
+      "features": {
+        "roots": {
+          "status": "unverified"
+        },
+        "sampling": {
+          "status": "unverified"
+        },
+        "elicitation": {
+          "status": "unverified"
+        },
+        "resources": {
+          "status": "unverified"
+        },
+        "prompts": {
+          "status": "unverified"
+        }
+      }
+    },
+    {
       "id": "tabnine",
       "evidence": "documentation only",
       "initialize": null,
@@ -2288,6 +2362,43 @@
         "recordedAt": "2026-10-22",
         "clientVersion": null,
         "reason": "No official headless Linux CLI package was found (the npm `tabnine` package is not Tabnine's)."
+      },
+      "evidenceLevel": "documentation only",
+      "features": {
+        "roots": {
+          "status": "unverified"
+        },
+        "sampling": {
+          "status": "unverified"
+        },
+        "elicitation": {
+          "status": "unverified"
+        },
+        "resources": {
+          "status": "unverified"
+        },
+        "prompts": {
+          "status": "unverified"
+        }
+      }
+    },
+    {
+      "id": "tabnine-cli",
+      "evidence": "documentation only",
+      "initialize": null,
+      "initialMethods": [],
+      "listChanged": {
+        "supported": null,
+        "detail": "unverified"
+      },
+      "source": "https://docs.tabnine.com/main/getting-started/tabnine-cli/features/mcp-server-config",
+      "observedSessionKind": null,
+      "clientVersion": null,
+      "recordedAt": null,
+      "uncaptured": {
+        "recordedAt": "2026-11-15",
+        "clientVersion": null,
+        "reason": "Tabnine CLI needs a signed-in Tabnine account, so no unattended capture was recorded."
       },
       "evidenceLevel": "documentation only",
       "features": {

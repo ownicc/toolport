@@ -163,17 +163,21 @@ run_with_timeout() {
 # "Waiting on notarization" line and no notarytool log (SOU-309).
 notarytool_submit() {
   local artifact="$1" kind="$2"
-  local submit_secs attempt out rc id
+  local submit_secs attempt out rc id err_file http_error
   submit_secs="$(duration_to_seconds "$NOTARIZE_SUBMIT_TIMEOUT")"
+  err_file="$WORK/notarytool-submit-$kind.err"
 
   for attempt in 1 2; do
     log "Submitting the $kind for notarization (timeout $NOTARIZE_SUBMIT_TIMEOUT, attempt $attempt/2)"
     set +e
     out="$(run_with_timeout "$submit_secs" xcrun notarytool submit "$artifact" \
       --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
-      --output-format json)"
+      --output-format json 2>"$err_file")"
     rc=$?
     set -e
+    if [[ -s "$err_file" ]]; then
+      cat "$err_file" >&2
+    fi
     if [[ $rc -eq 0 ]]; then
       id="$(printf '%s\n' "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)"
       if [[ -n "$id" ]]; then
@@ -184,6 +188,15 @@ notarytool_submit() {
         "$kind" "$artifact" >&2
       printf '%s\n' "$out" >&2
       die "notarytool submit returned no submission id for the $kind"
+    fi
+    # Apple answered with a client error (an expired agreement, bad credentials, a
+    # wrong team). Retrying or re-running the release cannot fix that, so say so.
+    # 408 and 429 are transient and fall through to the retry.
+    http_error="$(grep -Eo 'HTTP status code: 4[0-9]{2}.*' "$err_file" 2>/dev/null | grep -Ev 'code: (408|429)' | head -n 1 || true)"
+    if [[ -n "$http_error" ]]; then
+      printf '::error::Apple rejected the notarytool submit for the %s: %s Fix the Apple Developer account or the signing secrets; re-running the release will fail the same way until then.\n' \
+        "$kind" "$http_error" >&2
+      die "notarytool submit was rejected by Apple for the $kind; do not retry until the account issue is fixed"
     fi
     if [[ $attempt -eq 1 ]]; then
       log "notarytool submit for the $kind failed or timed out (exit $rc); retrying once"
@@ -228,18 +241,14 @@ xcrun stapler validate "$APP" || die "stapler validate failed on the app"
 
 # ---------------------------------------------------------------------------
 # 5. Build, sign, notarize, staple the .dmg (from the stapled app).
-#    Plain UDZO image via hdiutil (no extra deps). Styling can be layered on
-#    later; correctness/notarization is what matters for the release.
+#    The window shows Toolport.app beside an Applications shortcut over a
+#    background that says to drag one onto the other (macos-build-dmg.sh).
 # ---------------------------------------------------------------------------
 log "Building + notarizing the dmg"
 DMG_DIR="$REPO_ROOT/src-tauri/target/$TARGET/release/bundle/dmg"
 mkdir -p "$DMG_DIR"
 DMG="$DMG_DIR/Toolport_${TARGET}.dmg"
-rm -f "$DMG"
-# hdiutil's own size estimate can come up short for the larger 2.0 app
-# ("No space left on device"), so size the image from the app plus headroom.
-DMG_SIZE_MB=$(( $(du -sm "$APP" | cut -f1) * 5 / 4 + 64 ))
-hdiutil create -volname "Toolport" -srcfolder "$APP" -size "${DMG_SIZE_MB}m" -ov -format UDZO "$DMG"
+bash "$SCRIPT_DIR/macos-build-dmg.sh" "$APP" "$DMG"
 codesign --force --timestamp -s "$APPLE_SIGNING_IDENTITY" "$DMG"
 notarize "$DMG" "dmg"
 xcrun stapler staple "$DMG"

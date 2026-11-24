@@ -14,6 +14,8 @@ fn isolated_command(root: &std::path::Path, data: &std::path::Path) -> Command {
         }
     }
     let home = root.join("home");
+    // A real account has a home directory in which removal writes its report.
+    std::fs::create_dir_all(&home).expect("create isolated account home");
     command
         .env("TOOLPORT_TEST_ROOT", &home)
         .env("TOOLPORT_DATA_DIR", data)
@@ -169,6 +171,8 @@ fn purge_override_with_registry_preserves_user_files_for_both_brand_overrides() 
         .unwrap();
         for name in [
             "backups/tax.zip",
+            "backups/personal/tax.zip",
+            "backups/notes/original-report.json",
             "bin/personal-script",
             "logs/other-app.log",
             "daemon-notes.json",
@@ -206,6 +210,8 @@ fn purge_override_with_registry_preserves_user_files_for_both_brand_overrides() 
         );
         for name in [
             "backups/tax.zip",
+            "backups/personal/tax.zip",
+            "backups/notes/original-report.json",
             "bin/personal-script",
             "logs/other-app.log",
             "daemon-notes.json",
@@ -215,12 +221,18 @@ fn purge_override_with_registry_preserves_user_files_for_both_brand_overrides() 
                 "user bytes",
                 "{name}"
             );
+            // Unknown folders are preserved and reported as a unit.
+            let reported = match name {
+                "backups/personal/tax.zip" => "backups/personal",
+                "backups/notes/original-report.json" => "backups/notes",
+                other => other,
+            };
             assert!(
                 report["preserved"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|entry| entry.as_str().unwrap().contains(name)),
+                    .any(|entry| entry.as_str().unwrap().contains(reported)),
                 "{name}"
             );
         }
@@ -267,7 +279,7 @@ fn purge_global_option_proceeds_with_corrupt_registry() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn purge_missing_desktop_bus_keeps_registry_for_credential_retry() {
+fn purge_missing_desktop_bus_keeps_only_the_registry_for_credential_retry() {
     let env = conduit_lib::registry::DataDirTestEnv::new("purge_cli_bus_retry");
     let data = env.dir.join("Toolport");
     let runtime = env.dir.join("runtime");
@@ -275,8 +287,8 @@ fn purge_missing_desktop_bus_keeps_registry_for_credential_retry() {
     std::fs::create_dir(&runtime).unwrap();
     let registry = serde_json::to_vec(&conduit_lib::registry::Registry::default()).unwrap();
     std::fs::write(data.join("registry.json"), &registry).unwrap();
-    std::fs::write(data.join("secrets.enc"), "fixture").unwrap();
     for key in ["", "selected-file-backend"] {
+        std::fs::write(data.join("secrets.enc"), "fixture").unwrap();
         let output = isolated_command(&env.dir, &data)
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("TOOLPORT_SECRET_KEY", key)
@@ -289,8 +301,10 @@ fn purge_missing_desktop_bus_keeps_registry_for_credential_retry() {
             .as_str()
             .unwrap()
             .contains("credential cleanup not done"));
+        // The keyring could not be checked, so the registry stays for a retry.
+        // Everything else that is Toolport's goes, the file secrets included.
         assert_eq!(std::fs::read(data.join("registry.json")).unwrap(), registry);
-        assert!(data.join("secrets.enc").exists());
+        assert!(!data.join("secrets.enc").exists());
     }
     std::fs::remove_dir(runtime).unwrap();
     let output = isolated_command(&env.dir, &data)
@@ -782,4 +796,59 @@ fn in_process_client_discovery_requires_test_root() {
     let _restore = RestoreRoot(std::env::var_os("TOOLPORT_TEST_ROOT"));
     std::env::remove_var("TOOLPORT_TEST_ROOT");
     conduit_lib::clients::detect_clients();
+}
+
+// A confirmed removal inventories the OS credential store. On Linux the
+// fixture has no session bus, so it never reaches a keyring; on macOS and
+// Windows it would query the runner's real Keychain or Credential Manager.
+// Opening the report file is covered on every platform by the purge unit tests.
+#[cfg(target_os = "linux")]
+#[test]
+fn confirmed_removal_persists_the_console_report_in_the_users_home() {
+    let env = conduit_lib::registry::DataDirTestEnv::new("purge_cli_report");
+    let data = env.dir.join("Toolport");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("registry.json"),
+        serde_json::to_vec(&conduit_lib::registry::Registry::default()).unwrap(),
+    )
+    .unwrap();
+    let output = isolated_command(&env.dir, &data)
+        .args(["--remove-data", "--confirm"])
+        .env("TOOLPORT_SECRET_KEY", "purge-fixture-key")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let console: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let reports: Vec<_> = std::fs::read_dir(env.dir.join("home"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("Toolport-removal-report-")
+        })
+        .collect();
+    assert_eq!(reports.len(), 1);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(reports[0].path()).unwrap()).unwrap();
+    assert_eq!(saved, console);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(reports[0].path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    assert!(!data.join("registry.json").exists());
 }

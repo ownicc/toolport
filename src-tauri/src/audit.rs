@@ -38,6 +38,9 @@ pub fn try_clear() -> std::io::Result<()> {
     let Some(path) = audit_path() else {
         return Ok(());
     };
+    // Under the appenders' and the scrub's lock, so neither can put cleared
+    // lines back.
+    let _lock = crate::registry::lock_at(&path).map_err(std::io::Error::other)?;
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -155,6 +158,7 @@ pub fn record_routed_call(
     client_label: Option<&str>,
     args_hash: Option<&str>,
     pii: Option<PiiPass>,
+    secrets_replaced: Option<&std::collections::BTreeMap<String, usize>>,
 ) {
     let mut entry = timed_entry(
         &crate::router::sanitize_segment(server_id),
@@ -169,6 +173,12 @@ pub fn record_routed_call(
     );
     if let Some(label) = client_label.and_then(crate::approval::sanitize_client_label) {
         entry["clientLabel"] = json!(label);
+    }
+    // Which configured secrets the result carried, by name and count: the values
+    // themselves never reach the log. Named for what it counts: replacements in
+    // the result sent to the client, not in logs or other output.
+    if let Some(replaced) = secrets_replaced.filter(|m| !m.is_empty()) {
+        entry["secretsReplacedInResult"] = json!(replaced);
     }
     if let Err(error) = crate::team_activity::record(reg, server_id, ok) {
         eprintln!("Toolport: Teams activity could not be persisted: {error}");
@@ -253,7 +263,8 @@ fn timed_entry(
     }
     if !ok {
         if let Some(err) = error {
-            let trimmed: String = err.trim().chars().take(MAX_AUDIT_ERR_CHARS).collect();
+            // Redact before cutting: a cut first could keep part of a secret.
+            let trimmed = crate::secret_redact::truncate_chars(err.trim(), MAX_AUDIT_ERR_CHARS);
             if !trimmed.is_empty() {
                 entry["error"] = json!(trimmed);
             }
@@ -549,8 +560,9 @@ fn client_activity_from_entries(
 ) -> Vec<Value> {
     fill_session_clients(&mut entries);
     let names = crate::clients::CallerNames::for_entries(&entries);
-    let mut groups =
-        std::collections::BTreeMap::<String, (Value, std::collections::HashSet<String>)>::new();
+    type Sessions = std::collections::HashSet<String>;
+    // Per client: its summary, its sessions, and the sessions T3 Code hosted.
+    let mut groups = std::collections::BTreeMap::<String, (Value, Sessions, Sessions)>::new();
     for entry in entries {
         let call = tool_call_ok(&entry).is_some();
         if !call
@@ -567,16 +579,24 @@ fn client_activity_from_entries(
             entry["clientLabel"].as_str(),
         );
         let ts = entry["ts"].as_u64().unwrap_or(0);
-        let (summary, sessions) = groups.entry(name).or_insert_with(|| (json!({
+        let (summary, sessions, hosted) = groups.entry(name).or_insert_with(|| (json!({
             "client":entry["client"], "clientName":entry["clientName"], "clientLabel":entry["clientLabel"],
             "lastActiveMs":0, "callsToday": if since_ms.is_some() { json!(0) } else { Value::Null }
-        }), Default::default()));
+        }), Default::default(), Default::default()));
         summary["lastActiveMs"] = json!(summary["lastActiveMs"].as_u64().unwrap_or(0).max(ts));
         if call && since_ms.is_some_and(|since| ts >= since) {
             summary["callsToday"] = json!(summary["callsToday"].as_u64().unwrap_or(0) + 1);
         }
+        let via_t3 = entry["host"].as_str() == Some(crate::host_attribution::T3_CODE);
         if let Some(id) = entry["sessionId"].as_str() {
             sessions.insert(id.to_string());
+            if via_t3 {
+                hosted.insert(id.to_string());
+            }
+        }
+        if via_t3 {
+            // Rows grouped per client drop the host, so keep how much came through T3 Code.
+            summary["viaT3Code"] = json!(true);
         }
         if summary.get("firstCatalogSize").is_none() && entry["firstCatalogSize"].is_u64() {
             summary["firstCatalogSize"] = entry["firstCatalogSize"].clone();
@@ -584,8 +604,11 @@ fn client_activity_from_entries(
     }
     let mut rows: Vec<Value> = groups
         .into_values()
-        .map(|(mut row, sessions)| {
+        .map(|(mut row, sessions, hosted)| {
             row["sessionCount"] = json!(sessions.len());
+            if row["viaT3Code"] == json!(true) {
+                row["t3CodeSessions"] = json!(hosted.len());
+            }
             row
         })
         .collect();
@@ -736,6 +759,14 @@ fn fill_session_clients(entries: &mut [Value]) {
 pub fn activity_client_name(mut entry: Value, names: &crate::clients::CallerNames) -> Value {
     if !entry.is_object() {
         return entry;
+    }
+    // Toolport's own Tools tab reports the gateway it spawned; that adds nothing.
+    if entry["client"].as_str() == Some(&format!("adapter:{}", crate::clients::TOOLS_TAB_CLIENT_ID))
+    {
+        if let Some(entry) = entry.as_object_mut() {
+            entry.remove("clientLabel");
+            entry.remove("clientName");
+        }
     }
     if entry.get("client").is_some() || entry.get("clientName").is_some() {
         entry["clientName"] = json!(names.trusted_name(
@@ -1085,6 +1116,32 @@ fn csv_cell(value: Option<&Value>) -> String {
 mod tests {
 
     #[test]
+    fn client_activity_keeps_how_many_sessions_came_through_t3_code() {
+        let rows = client_activity_from_entries(
+            vec![
+                json!({"kind":"session","sessionId":"a","clientName":"Claude Code","host":"t3-code","ts":30}),
+                json!({"sessionId":"a","clientName":"Claude Code","host":"t3-code","ts":31,"ok":true}),
+                json!({"sessionId":"b","clientName":"Claude Code","host":"t3-code","ts":40,"ok":true}),
+                json!({"sessionId":"c","clientName":"Claude Code","ts":50,"ok":true}),
+                // Another host, or none, is not counted as T3 Code.
+                json!({"sessionId":"d","clientName":"Codex","host":"other","ts":20,"ok":true}),
+                json!({"clientName":"Cursor","host":"t3-code","ts":10,"ok":true}),
+            ],
+            64,
+            None,
+        );
+        let row = |name: &str| rows.iter().find(|row| row["clientName"] == name).unwrap();
+        assert_eq!(row("Claude Code")["sessionCount"], 3);
+        assert_eq!(row("Claude Code")["t3CodeSessions"], 2);
+        assert_eq!(row("Claude Code")["viaT3Code"], true);
+        assert!(row("Codex").get("t3CodeSessions").is_none());
+        assert!(row("Codex").get("viaT3Code").is_none());
+        // Hosted calls without a session still say they came through T3 Code.
+        assert_eq!(row("Cursor")["viaT3Code"], true);
+        assert_eq!(row("Cursor")["t3CodeSessions"], 0);
+    }
+
+    #[test]
     fn client_activity_groups_sessions_and_counts_only_todays_tool_calls() {
         let rows = client_activity_from_entries(
             vec![
@@ -1167,6 +1224,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
         }
         let rows = read_all().unwrap();
@@ -1192,6 +1250,50 @@ mod tests {
     }
 
     #[test]
+    fn a_call_row_names_the_secrets_its_result_carried() {
+        let _lock = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("toolport-secrets-row-{}", std::process::id()));
+        let _data = crate::registry::DataDirOverride::set(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let replaced: std::collections::BTreeMap<String, usize> =
+            [("API_KEY".to_string(), 2)].into_iter().collect();
+        record_routed_call(
+            &crate::registry::Registry::default(),
+            "srv",
+            "read",
+            true,
+            Some(5),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&replaced),
+        );
+        record_routed_call(
+            &crate::registry::Registry::default(),
+            "srv",
+            "plain",
+            true,
+            Some(5),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&Default::default()),
+        );
+        let rows = read_recent(10).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let read = rows.iter().find(|r| r["tool"] == "read").unwrap();
+        assert_eq!(read["secretsReplacedInResult"], json!({"API_KEY": 2}));
+        let plain = rows.iter().find(|r| r["tool"] == "plain").unwrap();
+        assert!(plain.get("secretsReplacedInResult").is_none(), "{plain}");
+    }
+
+    #[test]
     fn p08b_r1_hyphenated_call_and_approval_share_activity_server() {
         let _lock = crate::registry::data_dir_test_lock();
         let dir = std::env::temp_dir().join(format!("toolport-p08b-r1-{}", std::process::id()));
@@ -1205,6 +1307,7 @@ mod tests {
             Some(850),
             None,
             Some("adapter:claude-code"),
+            None,
             None,
             None,
             None,
@@ -1712,10 +1815,17 @@ mod tests {
                 );
             }
             // The parent reads only after this process exits, so land every queued
-            // line here instead of relying on the writer's next interval.
-            assert!(crate::telemetry::flush_for_test(
-                std::time::Duration::from_secs(5)
-            ));
+            // line here instead of relying on the writer's next interval. Wait for
+            // the writer to finish rather than guess how long a sibling's rotation
+            // fsync takes; the parent bounds this process if it hangs.
+            assert!(crate::telemetry::flush_for_test(std::time::Duration::MAX));
+            // A completed flush only means the writer finished; a failed locked
+            // append is counted, not raised. Report it here, where it happened.
+            assert_eq!(
+                crate::telemetry::health(),
+                crate::telemetry::Health::default(),
+                "audit stress child {child_id} did not persist every record"
+            );
             return;
         }
 
@@ -1732,6 +1842,9 @@ mod tests {
         let executable = std::env::current_exe().unwrap();
         for child_id in 0..CHILDREN {
             let ready = root.join(format!("ready-{child_id}"));
+            // Keep each child's panic message; the parent reports it on failure.
+            let stderr = std::fs::File::create(root.join(format!("child-{child_id}.stderr")))
+                .expect("create audit stress child stderr");
             fixture.children.push(
                 std::process::Command::new(&executable)
                     .args([
@@ -1743,8 +1856,13 @@ mod tests {
                     .env("TOOLPORT_AUDIT_STRESS_PATH", &path)
                     .env("TOOLPORT_AUDIT_STRESS_READY", ready)
                     .env("TOOLPORT_AUDIT_STRESS_GO", &go)
+                    // The writer must wait out a sibling's rotation however long
+                    // its fsync takes, never fall back to the store deadline and
+                    // drop the batch. A tiny deadline makes any fallback show here
+                    // instead of only on a slow disk.
+                    .env("TOOLPORT_LOCK_TIMEOUT_MS", "1")
                     .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
+                    .stderr(stderr)
                     .spawn()
                     .expect("spawn independent audit appender"),
             );
@@ -1758,10 +1876,11 @@ mod tests {
         std::fs::write(&go, "go").unwrap();
         for (child_id, child) in fixture.children.iter_mut().enumerate() {
             let status = wait_for_child(child, "audit stress child");
-            assert!(
-                status.success(),
-                "audit stress child {child_id} failed: {status}"
-            );
+            if !status.success() {
+                let stderr = std::fs::read_to_string(root.join(format!("child-{child_id}.stderr")))
+                    .unwrap_or_else(|error| format!("<stderr unavailable: {error}>"));
+                panic!("audit stress child {child_id} failed: {status}\nchild stderr:\n{stderr}");
+            }
         }
 
         let content = std::fs::read_to_string(&path).unwrap();

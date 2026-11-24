@@ -47,6 +47,14 @@ There is no Toolport-specific update command, and the app never self-updates.
 Whatever `pacman -Syu` installs is what you run; `pacman -Q toolport` prints the
 installed version.
 
+## Moving from toolport-bin
+
+`toolport-bin` was never published, so a copy you built yourself gets no
+updates. Run the four manual commands under Install, and answer yes when
+`pacman -Syu toolport` asks to remove `toolport-bin`. Your settings in
+`~/.config/Toolport` stay. The one-line installer cannot answer that prompt
+for you, so use the manual commands here.
+
 ## Remove
 
 ```sh
@@ -62,11 +70,11 @@ sudo pacman-key --delete A16BFA2E1014BD6BD718CC6E6621247E3FFA6AA7
 
 ## Notes
 
-- The package conflicts with the AUR `toolport-bin` and replaces
-  `toolport-native-preview`, so only one Toolport runs at a time. Both Linux
-  builds read the same `~/.config/Toolport` and only one process can hold the
-  approval broker, so pacman swaps an existing `toolport-bin` install in place
-  rather than installing beside it.
+- The package conflicts with `toolport-bin`, a name some locally built Toolport
+  packages used, and replaces `toolport-native-preview`, so only one Toolport
+  runs at a time. Both Linux builds read the same `~/.config/Toolport` and only
+  one process can hold the approval broker, so pacman offers to remove an
+  existing `toolport-bin` install rather than installing beside it.
 - In 2.0 the `.deb` and `.rpm` also ship GTK. The `.deb` needs Ubuntu 24.04+
   or Debian 13+. Ubuntu 22.04 and Debian 12 use the Tauri AppImage. See
   [Linux installation](linux-packages.md#install) for other distributions.

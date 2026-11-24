@@ -138,11 +138,33 @@ async function replay(profile) {
     }
     const initial = await catalog(client, "mock__echo");
     const typed = initial.find((t) => t.name === client.spell("mock__structured"));
-    assert.equal(typed?.outputSchema?.properties?.answer?.type, "integer");
+    assert(typed, "typed fixture tool must be listed");
+    assert.equal(typed.inputSchema.properties.bytes.type, "integer");
     const structured = await client.call("mock__structured");
     success(structured);
     assert.equal(structured.result.structuredContent.answer, 42);
-    pass(`${profile.id}: captured startup, outputSchema and structuredContent`);
+    const shaped = await client.call("mock__structured", { bytes: 256 * 1024 });
+    success(shaped);
+    if (typed.outputSchema) {
+      assert(
+        shaped.result.structuredContent,
+        "advertised outputSchema requires structuredContent even after shaping",
+      );
+    }
+    assert.equal(typed.outputSchema, undefined);
+    assert.equal(shaped.result.structuredContent, undefined);
+    const preview = textOf(shaped);
+    assert(preview.includes("[Toolport shaped this result:"));
+    assert(preview.length < 256 * 1024);
+    const cursor = preview.match(/"cursor":"([^"]+)"/)?.[1];
+    assert(cursor, "shaped result must offer a cursor");
+    const fetched = await client.call("toolport_fetch_result", {
+      cursor,
+      projection: "answer",
+    });
+    success(fetched);
+    assert(textOf(fetched).includes("42"));
+    pass(`${profile.id}: small structured results, shaped previews and cursor retrieval`);
 
     // All profiles get the same event. Re-list only for verified refresh behavior;
     // an unknown client is not credited with a handler it has not demonstrated.
@@ -197,6 +219,7 @@ async function replay(profile) {
     pass(`${profile.id}: resource and prompt contracts (synthetic requests)`);
 
     const slowId = "slow-cancel";
+    const slowStarted = Date.now();
     const slow = client.call("mock__sleep", { ms: 5_000 }, false, slowId);
     let slowPending = true;
     void slow.then(
@@ -215,13 +238,14 @@ async function replay(profile) {
     success(fast);
     assert(textOf(fast).includes("concurrent fast"));
     assert(slowPending, "slow call completed before concurrent fast call");
-    client.send({
-      jsonrpc: "2.0",
-      method: "notifications/cancelled",
-      params: { requestId: slowId, reason: "fixture done" },
-    });
-    assert(failed(await slow), "cancelled call succeeded");
+    client.cancel(slowId, "fixture done");
+    assert((await slow).cancelled, "cancelled call was answered");
     await fixture.dispatched((r) => r.method === "notifications/cancelled");
+    // Outlast the server's own answer: nothing may arrive for the cancelled ID
+    // (the client asserts that on every message it reads).
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.max(0, slowStarted + 5_500 - Date.now())),
+    );
     pass(
       `${profile.id}: long call, concurrent fast call, downstream cancellation (synthetic requests)`,
     );

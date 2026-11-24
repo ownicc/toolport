@@ -20,11 +20,13 @@ import {
 import { toastError } from "@/lib/toast";
 import {
   callTool,
+  cancelToolCall,
   clearToolOverride,
   getPrompt,
   listServerPrompts,
   listServerResources,
   listServerTools,
+  onToolRunProgress,
   readResource,
   setToolEnabled,
   setToolPinned,
@@ -226,12 +228,40 @@ function coerce(v: unknown, schema: JsonSchemaProp): unknown {
 }
 
 /** Render the result content blocks as readable text. */
+const PROVENANCE_KEY = "app.toolport/provenance";
+
+/** Toolport's provenance label, removed from every `_meta`; the server's own
+ * `_meta` fields stay. GTK's result view does the same. */
+function withoutProvenance(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutProvenance);
+  if (value === null || typeof value !== "object") return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (
+      key === "_meta" &&
+      item !== null &&
+      typeof item === "object" &&
+      !Array.isArray(item)
+    ) {
+      const meta = Object.fromEntries(
+        Object.entries(item).filter(([name]) => name !== PROVENANCE_KEY),
+      );
+      if (Object.keys(meta).length > 0) out[key] = withoutProvenance(meta);
+    } else {
+      out[key] = withoutProvenance(item);
+    }
+  }
+  return out;
+}
+
 function renderResult(result: ToolCallResult): string {
   const blocks = result.content ?? [];
-  if (blocks.length === 0) return JSON.stringify(result, null, 2);
+  if (blocks.length === 0) return JSON.stringify(withoutProvenance(result), null, 2);
   return blocks
     .map((b) =>
-      b.type === "text" && b.text != null ? b.text : JSON.stringify(b, null, 2),
+      b.type === "text" && b.text != null
+        ? b.text
+        : JSON.stringify(withoutProvenance(b), null, 2),
     )
     .join("\n");
 }
@@ -360,7 +390,8 @@ function CopyButton({ text }: { text: string }) {
 
 /** A raw MCP result rendered as pretty JSON (or text), with a copy button. */
 function ResultBlock({ title, value }: { title: string; value: unknown }) {
-  const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  const text =
+    typeof value === "string" ? value : JSON.stringify(withoutProvenance(value), null, 2);
   return (
     <div className="flex flex-col gap-2">
       <div className="flex items-center gap-2">
@@ -696,22 +727,38 @@ export function ServerToolsPanel({
   const [result, setResult] = useState<ToolCallResult | null>(null);
   const [callError, setCallError] = useState<string | null>(null);
   // Seconds elapsed while a call is in flight, and a monotonically-increasing id used
-  // to invalidate a call the user cancelled or superseded (a Tauri invoke can't be
-  // aborted, so we stop waiting on it and ignore its eventual result).
+  // to invalidate a call the user cancelled or superseded, so its late result is
+  // ignored even after the gateway was told to cancel it.
   const [elapsed, setElapsed] = useState(0);
   const callSeq = useRef(0);
   const tickerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // The invoke panel sits ABOVE the tool list; on a long list, scroll it into view when a
   // tool is picked so the arguments form is never buried out of sight.
   const invokeRef = useRef<HTMLDivElement | null>(null);
-  // If the call hasn't returned in this long, stop waiting and tell the user rather
-  // than spinning forever on a slow or wedged server.
-  const CALL_TIMEOUT_MS = 60_000;
+  // The Run in flight, so Cancel and the backend's "starting" phase reach it. The
+  // backend bounds the Run itself (server start, approval and the call's own limit).
+  const runIdRef = useRef<string | null>(null);
+  const [starting, setStarting] = useState(false);
+
+  /** Cancel the Run in flight, if any, in the gateway as well as here. */
+  function abandonRun() {
+    const runId = runIdRef.current;
+    runIdRef.current = null;
+    setStarting(false);
+    if (runId) void cancelToolCall(runId).catch(() => {});
+  }
 
   useEffect(() => {
-    // Stop the elapsed-time ticker if the view unmounts mid-call.
+    const unlisten = onToolRunProgress(({ runId, phase }) => {
+      if (runId === runIdRef.current) setStarting(phase === "starting");
+    });
+    // Stop the elapsed-time ticker and the Run if the view unmounts mid-call.
     return () => {
+      void unlisten.then((stop) => stop());
       if (tickerRef.current) clearInterval(tickerRef.current);
+      const runId = runIdRef.current;
+      runIdRef.current = null;
+      if (runId) void cancelToolCall(runId).catch(() => {});
     };
   }, []);
 
@@ -727,8 +774,9 @@ export function ServerToolsPanel({
     // A server switch invalidates any in-flight call: drop its late result and clear the
     // "Calling…" state + ticker, so a superseded call can't paint under the new server.
     callSeq.current += 1;
-    if (tickerRef.current) clearInterval(tickerRef.current);
     // eslint-disable-next-line react-hooks/set-state-in-effect -- Invalidate the previous server call and clear its visible state together.
+    abandonRun();
+    if (tickerRef.current) clearInterval(tickerRef.current);
     setCalling(false);
     setElapsed(0);
     if (!serverId) {
@@ -821,8 +869,9 @@ export function ServerToolsPanel({
     // Switching tools also invalidates an in-flight call (same reasoning as the server
     // effect), so a late result doesn't land under the newly selected tool.
     callSeq.current += 1;
-    if (tickerRef.current) clearInterval(tickerRef.current);
     // eslint-disable-next-line react-hooks/set-state-in-effect -- Invalidate the previous tool call and clear its visible state together.
+    abandonRun();
+    if (tickerRef.current) clearInterval(tickerRef.current);
     setCalling(false);
     setElapsed(0);
     setArgs({});
@@ -874,6 +923,9 @@ export function ServerToolsPanel({
       return;
     }
     const myId = ++callSeq.current;
+    const runId = `run-${myId}-${Date.now()}`;
+    runIdRef.current = runId;
+    setStarting(false);
     setCalling(true);
     setResult(null);
     setCallError(null);
@@ -884,47 +936,39 @@ export function ServerToolsPanel({
       if (callSeq.current === myId) setElapsed(Math.floor((Date.now() - started) / 1000));
     }, 1000);
     try {
-      const timeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("__timeout__")), CALL_TIMEOUT_MS),
+      // The backend times the Run out itself and says so in the user's language.
+      const r = await callTool(
+        serverId,
+        selectedTool,
+        built as Record<string, unknown>,
+        runId,
       );
-      const r = await Promise.race([
-        callTool(serverId, selectedTool, built as Record<string, unknown>),
-        timeout,
-      ]);
       if (callSeq.current !== myId) return; // cancelled or superseded by a newer call
       setResult(r as ToolCallResult);
     } catch (e) {
       if (callSeq.current !== myId) return;
-      setCallError(
-        e instanceof Error && e.message === "__timeout__"
-          ? translate(
-              "No response after {value0}s. The server may be slow or unreachable; check its status under Servers, then retry.",
-              { value0: CALL_TIMEOUT_MS / 1000 },
-            )
-          : String(e),
-      );
+      setCallError(String(e));
     } finally {
       // Only tear down if we're still the current call: a cancelled/superseded call
       // resolving late must not clear a newer call's ticker (which would freeze its
       // elapsed timer) or flip its calling state.
       if (callSeq.current === myId) {
         if (tickerRef.current) clearInterval(tickerRef.current);
+        if (runIdRef.current === runId) runIdRef.current = null;
+        setStarting(false);
         setCalling(false);
       }
     }
   }
 
-  // Stop waiting on an in-flight call: invalidate its id so the eventual result is
-  // dropped, and reset the UI. A Tauri invoke can't be aborted, so this is NOT an
-  // abort: the downstream tool keeps executing and its side effects still happen.
-  // Stopping the wait does not cancel a pending approval or downstream call.
+  // Cancel the Run: the gateway is told to cancel the call, including a wait for
+  // the server to start or a pending approval, and its late result is dropped.
   function cancelCall() {
     callSeq.current++;
+    abandonRun();
     if (tickerRef.current) clearInterval(tickerRef.current);
     setCalling(false);
-    setCallError(
-      translate("Stopped waiting: the call may still be running on the server."),
-    );
+    setCallError(translate("Stopped. The server was told to cancel the call."));
   }
 
   if (servers.length === 0) {
@@ -1101,7 +1145,12 @@ export function ServerToolsPanel({
                     <Play className="size-4" />
                   )}
                   {calling
-                    ? t("Calling… {value0}s", { value0: elapsed })
+                    ? starting
+                      ? t("Starting {value0}… {value1}s", {
+                          value0: serverEntry?.name ?? serverId,
+                          value1: elapsed,
+                        })
+                      : t("Calling… {value0}s", { value0: elapsed })
                     : t("Call tool")}
                 </Button>
                 {calling && (
@@ -1274,7 +1323,20 @@ export function ServerToolsPanel({
                           checked={!perToolOff}
                           onCheckedChange={(on) => toggleTool(t.name, on)}
                           disabled={policyBusy}
-                          aria-label={translate("Enable {value0}", { value0: t.name })}
+                          // The name stays the tool's; the switch state says on or
+                          // off, and the tooltip says what a click does, as in GTK.
+                          // While the global switch hides a destructive tool, a
+                          // click changes only its own setting, so it says that.
+                          aria-label={t.name}
+                          title={
+                            denyDestructive && destructive
+                              ? translate(
+                                  "Destructive tools are hidden from clients by the global switch even when individually enabled.",
+                                )
+                              : perToolOff
+                                ? translate("Hidden from clients. Expose it.")
+                                : translate("Exposed to clients. Hide it.")
+                          }
                         />
                       </div>
                     );

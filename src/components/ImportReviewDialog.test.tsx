@@ -1,6 +1,6 @@
 import { ImportReviewDialog } from "./ImportReviewDialog";
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
   runsShell,
@@ -59,6 +59,28 @@ function renderDialog(overrides: Partial<Parameters<typeof ImportReviewDialog>[0
 }
 
 describe("ImportReviewDialog", () => {
+  it("names the saved name and marks unsupported servers for review", () => {
+    renderDialog({
+      items: [
+        { ...items()[1], name: "github (2)", sourceName: "github" },
+        {
+          ...items()[0],
+          name: "stripe (2)",
+          sourceName: "stripe",
+          unsupported: "Custom headers stay native",
+        },
+      ],
+    });
+    expect(screen.getByText("github")).toBeVisible();
+    expect(screen.getByText("Import as github (2)")).toBeVisible();
+    expect(screen.queryByText("github (2)")).toBeNull();
+    expect(screen.getAllByText("New")).toHaveLength(1);
+    expect(screen.getByText("Needs review")).toBeVisible();
+    expect(screen.getByText("Unsupported: Custom headers stay native")).toBeVisible();
+    // Not imported, so no destination name.
+    expect(screen.queryByText("Import as stripe (2)")).toBeNull();
+  });
+
   it("discloses changed settings on existing servers", () => {
     renderDialog({
       items: [
@@ -82,12 +104,44 @@ describe("ImportReviewDialog", () => {
       confirmLabel: "Connect",
     });
     expect(screen.getByRole("button", { name: "Connect" })).toBeDisabled();
+    // A long key wraps instead of running out of the dialog, as in GTK.
+    expect(screen.getByText("Enter PAT or deselect Calendar")).toHaveClass(
+      "[overflow-wrap:anywhere]",
+    );
     expect(screen.getByText("Enter PAT or deselect Calendar")).toBeVisible();
     await userEvent.click(screen.getByText("Calendar credentials and settings"));
+    expect(screen.getByText(/Keep PAT in keychain/).closest("label")).toHaveClass(
+      "min-w-0",
+      "flex-1",
+      "[overflow-wrap:anywhere]",
+    );
     await userEvent.click(screen.getByRole("button", { name: "Enter value" }));
     await userEvent.type(screen.getByLabelText("PAT"), "synthetic");
     await userEvent.click(screen.getByRole("button", { name: "Use for connection" }));
     expect(screen.getByRole("button", { name: "Connect" })).toBeEnabled();
+  });
+
+  it("gives disclosures and server cards the same hover and focus ring as buttons", () => {
+    renderDialog({
+      items: [
+        {
+          ...items()[0],
+          name: "Calendar",
+          credentials: [{ key: "PAT", secret: true, present: false, required: true }],
+        },
+      ],
+      details: "Config: /fixture/config",
+      requireCredentials: true,
+    });
+    const toggles = [
+      screen.getByText("Details"),
+      screen.getByText("Calendar credentials and settings"),
+      screen.getByRole("button", { name: /Calendar/ }),
+    ];
+    for (const toggle of toggles) {
+      expect(toggle).toHaveClass("focus-visible:ring-3", "focus-visible:ring-ring/50");
+      expect(toggle.className).toMatch(/(^|\s)hover:bg-muted/);
+    }
   });
 
   it("permits optional missing values and add flows", async () => {
@@ -170,6 +224,20 @@ describe("ImportReviewDialog", () => {
     await userEvent.click(screen.getByRole("button", { name: /import 2 servers/i }));
     expect(onConfirm).toHaveBeenCalledWith(expect.arrayContaining(["a", "c"]));
     expect(onConfirm.mock.calls[0][0]).not.toContain("b");
+  });
+
+  it("puts Cancel then the confirm together in the right-aligned footer", () => {
+    renderDialog();
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    const confirm = screen.getByRole("button", { name: /Import 3 servers/ });
+    const footer = cancel.closest('[data-slot="dialog-footer"]');
+    expect(footer).not.toBeNull();
+    expect(footer).toHaveClass("justify-end");
+    expect(footer).not.toHaveClass("justify-between");
+    expect(confirm.closest('[data-slot="dialog-footer"]')).toBe(footer);
+    expect(
+      cancel.compareDocumentPosition(confirm) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   it("disables import when nothing is selected", async () => {
@@ -448,4 +516,142 @@ it("leaves unsupported servers unchecked and sends per-row keychain choices", as
   await userEvent.click(screen.getByLabelText(/Keep PORT in keychain/));
   await userEvent.click(screen.getByRole("button", { name: /Import 1 server/ }));
   expect(onConfirm).toHaveBeenCalledWith(["a"], { stripe: { PORT: true }, linear: {} });
+});
+
+describe("ImportReviewDialog spec details", () => {
+  const withCredentials = () => [
+    {
+      ...items()[0],
+      name: "Calendar",
+      credentials: [{ key: "PAT", secret: true, present: false, required: true }],
+    },
+  ];
+
+  it("titles the review 17/600 and sets its Details paths in 13px mono", () => {
+    renderDialog({ details: "Config: /fixture/config" });
+    expect(screen.getByRole("heading", { name: "Review servers to import" })).toHaveClass(
+      "text-[17px]",
+      "font-semibold",
+    );
+    expect(screen.getByText("Config: /fixture/config")).toHaveClass(
+      "font-mono",
+      "text-[13px]",
+      "font-normal",
+    );
+  });
+
+  it("marks every fold with a chevron instead of the browser marker", () => {
+    renderDialog({
+      items: withCredentials(),
+      details: "Config: /fixture/config",
+      requireCredentials: true,
+    });
+    for (const name of ["Details", "Calendar credentials and settings"]) {
+      const summary = screen.getByText(name).closest("summary")!;
+      expect(summary).toHaveClass("list-none", "[&::-webkit-details-marker]:hidden");
+      const chevron = summary.querySelector('[data-slot="disclosure-chevron"]');
+      expect(chevron).toHaveClass("size-4", "[details[open]>summary>&]:rotate-90");
+    }
+  });
+
+  it("takes credentials in the shared 32px input", async () => {
+    renderDialog({ items: withCredentials(), requireCredentials: true });
+    await userEvent.click(screen.getByRole("button", { name: "Enter value" }));
+    const input = screen.getByLabelText("PAT");
+    expect(input).toHaveAttribute("data-slot", "input");
+    expect(input).toHaveAttribute("type", "password");
+    expect(input.closest("label")!.firstElementChild).toHaveClass(
+      "[overflow-wrap:anywhere]",
+    );
+    expect(input).toHaveClass(
+      "h-8",
+      "rounded-md",
+      "border",
+      "bg-card",
+      "focus-visible:ring-2",
+    );
+    expect(screen.getByRole("heading", { name: "Calendar credentials" })).toHaveClass(
+      "text-[17px]",
+    );
+    expect(
+      screen.getByText(
+        "This value is used only for the selected server. It is saved only if connection succeeds.",
+      ),
+    ).toHaveClass("text-meta", "text-muted-foreground");
+    // Return uses the value, as the GTK prompt does.
+    await userEvent.type(input, "fixture-token{Enter}");
+    expect(screen.queryByRole("heading", { name: "Calendar credentials" })).toBeNull();
+    expect(screen.getByText("Ready for connection")).toBeInTheDocument();
+  });
+
+  it("keeps the credential sheet open on an Enter that ends an input method composition", async () => {
+    renderDialog({ items: withCredentials(), requireCredentials: true });
+    await userEvent.click(screen.getByRole("button", { name: "Enter value" }));
+    const input = screen.getByLabelText("PAT");
+    fireEvent.change(input, { target: { value: "ねこ" } });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    expect(screen.getByRole("heading", { name: "Calendar credentials" })).toBeVisible();
+    expect(screen.queryByText("Ready for connection")).toBeNull();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.queryByRole("heading", { name: "Calendar credentials" })).toBeNull();
+    expect(screen.getByText("Ready for connection")).toBeInTheDocument();
+  });
+
+  it("grows the server list to the dialog window-margin cap and scrolls only the list", async () => {
+    const base = items()[0];
+    const many = Array.from({ length: 40 }, (_, i) => ({
+      ...base,
+      key: `s${i}`,
+      name: `srv-${i + 1}`,
+    }));
+    renderDialog({ items: many, details: "Config: /fixture/config" });
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveClass(
+      "max-h-[calc(100dvh-2rem)]",
+      "max-w-[calc(100%-2rem)]",
+      "sm:max-w-lg",
+    );
+    const list = screen.getByRole("button", { name: /srv-1\b/ }).parentElement!
+      .parentElement!;
+    expect(list).toContainElement(screen.getByRole("button", { name: /srv-40\b/ }));
+    expect(list).toHaveClass("overflow-y-auto", "min-h-24");
+    expect(list.className).not.toMatch(/\bmax-h-/);
+    expect(list).not.toHaveAttribute("tabindex");
+    expect(list.parentElement).toHaveClass("flex", "flex-col", "min-h-0");
+    const details = screen.getByText("Details").closest("details")!;
+    expect(list.contains(details)).toBe(false);
+    expect(details).toHaveClass("shrink-0");
+    await userEvent.click(screen.getByText("Details"));
+    expect(dialog.querySelector('[data-slot="dialog-footer"]')).toBeVisible();
+  });
+
+  it("does not reserve extra list height for a single server", () => {
+    const single = items()[0];
+    renderDialog({ items: [single] });
+    const list = screen.getByRole("button", { name: new RegExp(single.name) })
+      .parentElement!.parentElement!;
+    expect(list).toHaveClass("overflow-y-auto", "shrink-0");
+    expect(list).not.toHaveClass("min-h-24");
+  });
+
+  it("keeps the review list at a usable minimum height when credential warnings grow", () => {
+    const base = items()[0];
+    const many = Array.from({ length: 12 }, (_, i) => ({
+      ...base,
+      key: `s${i}`,
+      name: `srv-${i + 1}`,
+      credentials: [{ key: `TOKEN_${i}`, secret: true, present: false, required: true }],
+    }));
+    renderDialog({ items: many, requireCredentials: true });
+    const list = screen.getByRole("button", { name: /srv-1\b/ }).parentElement!
+      .parentElement!;
+    expect(list).toHaveClass("overflow-y-auto", "min-h-24");
+    const warnings = screen.getAllByText(/^Enter TOKEN_\d+ or deselect srv-\d+$/);
+    expect(warnings.length).toBe(12);
+    for (const warning of warnings) {
+      expect(warning).toHaveClass("shrink-0");
+      expect(list.parentElement).toContainElement(warning);
+    }
+  });
 });

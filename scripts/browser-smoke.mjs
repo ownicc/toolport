@@ -168,6 +168,37 @@ try {
   await expect(page.getByRole("option", { name: "Work", exact: true })).toBeVisible();
   await page.screenshot({ path: path.join(output, "client-access.png") });
   await page.keyboard.press("Escape");
+  // Disconnect answers in the fixture and the client then reads as not connected.
+  await page.getByRole("button", { name: "Disconnect", exact: true }).click();
+  await page
+    .getByRole("dialog", { name: "Disconnect Toolport from Codex?", exact: true })
+    .getByRole("button", { name: "Disconnect", exact: true })
+    .click();
+  await expect(page.getByText("Disconnected Toolport from Codex.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Disconnect", exact: true })).toHaveCount(
+    0,
+  );
+  await page.screenshot({ path: path.join(output, "client-disconnected.png") });
+  expect((await page.evaluate(() => window.toolportFixture)).missing).toEqual([]);
+  // Connect puts the gateway back with the access chosen for it.
+  await page.getByRole("combobox", { name: "Access", exact: true }).click();
+  await page.getByRole("option", { name: "Work", exact: true }).click();
+  await page.getByRole("button", { name: "Connect to Toolport", exact: true }).click();
+  const review = page.getByRole("dialog", { name: "Review and connect Codex" });
+  await review.getByRole("button", { name: "Connect to Toolport", exact: true }).click();
+  await page
+    .getByRole("dialog", { name: "Codex connected" })
+    .getByRole("button", { name: "Done", exact: true })
+    .click();
+  await expect(review).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Disconnect", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "Access", exact: true })).toHaveText(
+    "Work",
+  );
+  // Back to the fixture's connected Codex for the steps below.
+  await page.goto(`${baseURL}/fixtures/`);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("button", { name: "Access", exact: true }).click();
   await expect(
@@ -218,9 +249,11 @@ try {
   const longServer = "A".repeat(70);
   await expect(page.getByTitle(longServer, { exact: true })).toBeVisible();
   const firstToggle = await page
-    .getByRole("switch", { name: `Toggle ${longServer}`, exact: true })
+    .getByRole("switch", { name: new RegExp(`^(Enable|Disable) ${longServer}$`) })
     .boundingBox();
-  expect(firstToggle.y + firstToggle.height).toBeLessThanOrEqual(360);
+  // The long name keeps the switch in the window: it wraps under the name
+  // rather than being pushed off the right edge.
+  expect(firstToggle.x + firstToggle.width).toBeLessThanOrEqual(480);
   await page
     .getByRole("button", { name: `Show ${longServer} details`, exact: true })
     .click();
@@ -298,6 +331,25 @@ try {
   await expect(page.getByText("Needs sign-in", { exact: true })).toBeVisible();
   await expect(page.getByText("Unreachable", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Retry", exact: true })).toHaveCount(2);
+  // A narrow window moves a row's status and actions under its name instead of
+  // squeezing the name to nothing.
+  await page.setViewportSize({ width: 480, height: 900 });
+  const serverNames = page.locator("[data-server-id] button.truncate.font-semibold");
+  expect(await serverNames.count()).toBeGreaterThan(2);
+  for (const name of await serverNames.all()) {
+    // The name's column keeps 200px or more, and the name itself is not cut.
+    await expect
+      .poll(() =>
+        name.evaluate(
+          (el) =>
+            el.parentElement.parentElement.clientWidth >= 200 &&
+            el.scrollWidth <= el.clientWidth,
+        ),
+      )
+      .toBe(true);
+  }
+  await page.screenshot({ path: path.join(output, "servers-narrow-480.png") });
+  await page.setViewportSize({ width: 1440, height: 1000 });
   await page.getByRole("button", { name: "View log", exact: true }).first().click();
   await expect(page.getByRole("tab", { name: "Overview", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Settings", exact: true }).click();
@@ -379,7 +431,11 @@ try {
   await approval.getByRole("button", { name: "Deny", exact: true }).click();
   await expect(approval).toHaveCount(0);
   await page.getByRole("button", { name: "Activity", exact: true }).click();
-  await page.getByRole("button", { name: /recent calls/i }).click();
+  // The call list starts open.
+  await expect(page.getByRole("button", { name: /recent calls/i })).toHaveAttribute(
+    "aria-expanded",
+    "true",
+  );
   await expect(page.getByText("team_slack", { exact: true }).first()).toBeVisible();
   for (const label of [
     "Approved",
@@ -404,6 +460,28 @@ try {
     await expect(
       page.getByRole("heading", { name: "Review and connect Codex" }),
     ).toBeVisible();
+    // Each card's 3px focus ring and selection ring fit inside every box that
+    // clips it on the way up to the dialog, so neither is cut at the sides.
+    const clipped = await page.evaluate(() =>
+      [...document.querySelectorAll('[role="dialog"] button[aria-pressed]')].flatMap(
+        (card) => {
+          const box = card.getBoundingClientRect();
+          const cuts = [];
+          for (let el = card.parentElement; el && el.getAttribute("role") !== "dialog";) {
+            if (getComputedStyle(el).overflowX !== "visible") {
+              const clip = el.getBoundingClientRect();
+              if (box.left - clip.left < 3 || clip.right - box.right < 3)
+                cuts.push(
+                  `${card.textContent.trim().slice(0, 20)} in ${el.dataset.slot ?? el.className}`,
+                );
+            }
+            el = el.parentElement;
+          }
+          return cuts;
+        },
+      ),
+    );
+    expect(clipped).toEqual([]);
     await page.getByText("Details", { exact: true }).click();
     await expect(page.getByText(/Backups will be saved/)).toBeVisible();
     await page.getByText("Details", { exact: true }).click();
@@ -477,7 +555,7 @@ try {
     .getByRole("button", { name: "Add", exact: true })
     .click();
   await expect(
-    page.getByRole("switch", { name: "Toggle Manual notes", exact: true }),
+    page.getByRole("switch", { name: "Disable Manual notes", exact: true }),
   ).toBeChecked();
   await page.screenshot({
     animations: "disabled",
@@ -513,7 +591,7 @@ try {
   await page.getByRole("button", { name: "Add", exact: true }).first().click();
   await page.getByRole("button", { name: "Servers", exact: true }).click();
   await expect(
-    page.getByRole("switch", { name: "Toggle NoteKit", exact: true }),
+    page.getByRole("switch", { name: "Disable NoteKit", exact: true }),
   ).toBeChecked();
   await page.screenshot({
     animations: "disabled",
@@ -638,7 +716,10 @@ try {
     groupedClients.getByText(/60 calls today.*Last saw 1,711 tools/),
   ).toBeVisible();
   await page.getByRole("button", { name: "Activity", exact: true }).click();
-  await page.getByRole("button", { name: /Recent calls and approvals/ }).click();
+  // The call list starts open.
+  await expect(
+    page.getByRole("button", { name: /Recent calls and approvals/ }),
+  ).toHaveAttribute("aria-expanded", "true");
   for (const label of [
     "Searched tools",
     "Looked up a tool",
@@ -651,7 +732,7 @@ try {
     /before reaching the model/,
   );
   await expect(page.getByText(/5,225 calls recorded/)).toContainText(
-    "Showing the latest 5.",
+    "Showing the latest 5 entries.",
   );
   await expect(page.getByText("Nothing searched yet.", { exact: true })).toHaveCount(0);
   await expect(
@@ -668,7 +749,9 @@ try {
   await page.getByRole("button", { name: /^Discovery/ }).click();
   await expect(page.getByText(/GitHub issues/)).toBeVisible();
   await page.screenshot({ path: path.join(output, "discovery-after-r2.png") });
-  await page.getByRole("button", { name: /^Per-server breakdown/ }).click();
+  await expect(
+    page.getByRole("button", { name: /^Per-server breakdown/ }),
+  ).toHaveAttribute("aria-expanded", "true");
   await page.screenshot({ path: path.join(output, "server-stats-after-r2.png") });
   await page.getByRole("button", { name: "Clear", exact: true }).click();
   await expect(page.getByRole("dialog")).toContainText("Clear retained activity?");

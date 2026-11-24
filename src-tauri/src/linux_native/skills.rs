@@ -746,8 +746,10 @@ fn state_dot(state: Option<State>, tooltip: &str, width: i32) -> gtk::CenterBox 
     cell
 }
 
-fn legend() -> gtk::Box {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+/// The key under the list. It flows onto more lines in a narrow window instead of
+/// widening the page past its edge.
+fn legend() -> super::page_header::ActionFlow {
+    let row = super::page_header::ActionFlow::new();
     row.add_css_class("toolport-skill-legend");
     for (state, label) in [
         (Some(State::On), l10n::label("On")),
@@ -1082,7 +1084,9 @@ impl SkillsPage {
         top.set_margin_end(24);
 
         // Tabs on the left, project/search/refresh on the right, over one bottom rule.
-        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        // The filters and search flow onto another line in a narrow window
+        // instead of pushing the page past its edge.
+        let bar = super::page_header::ActionFlow::new();
 
         let tab_box = gtk::Box::new(gtk::Orientation::Horizontal, 18);
         tab_box.set_hexpand(true);
@@ -1153,6 +1157,7 @@ impl SkillsPage {
             .always_show_arrow(true)
             .valign(gtk::Align::Center)
             .build();
+        super::quiet_tooltips::guard_menu(&project_menu);
         project_menu.set_tooltip_text(Some(&crate::i18n::tr(
             "Also show the rules and skills a project folder adds",
         )));
@@ -1168,6 +1173,7 @@ impl SkillsPage {
             .css_classes(["toolport-search"])
             .build();
         let agent_filter = gtk::DropDown::from_strings(&[]);
+        super::quiet_tooltips::guard_dropdown(&agent_filter);
         agent_filter.set_valign(gtk::Align::Center);
         // No tooltip: the menu names itself, and a tooltip fades out after the pointer leaves.
         agent_filter.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr(
@@ -2410,6 +2416,7 @@ impl SkillsPage {
             .child(&l10n::label(open_label))
             .popover(&popover)
             .build();
+        super::quiet_tooltips::guard_split_button(&open);
         open.set_dropdown_tooltip(&crate::i18n::tr("Open with"));
         {
             let page = self.clone();
@@ -2977,6 +2984,7 @@ impl SkillsPage {
             .tooltip_text(&label)
             .css_classes(["flat", "toolport-row-more"])
             .build();
+        super::quiet_tooltips::guard_menu(&button);
         button.update_property(&[gtk::accessible::Property::Label(&label)]);
         let slot = format!("{}#menu", agent.id);
         self.controls
@@ -3762,6 +3770,60 @@ mod tests {
             roots: vec![],
             rules_note: None,
             rule_locations: vec![],
+        }
+    }
+
+    #[test]
+    #[ignore = "requires GTK; explicitly run in the isolated omabox session"]
+    fn skills_toolbar_and_legend_wrap_instead_of_widening_the_page() {
+        adw::init().unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("skills-narrow-toolbar");
+        let app = adw::Application::builder().build();
+        app.register(None::<&gtk::gio::Cancellable>).unwrap();
+        let agents: Vec<Agent> = (0..8)
+            .map(|i| Agent {
+                id: format!("codex@{i}"),
+                name: format!("Profile {i}"),
+                connected: true,
+                ..regression_agent()
+            })
+            .collect();
+        let page = SkillsPage::new(&app);
+        page.inventory.replace(Some(Inventory {
+            agents,
+            skills: vec![],
+            rules: vec![],
+            issues: vec![],
+            project: None,
+        }));
+        page.render();
+        page.agent_filter.set_selected(1);
+        let content = page
+            .skills
+            .bin
+            .borrow()
+            .as_ref()
+            .and_then(|bin| bin.child())
+            .expect("the page content");
+        fn find(widget: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
+            if widget.has_css_class(class) {
+                return Some(widget.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if let Some(found) = find(&current, class) {
+                    return Some(found);
+                }
+                child = current.next_sibling();
+            }
+            None
+        }
+        // The page's own floor is 360px; anything wider is cut off at the window's
+        // edge, as the toolbar and the key under the list were at 720px.
+        for class in ["toolport-skill-tabbar", "toolport-skill-legend"] {
+            let widget = find(&content, class).unwrap_or_else(|| panic!("{class}"));
+            let (min, _, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+            assert!(min <= 360, "{class} needs {min}px");
         }
     }
 

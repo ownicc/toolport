@@ -12,8 +12,16 @@ pub struct ClientResult {
     pub warnings: Vec<String>,
 }
 
+/// Restore every client, then stop the daemons nothing connected still uses:
+/// with Toolport out of every config, an idle daemon has no one left to serve.
 pub fn all(dry_run: bool) -> Result<Vec<ClientResult>, String> {
-    all_with_registry(dry_run, false)
+    let results = all_with_registry(dry_run, false)?;
+    if !dry_run {
+        for line in crate::daemon::stop_when_idle_after_disconnect() {
+            eprintln!("{line}");
+        }
+    }
+    Ok(results)
 }
 
 pub(crate) fn for_purge(all_installs: bool) -> Result<Vec<ClientResult>, String> {
@@ -128,23 +136,44 @@ fn all_with_clients(
             error: result.err(),
         });
     }
+    // A corrupt receipt or saved-location store must not prevent the valid
+    // clients above from restoring, or disappear from noninteractive reports.
+    for row in recovery::list()? {
+        if let Some(error) = row.error {
+            if !results.iter().any(|result| result.path == row.backup_path) {
+                results.push(ClientResult {
+                    client_id: row.client_id,
+                    path: row.backup_path,
+                    dry_run,
+                    error: Some(error),
+                    warnings: Vec::new(),
+                });
+            }
+        }
+    }
     Ok(results)
 }
 
-fn restore_path(
+pub(super) fn restore_path(
     id: &str,
     path: &Path,
     format: Format,
     managed: Option<&ManagedEntry>,
 ) -> Result<Vec<String>, String> {
+    backup_storage::reset_missing();
+    recovery_values::reset_progress();
     let (revision, used_move_record) = restore::run(id, path, format, || {
         mutation::disconnecting();
-        backup_file(id, path)?;
-        if !restore::apply(id, format, path)? {
+        restore::prepare_disconnect(id, path)?;
+        if !restore::pending_values(id, path)? {
+            backup_file(id, path)?;
+        }
+        let (handled, adopted) = restore::apply_adopting(id, format, path)?;
+        if !handled {
             restore::check_legacy_gateway(format, path, managed)?;
             moved::restore(id, format, path)?;
             edit_format(format, path, None, true)?;
-        } else if restore::needs_moved(id, path)? {
+        } else if adopted || restore::needs_moved(id, path)? {
             moved::restore(id, format, path)?;
         }
         let revision = mutation::read(path)
@@ -159,7 +188,7 @@ fn restore_path(
             hook(path);
         }
     });
-    let warnings = disconnect_warnings(format, path)
+    let mut warnings = disconnect_warnings(format, path)
         .map_err(|error| {
             eprintln!(
                 "toolport: could not inspect disconnect warnings at {}: {error}",
@@ -167,9 +196,10 @@ fn restore_path(
             )
         })
         .unwrap_or_default();
-    finish_uninstall(
+    let recovery_warnings = finish_uninstall_with_warnings(
         id,
         &WriteOutcome {
+            existed_before: true,
             path: path.to_string_lossy().into_owned(),
             backup: None,
             managed: None,
@@ -180,6 +210,7 @@ fn restore_path(
             recovery_path: None,
         },
     )?;
+    warnings.extend(recovery_warnings);
     Ok(warnings)
 }
 
@@ -434,7 +465,9 @@ mod tests {
             entry_state: GatewayEntryState::Managed,
             error: None,
             claude_profile: None,
+            t3_code: Vec::new(),
             location_removable: false,
+            location_kept_by_t3_code: false,
         };
         let results = all_with_clients(false, true, || vec![client]).unwrap();
         assert_eq!(results.len(), 1);
@@ -442,6 +475,70 @@ mod tests {
         assert!(results[0].error.is_none(), "{:?}", results[0]);
         assert_eq!(std::fs::read_to_string(&selected).unwrap(), native);
         assert_eq!(std::fs::read(&fallback).unwrap(), fallback_bytes);
+        assert_eq!(std::fs::read_to_string(&registry).unwrap(), "broken");
+    }
+
+    /// Greptile P1 on #1370: with a corrupt registry, purge restores from the client's own
+    /// records. An edited Toolport entry takes the merge path, which asks the registry
+    /// whether the entry is v1's; a registry it can't read proves nothing, so the restore
+    /// goes on: the moved server comes back and the edited entry stays.
+    #[test]
+    fn purge_with_a_corrupt_registry_restores_a_client_whose_entry_was_edited() {
+        let env = crate::registry::DataDirTestEnv::new("purge_corrupt_registry_edited_entry");
+        let _env_lock = env_test_lock();
+        let path = env.dir.join("client.json");
+        std::fs::write(&path, r#"{"mcpServers":{"native":{"command":"native"}}}"#).unwrap();
+        let entry: ServerEntry = serde_json::from_value(serde_json::json!({"id":"toolport", "name":"toolport", "transport":"stdio", "command":"/fixture/toolport-gateway"})).unwrap();
+        mutation::run("claude-code", &path, Format::JsonMcpServers, || {
+            moved::record("claude-code", Format::JsonMcpServers, &path)?;
+            write_format(
+                Format::JsonMcpServers,
+                &path,
+                std::slice::from_ref(&entry),
+                true,
+            )
+        })
+        .unwrap();
+        let mut edited = parse_json_value(&read_config_file(&path).unwrap()).unwrap();
+        assert!(edited["mcpServers"].get("native").is_none());
+        edited["mcpServers"]["toolport"]["args"] = serde_json::json!(["--custom"]);
+        std::fs::write(&path, edited.to_string()).unwrap();
+        let registry = env.dir.join("registry.json");
+        std::fs::write(&registry, "broken").unwrap();
+        let servers = parse_client_content(
+            Format::JsonMcpServers,
+            &std::fs::read_to_string(&path).unwrap(),
+        )
+        .unwrap();
+        let client = DetectedClient {
+            id: "claude-code".into(),
+            name: "Claude Code".into(),
+            uses_connectors: false,
+            discovery: discovery::capabilities("claude-code"),
+            config_path: path.to_string_lossy().into_owned(),
+            config_exists: true,
+            app_present: true,
+            servers,
+            plugin_servers: Vec::new(),
+            gateway_installed: true,
+            entry_state: GatewayEntryState::Customized,
+            error: None,
+            claude_profile: None,
+            t3_code: Vec::new(),
+            location_removable: false,
+            location_kept_by_t3_code: false,
+        };
+        let results = all_with_clients(false, true, || vec![client]).unwrap();
+        assert!(results.iter().all(|row| row.error.is_none()), "{results:?}");
+        let after = parse_json_value(&read_config_file(&path).unwrap()).unwrap();
+        assert_eq!(
+            after["mcpServers"]["native"],
+            serde_json::json!({"command": "native"})
+        );
+        assert_eq!(
+            after["mcpServers"]["toolport"]["args"],
+            serde_json::json!(["--custom"])
+        );
         assert_eq!(std::fs::read_to_string(&registry).unwrap(), "broken");
     }
 

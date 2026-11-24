@@ -61,6 +61,7 @@ use conduit_lib::session_observability as observation;
 use conduit_lib::session_store::SessionStore;
 use conduit_lib::shaping;
 use conduit_lib::tool_definitions::{CatalogRef, SerializedTools, SharedTools, ToolCatalog};
+use conduit_lib::tool_signature;
 use conduit_lib::topology::LaunchKey;
 
 #[cfg(any(unix, windows))]
@@ -1338,6 +1339,15 @@ fn without_progress_token(meta: &Value) -> Value {
     out
 }
 
+/// A copy of `meta` without the gateway's start notices ask.
+fn without_start_notices(meta: &Value) -> Value {
+    let mut out = meta.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.remove(downstream::START_NOTICES_META_KEY);
+    }
+    out
+}
+
 /// The live token table, created on first use so tests can exercise routing
 /// without standing up a full gateway.
 fn progress_routes() -> &'static Arc<Mutex<ProgressRoutes>> {
@@ -1472,7 +1482,8 @@ fn search_tool_def() -> Value {
             },
             "required": ["query"],
             "additionalProperties": false
-        }
+        },
+        "_meta": { CLAUDE_ALWAYS_LOAD_META: true }
     })
 }
 
@@ -1499,7 +1510,8 @@ fn call_tool_def() -> Value {
             },
             "required": ["name"],
             "additionalProperties": false
-        }
+        },
+        "_meta": { CLAUDE_ALWAYS_LOAD_META: true }
     })
 }
 
@@ -1547,7 +1559,9 @@ fn run_script_tool_def() -> Value {
             structuredContent.toolportScript.progress lists the calls that already ran in order; \
             resume by index, and use toolport.checkpoint(value) to record your own resume state. For \
             a reusable orchestration, pass immutable `input` plus `inputSchema`. Gates match \
-            toolport_call_tool.",
+            toolport_call_tool. A search hit ends with the tool's script signature, shortened when \
+            long; toolport.describe(name) returns the full {name, signature, inputSchema}. \
+            A call returns the MCP result {content, structuredContent, isError}.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1576,7 +1590,8 @@ fn run_script_tool_def() -> Value {
             },
             "required": ["script"],
             "additionalProperties": false
-        }
+        },
+        "_meta": { CLAUDE_ALWAYS_LOAD_META: true }
     })
 }
 
@@ -1595,8 +1610,123 @@ fn fetch_result_tool_def() -> Value {
             },
             "required": ["cursor"],
             "additionalProperties": false
-        }
+        },
+        "_meta": { CLAUDE_ALWAYS_LOAD_META: true }
     })
+}
+
+/// Claude Code defers MCP tool schemas behind its own tool search and loads a tool
+/// upfront when its `tools/list` entry sets this `_meta` key to `true`
+/// (code.claude.com/docs/en/mcp, v2.1.285+). Search, call, fetch-result and
+/// run-script carry it: in Lazy mode the model needs search and call before it can
+/// reach anything else, and a trimmed result names toolport_fetch_result, which must be
+/// callable without another lookup. Status and help_<server> stay deferred. The key is
+/// vendor-prefixed, so other clients ignore it.
+const CLAUDE_ALWAYS_LOAD_META: &str = "anthropic/alwaysLoad";
+
+/// Claude Code saves a text result longer than this many characters to a file unless
+/// the tool's `tools/list` entry raises the threshold with this `_meta` key, up to
+/// [`CLAUDE_RESULT_CHARS_CEILING`].
+const CLAUDE_RESULT_SIZE_META: &str = "anthropic/maxResultSizeChars";
+const CLAUDE_RESULT_CHARS_DEFAULT: usize = 50_000;
+const CLAUDE_RESULT_CHARS_CEILING: usize = 500_000;
+
+/// The `anthropic/maxResultSizeChars` value for a shaping budget, or `None` when Claude
+/// Code's default already covers every result the budget lets through. The budget counts
+/// serialized bytes and Claude counts text characters; bytes bound characters from
+/// above, so advertising the byte budget is safe. `0` never shapes, so it gets the
+/// ceiling.
+fn claude_result_size_hint(budget: usize) -> Option<usize> {
+    match budget {
+        0 => Some(CLAUDE_RESULT_CHARS_CEILING),
+        budget if budget > CLAUDE_RESULT_CHARS_DEFAULT => {
+            Some(budget.min(CLAUDE_RESULT_CHARS_CEILING))
+        }
+        _ => None,
+    }
+}
+
+/// Shaping budgets for one `tools/list` view, used to raise Claude Code's result
+/// threshold where Toolport lets larger results through than Claude's default.
+struct ResultSizeHints {
+    /// `TOOLPORT_RESULT_BUDGET`, or the default. Fetch-result pages and script
+    /// results are shaped with it.
+    global: usize,
+    /// Per-server `resultBudgets`, keyed like `defend_and_shape` reads them.
+    servers: HashMap<String, usize>,
+    /// The largest budget among the servers this view may call, which bounds every
+    /// `toolport_call_tool` result.
+    call: usize,
+}
+
+impl ResultSizeHints {
+    fn new(reg: &Registry, allowed: Option<&HashSet<String>>) -> Self {
+        let (global, _warning) = shaping::budget();
+        let servers: HashMap<String, usize> = reg
+            .result_budgets
+            .iter()
+            .map(|(server, &budget)| (server.clone(), budget as usize))
+            .collect();
+        // 0 means never shape, which is larger than any byte budget. Counting a
+        // configured server the router does not serve right now only raises the
+        // threshold; results stay capped by their real budget either way.
+        let larger = |a: usize, b: usize| if a == 0 || b == 0 { 0 } else { a.max(b) };
+        let call = reg
+            .servers
+            .iter()
+            .filter(|server| {
+                !clients::is_gateway_server(server)
+                    && allowed.is_none_or(|scope| server_in_allowed_scope(&server.id, scope))
+            })
+            .filter_map(|server| servers.get(&sanitize_segment(&server.id)).copied())
+            .fold(global, larger);
+        Self {
+            global,
+            servers,
+            call,
+        }
+    }
+
+    /// Add `anthropic/maxResultSizeChars` to one listed tool when its results can exceed
+    /// Claude Code's default. An upstream tool that already set the key keeps its value.
+    fn apply(&self, tool: &mut Value, router: &Router) {
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            return;
+        };
+        let budget = match name {
+            "toolport_call_tool" => self.call,
+            "toolport_fetch_result" | "toolport_run_script" => self.global,
+            "toolport_status" | "toolport_search_tools" => return,
+            _ => match router.route_of(name) {
+                Some((server, _)) => self
+                    .servers
+                    .get(&sanitize_segment(server))
+                    .copied()
+                    .unwrap_or(self.global),
+                None => return,
+            },
+        };
+        let Some(chars) = claude_result_size_hint(budget) else {
+            return;
+        };
+        let Some(map) = tool.as_object_mut() else {
+            return;
+        };
+        if let Some(meta) = map
+            .entry("_meta")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+        {
+            meta.entry(CLAUDE_RESULT_SIZE_META)
+                .or_insert_with(|| json!(chars));
+        }
+    }
+
+    fn apply_all(&self, tools: &mut [Value], router: &Router) {
+        for tool in tools {
+            self.apply(tool, router);
+        }
+    }
 }
 
 /// The fixed 2.0 agent-facing floor: the meta-tools every connection advertises,
@@ -1624,8 +1754,10 @@ fn floor_tool_defs_with_code_mode(code_mode: bool) -> Vec<Value> {
 /// The byte guard complements the exact `o200k_base` gate in token_budget_regression;
 /// bytes alone cannot establish a token budget for JSON or non-ASCII text.
 /// The default floor goal is at most 550 o200k_base tokens, including 10% headroom.
+/// Raised from 2,400 for Claude Code's `anthropic/alwaysLoad` on search, call and
+/// fetch-result: 2,376 -> 2,490 bytes with Code Mode off.
 #[cfg(test)]
-const META_TOOL_FLOOR_BYTE_BUDGET: usize = 2_400;
+const META_TOOL_FLOOR_BYTE_BUDGET: usize = 2_520;
 
 /// The floor, named in the error a client gets when it calls a meta-tool that 2.0
 /// removed. Kept as one string so every refusal reads the same.
@@ -1711,10 +1843,10 @@ impl DiscoveryMode {
 /// The code-mode flag a registry load seeds (WS2-5).
 ///
 /// A successful load copies `registry.code_mode`, which is the value a host's flag starts
-/// from (see [`HostState::code_mode_enabled`]). A load failure must fail closed (`false`):
-/// [`Registry::default`] has `code_mode: true`, so seeding from the error fallback would
-/// silently re-enable code mode after a corrupt registry. The watcher already fails safe by
-/// not touching the flag when a reload fails.
+/// from (see [`HostState::code_mode_enabled`]). A load failure must fail closed (`false`)
+/// rather than seed from the [`Registry::default`] fallback, so a corrupt registry can
+/// never turn code mode on. The watcher already fails safe by not touching the flag
+/// when a reload fails.
 fn seed_code_mode_after_registry_load(loaded: Result<&Registry, ()>) -> bool {
     match loaded {
         Ok(reg) => reg.code_mode,
@@ -3403,12 +3535,16 @@ fn explain_match(query: &str, tool: &Value) -> Vec<String> {
 
 /// Neutralize every model-visible string on one catalog entry so a tool
 /// definition cannot deliver a fake Toolport voice (SBS-896): `description`,
-/// `title`, `annotations`, and every string in `inputSchema` / `outputSchema`
+/// `title`, `annotations`, and every string in `inputSchema`
 /// (a parameter description, a schema `title`, an `enum` value, a `default`, a
 /// property name). `name` is deliberately untouched - it is the routing key the
-/// model must echo back verbatim to call the tool.
+/// model must echo back verbatim to call the tool. Downstream output schemas are
+/// omitted because gateway results may be shaped instead of returned verbatim.
 fn neutralize_listed_tool(tool: &mut Value) {
     if let Some(map) = tool.as_object_mut() {
+        // Shaping can replace structuredContent with a preview and cursor. Do not
+        // promise the downstream output contract on any gateway discovery path.
+        map.remove("outputSchema");
         for (key, child) in map.iter_mut() {
             if key != "name" {
                 integrity::neutralize_value_strings(child);
@@ -3586,6 +3722,38 @@ fn project_search_results(tools: &[&Value], include_top_schema: bool) -> Vec<Val
     }).collect()
 }
 
+/// Code Mode only: give each search hit the signature of its script call. A menu row
+/// gains a trailing string; a full definition gains a `signature` field. A long
+/// signature is shortened, never dropped. The output schema only types the return:
+/// it stays out of the listed definition (see [`neutralize_listed_tool`]).
+fn add_search_signatures(entries: &mut [Value], source: &[&Value]) {
+    for entry in entries {
+        let name = match &*entry {
+            Value::Array(row) => row.first(),
+            Value::Object(map) => map.get("name"),
+            _ => None,
+        }
+        .and_then(Value::as_str);
+        let Some(tool) = name.and_then(|name| {
+            source
+                .iter()
+                .find(|tool| tool["name"].as_str() == Some(name))
+        }) else {
+            continue;
+        };
+        let Some(signature) = tool_signature::signature(tool) else {
+            continue;
+        };
+        match entry {
+            Value::Array(row) => row.push(Value::String(signature)),
+            Value::Object(map) => {
+                map.insert("signature".into(), Value::String(signature));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Append this process's health notes, such as a client moved to a private
 /// gateway, so an agent sees why its gateway behaves differently.
 fn with_status_notes(summary: String) -> String {
@@ -3593,6 +3761,7 @@ fn with_status_notes(summary: String) -> String {
     if let Some(notice) = conduit_lib::telemetry::health().notice() {
         notes.push(notice);
     }
+    notes.extend(conduit_lib::secret_redact::status_notes());
     if notes.is_empty() {
         return summary;
     }
@@ -3604,8 +3773,31 @@ fn with_status_notes(summary: String) -> String {
     out
 }
 
+/// [`enabled_summary_with`] against the host's live router (tests only; requests
+/// pass the router they were dispatched with).
+#[cfg(test)]
 fn enabled_summary(
     host: &HostState,
+    reg: &Registry,
+    cached: &dyn ToolCatalog,
+    profile: Option<&str>,
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> String {
+    let router = Arc::clone(
+        &host
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    enabled_summary_with(host, &router, reg, cached, profile, allowed)
+}
+
+/// [`enabled_summary`] judged against `router`: its tool counts are the tools
+/// search would return to this caller ([`tool_visible_to_model`]), so a stale
+/// cache entry for a refused tool is not counted.
+fn enabled_summary_with(
+    host: &HostState,
+    router: &Router,
     reg: &Registry,
     cached: &dyn ToolCatalog,
     profile: Option<&str>,
@@ -3714,9 +3906,12 @@ fn enabled_summary(
         // belong to instead. An ambiguous prefix resolves to nothing and is counted for
         // neither twin, which is the same fail-closed answer scoping gives (SBS-866).
         let owners = unique_prefix_owners(reg);
+        let route_of = |name: &str| owner_of_exposed_tool(Some(router), &owners, name);
+        let deny_destructive = reg.deny_destructive_effective();
+        let refused = |tool: &Value| tool_refused(tool, router, deny_destructive);
         for t in cached.iter() {
             let prefix = tool_prefix(t);
-            if prefix.is_empty() {
+            if prefix.is_empty() || !tool_visible_to_model(t, allowed, &route_of, &refused) {
                 continue;
             }
             // `tool_prefix` already lower-cases, matching how `owners` is keyed.
@@ -4324,6 +4519,100 @@ fn mcp_app_tool_for_view(tool: &Value, router: &Router, relays: bool, servers: &
 /// Whether a client scoped to `allowed` may see the exposed tool `name`. See
 /// [`scope_tools`] for how `route_of` is resolved and why the `server__` prefix is only a
 /// fallback.
+/// The model-facing visibility rule `toolport_search_tools` applies to every
+/// candidate: MCP Apps visibility (an app-only tool is never shown to the model), the
+/// caller's server scope, and the router's refusals (`refused`, normally
+/// [`tool_refused`]), so a stale cache entry for a tool that was since quarantined,
+/// disabled, put outside this client's allow-list or denied as destructive never
+/// reaches the model. `toolport.describe` and the `servers.*` stubs use the same
+/// function, and execution refuses the same tools, so all four agree.
+fn tool_visible_to_model(
+    tool: &Value,
+    allowed: Option<&std::collections::HashSet<String>>,
+    route_of: &impl Fn(&str) -> Option<String>,
+    refused: &impl Fn(&Value) -> bool,
+) -> bool {
+    mcp_app_tool_is_model_visible(tool)
+        && !refused(tool)
+        && tool
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| {
+                allowed.is_none_or(|allowed| tool_in_scope(name, allowed, route_of))
+            })
+}
+
+/// Whether search could still return the exposed tool `name` to this caller: it is
+/// in the catalog search reads and passes [`tool_visible_to_model`] under the
+/// current router, registry and scope. Paged definitions are rechecked with it.
+fn discovery_tool_visible(
+    name: &str,
+    cached: &dyn ToolCatalog,
+    router: &Router,
+    reg: &Registry,
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    let live;
+    let base: &dyn ToolCatalog = if cached.is_empty() {
+        live = router.shared_tools();
+        &live
+    } else {
+        cached
+    };
+    let owners = unique_prefix_owners(reg);
+    let route_of = |exposed: &str| owner_of_exposed_tool(Some(router), &owners, exposed);
+    let deny_destructive = reg.deny_destructive_effective();
+    let refused = |tool: &Value| tool_refused(tool, router, deny_destructive);
+    let visible = base
+        .values()
+        .filter(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+        .any(|tool| tool_visible_to_model(tool, allowed, &route_of, &refused));
+    visible
+}
+
+/// Whether a running script may still see `name` under the live router: this
+/// connection's adapter scope still holds, the live policy still admits the tool
+/// (the recheck every dispatch makes), and search would still return it.
+fn script_live_visible(
+    name: &str,
+    catalog: &dyn ToolCatalog,
+    reg: &Registry,
+    allowed: Option<&std::collections::HashSet<String>>,
+    router: &Router,
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
+    resolver: Option<LiveRouterResolver>,
+) -> bool {
+    let _view = LiveRouterResolverGuard::enter(resolver);
+    if recheck_live_policy(router, live_router, DispatchTarget::Tool(name)).is_err() {
+        return false;
+    }
+    let live = live_router.map(|slot| {
+        Arc::clone(
+            &slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    });
+    discovery_tool_visible(
+        name,
+        catalog,
+        live.as_deref().unwrap_or(router),
+        reg,
+        allowed,
+    )
+}
+
+/// Whether the router refuses a catalog entry: blocked by policy (quarantine,
+/// disabled, outside the client's tool allow-list, Strict safety), or destructive
+/// while the destructive gate is on, judged from the entry itself so a cache
+/// written before the servers connect is covered too.
+fn tool_refused(tool: &Value, router: &Router, deny_destructive: bool) -> bool {
+    let Some(name) = tool.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    (deny_destructive && cached_tool_is_destructive(tool, name, router)) || router.is_blocked(name)
+}
+
 fn tool_in_scope(
     name: &str,
     allowed: &std::collections::HashSet<String>,
@@ -4717,6 +5006,200 @@ fn recheck_live_policy(
     }
 }
 
+/// Whether any of `candidates` (or another server `visible` admits) is still
+/// loading its first catalog.
+fn first_catalog_loading(
+    view: &Router,
+    candidates: &[String],
+    visible: impl Fn(&str) -> bool + Copy,
+) -> bool {
+    view.any_discovering(visible)
+        || view.any_publishing_first_catalog(visible)
+        || candidates.iter().any(|owner| {
+            view.kick_pending(owner, |id| id == owner)
+                .is_some_and(|status| status.connecting)
+        })
+}
+
+/// Wait, up to `budget`, for a demand-started server's first catalog. Stops early
+/// once `done` holds on the latest live router, nothing visible is loading any
+/// more, or the request is cancelled. Returns the latest live router.
+#[allow(clippy::too_many_arguments)]
+fn wait_for_first_catalog(
+    router: &Router,
+    mut fresh: Option<Arc<Router>>,
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
+    budget: Duration,
+    candidates: &[String],
+    visible: impl Fn(&str) -> bool + Copy,
+    done: impl Fn(&Router) -> bool,
+    cancel: Option<&downstream::CancelContext>,
+) -> Option<Arc<Router>> {
+    let deadline = Instant::now() + budget;
+    let mut seen = started_supervisors();
+    loop {
+        let view = fresh.as_deref().unwrap_or(router);
+        if done(view)
+            || !first_catalog_loading(view, candidates, visible)
+            || Instant::now() >= deadline
+            || cancel.is_some_and(downstream::CancelContext::is_cancelled)
+        {
+            break;
+        }
+        seen = wait_for_started_supervisor(
+            seen,
+            deadline.min(Instant::now() + Duration::from_millis(25)),
+        );
+        fresh = clone_live_router(live_router);
+    }
+    clone_live_router(live_router)
+}
+
+/// Resolve a Tools tab target (`_toolportTarget`) whose server has no catalog
+/// yet. Starts only that exact server, and only when it is visible to this
+/// request, enabled and allowed by policy. `Ok(None)` keeps the generic
+/// unavailable message; `Err` is a tool result to return as is. Everything
+/// after the alias (tool scope, quarantine, approval) stays in `execute_call`.
+#[allow(clippy::too_many_arguments)]
+fn cold_start_target(
+    reg: &Registry,
+    router: &Router,
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
+    allowed: Option<&std::collections::HashSet<String>>,
+    server: &str,
+    tool: &str,
+    cancel: Option<&downstream::CancelContext>,
+    client_meta: Option<&Value>,
+) -> Result<Option<String>, Value> {
+    let failure =
+        |text: String| json!({"content": [{"type": "text", "text": text}], "isError": true});
+    if server.is_empty()
+        || tool.is_empty()
+        || !allowed.is_none_or(|scope| server_in_allowed_scope(server, scope))
+        || !reg.servers.iter().any(|entry| entry.id == server)
+    {
+        return Ok(None);
+    }
+    if !reg.server_enabled(server) {
+        return Err(failure(format!(
+            "Blocked by Toolport: {server} is turned off. Change it in Toolport > Servers."
+        )));
+    }
+    // A tool the request could not call once the catalog is in (outside a
+    // tool-granular scope, switched off, quarantined, or a fail-closed catalog)
+    // does not start its server. Check the request's own view, which carries an
+    // adapter's tool scope, and the live policy.
+    let switched_off = reg
+        .servers
+        .iter()
+        .any(|entry| entry.id == server && entry.disabled_tools.iter().any(|t| t == tool));
+    if switched_off || router.refuses_before_catalog(server, tool) {
+        return Ok(None);
+    }
+    // Without a live slot nothing can publish a new catalog to this request.
+    let Some(fresh) = clone_live_router(live_router) else {
+        return Ok(None);
+    };
+    let view = fresh.as_ref();
+    recheck_live_policy(router, live_router, DispatchTarget::Server(server))
+        .map_err(|message| failure(format!("Toolport: {message}")))?;
+    if view.authorize(DispatchTarget::Server(server)).is_err()
+        || view.refuses_before_catalog(server, tool)
+    {
+        return Ok(None);
+    }
+    if let Some(alias) = view.exposed_tool_name(server, tool) {
+        return Ok(Some(alias.to_string()));
+    }
+    view.prepare_lazy_use(server);
+    view.kick_pending(server, |id| id == server);
+    cold_start_progress(client_meta, server, ColdStartPhase::Starting);
+    let candidates = [server.to_string()];
+    let only_target = |id: &str| id == server;
+    // As long as this server may take to start, so a slow start is never cut
+    // short; Cancel still ends the wait at once.
+    let start_wait = reg.servers.iter().find(|entry| entry.id == server).map_or(
+        downstream::SETUP_CATALOG_WAIT_BUDGET,
+        conduit_lib::playground::start_wait,
+    );
+    let fresh = wait_for_first_catalog(
+        router,
+        Some(fresh),
+        live_router,
+        start_wait,
+        &candidates,
+        only_target,
+        |view| view.exposed_tool_name(server, tool).is_some(),
+        cancel,
+    );
+    let view = fresh.as_deref().unwrap_or(router);
+    if cancel.is_some_and(downstream::CancelContext::is_cancelled) {
+        return Err(failure(
+            "Toolport: request cancelled while the server was starting".to_string(),
+        ));
+    }
+    let Some(alias) = view.exposed_tool_name(server, tool).map(str::to_string) else {
+        if first_catalog_loading(view, &candidates, only_target) {
+            return Err(failure(format!(
+                "Toolport: {server} is still starting. Run it again in a moment."
+            )));
+        }
+        return Ok(None);
+    };
+    // Recheck policy on both sides of readiness. The server is Ready once its
+    // catalog published, so this returns at once.
+    prepare_dispatch(
+        view,
+        live_router,
+        DispatchTarget::Server(server),
+        cancel,
+        false,
+    )
+    .map_err(|message| failure(format!("Toolport: {message}")))?;
+    cold_start_progress(client_meta, server, ColdStartPhase::Started);
+    Ok(Some(alias))
+}
+
+#[derive(Clone, Copy)]
+enum ColdStartPhase {
+    Starting,
+    Started,
+}
+
+/// Tell the client its call is waiting for the server to start, and when that
+/// is over, as progress on the request's own `progressToken`. Sent only when the
+/// request asked for it with [`downstream::START_NOTICES_META_KEY`] and the
+/// progress can be delivered.
+fn cold_start_progress(client_meta: Option<&Value>, server: &str, phase: ColdStartPhase) {
+    let asked = client_meta
+        .and_then(|meta| meta.get(downstream::START_NOTICES_META_KEY))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !asked {
+        return;
+    }
+    let (Some(_route), Some(relayed)) = prepare_progress(client_meta, None, server) else {
+        return;
+    };
+    let (Some(token), Some(dispatch)) = (relayed.get("progressToken"), PROGRESS_DISPATCH.get())
+    else {
+        return;
+    };
+    let (progress, name, message) = match phase {
+        ColdStartPhase::Starting => (0, "starting", format!("Starting {server}")),
+        ColdStartPhase::Started => (1, "started", format!("Started {server}")),
+    };
+    dispatch(
+        server.to_string(),
+        json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {
+            "progressToken": token,
+            "progress": progress,
+            "message": message,
+            "_meta": {"toolport/phase": name, "toolport/serverId": server},
+        }}),
+    );
+}
+
 /// Startup may outlast a policy edit, so check on both sides of the wait.
 fn prepare_dispatch(
     router: &Router,
@@ -4735,6 +5218,30 @@ fn prepare_dispatch(
         router.wait_for_server(owner, cancel, continuation)?;
     }
     recheck_live_policy(router, live_router, target)
+}
+
+/// Refuse a prompt dispatch whose server had its prompts hidden (`hidePrompts`)
+/// after this request took its router snapshot. The snapshot still routes the
+/// prompt, and [`recheck_live_policy`] only asks whether the server is on, so
+/// without this an in-flight `prompts/get` or prompt completion would still
+/// reach a prompt the user just hid. Only prompt dispatch calls this, so the
+/// server's tools are never affected. The refusal reads like an unknown prompt,
+/// the same as a request admitted after the change.
+fn recheck_live_prompt_visibility(
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
+    owner: &str,
+    exposed: &str,
+) -> Result<(), String> {
+    let hidden = live_router.is_some_and(|slot| {
+        slot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .prompts_hidden(owner)
+    });
+    if hidden {
+        Err(format!("no route for prompt '{exposed}'"))
+    } else {
+        Ok(())
+    }
 }
 
 const STALE_LIVE_VIEW: &str =
@@ -4987,50 +5494,47 @@ fn execute_call(
     let catalog_visible = |id: &str| {
         visible(id) && (candidates.is_empty() || candidates.iter().any(|owner| owner == id))
     };
+    // Activity counts the wait for the server to start in the call's duration:
+    // the caller waited for it too.
+    let mut start_wait = CARRIED_START_WAIT.with(std::cell::Cell::get);
     if view.authorize(DispatchTarget::Tool(name)).is_ok() {
         for owner in &candidates {
             view.prepare_lazy_use(owner);
             view.kick_pending(owner, |id| id == owner);
         }
+        let waiting = Instant::now();
         if view.route_of(name).is_some() {
             // A cached route proves identity, not current safety metadata. Keep
             // the existing readiness wait before classifying a known call.
             for owner in &candidates {
+                // A known server that is not up yet: say the call waits for it.
+                let starting = view.lazy_starting(owner);
+                if starting {
+                    cold_start_progress(client_meta, owner, ColdStartPhase::Starting);
+                }
                 if let Err(message) = view.wait_for_server(owner, cancel.as_ref(), false) {
                     return json!({"content": [{"type": "text", "text": format!("Toolport: {message}")}], "isError": true});
+                }
+                if starting {
+                    cold_start_progress(client_meta, owner, ColdStartPhase::Started);
                 }
             }
             fresh = clone_live_router(live_router);
         } else if fresh.is_some() {
-            let deadline = Instant::now() + FIRST_CATALOG_WAIT;
-            let mut seen = started_supervisors();
-            loop {
-                let view = fresh.as_deref().unwrap_or(router);
-                let loading = view.any_discovering(catalog_visible)
-                    || view.any_publishing_first_catalog(catalog_visible)
-                    || candidates.iter().any(|owner| {
-                        view.kick_pending(owner, |id| id == owner)
-                            .is_some_and(|status| status.connecting)
-                    });
-                if view.route_of(name).is_some()
-                    || view.is_blocked(name)
-                    || !loading
-                    || Instant::now() >= deadline
-                    || cancel
-                        .as_ref()
-                        .is_some_and(downstream::CancelContext::is_cancelled)
-                {
-                    break;
-                }
-                seen = wait_for_started_supervisor(
-                    seen,
-                    deadline.min(Instant::now() + Duration::from_millis(25)),
-                );
-                fresh = clone_live_router(live_router);
-            }
-            fresh = clone_live_router(live_router);
+            fresh = wait_for_first_catalog(
+                router,
+                fresh,
+                live_router,
+                FIRST_CATALOG_WAIT,
+                &candidates,
+                catalog_visible,
+                |view| view.route_of(name).is_some() || view.is_blocked(name),
+                cancel.as_ref(),
+            );
         }
+        start_wait += waiting.elapsed();
     }
+    let mut start_wait_ms = start_wait.as_millis().min(u64::MAX as u128) as u64;
     let router = fresh.as_deref().unwrap_or(router);
     let fresh_catalog = fresh.as_ref().map(|view| view.shared_tools());
     let cached = fresh_catalog
@@ -5151,6 +5655,7 @@ fn execute_call(
                         active_client_label().as_deref(),
                         None,
                         None,
+                        None,
                     );
                     return json!({
                         "content": [{ "type": "text", "text": msg }],
@@ -5238,6 +5743,8 @@ fn execute_call(
                 client: client.map(str::to_string),
                 client_name: observation::current().client_name,
                 client_label: active_client_label(),
+                host: observation::current().host.map(|host| host.host),
+                host_thread: observation::current().host.and_then(|host| host.thread),
                 server: server_id.to_string(),
                 tool: tool.to_string(),
                 reason,
@@ -5292,8 +5799,13 @@ fn execute_call(
                             held_ms,
                             downstream,
                             newly_approved,
+                            start_wait: asked_after,
                         },
                     )) => {
+                        // The start happened on the request that asked; this
+                        // retry found the server ready.
+                        start_wait_ms = start_wait_ms
+                            .saturating_add(asked_after.as_millis().min(u64::MAX as u128) as u64);
                         approval_reason = stored_reason;
                         active_modern_hitl = Some(token.to_string());
                         routed_mrtr = Some(downstream);
@@ -5335,7 +5847,10 @@ fn execute_call(
                             &arguments,
                             incoming,
                         ) {
-                            Ok(token) => return modern_hitl_input_required(&token),
+                            Ok(token) => {
+                                set_modern_hitl_start_wait(&token, start_wait);
+                                return modern_hitl_input_required(&token);
+                            }
                             Err(decision) => (decision, 0, current_fp.clone(), true),
                         }
                     }
@@ -5487,6 +6002,9 @@ fn execute_call(
     };
     // Hash args for the audit line (and SOU-171 org export) without storing them.
     let call_args_hash = audit::args_hash(&arguments);
+    // The client's own arguments, for the outgoing redaction's exemption: a
+    // secret the client sent may be echoed back to it.
+    let client_arguments = arguments.clone();
     if let Some(profiler) = &mut call_profiler {
         profiler.mark_preflight();
     }
@@ -5499,8 +6017,17 @@ fn execute_call(
     //
     // Identity already comes from `exec_router` via the SOU-478 rebind above
     // (SOU-474 originally fixed only this progress path).
-    let (_progress_route, relay_owned) = prepare_progress(client_meta, server_id);
-    let client_meta = relay_owned.as_ref().or(client_meta);
+    let (_progress_route, relay_owned) = prepare_progress(
+        client_meta,
+        Some(&json!({ "arguments": client_arguments })),
+        server_id,
+    );
+    // The request's ask for start notices is for the gateway, not the server.
+    let relayed = relay_owned
+        .as_ref()
+        .or(client_meta)
+        .map(without_start_notices);
+    let client_meta = relayed.as_ref();
 
     // Resolve pseudonyms LAST, immediately before the call leaves the machine, so
     // the downstream server gets real data while every model-facing path above
@@ -5586,8 +6113,16 @@ fn execute_call(
             // hostile server can't bypass the injection scanner by answering with an
             // error instead of a result (issue #421). A server's own result, failed or
             // not, gets no Toolport text appended: clients parse these blocks.
-            let Defended { result: out, pii } =
-                defend_and_shape(reg, srv, tool, client, result, "", shape);
+            let request = json!({ "arguments": client_arguments });
+            let Defended {
+                result: mut out,
+                pii,
+                secrets: shaped,
+            } = defend_and_shape_for(reg, srv, tool, client, result, "", shape, Some(&request));
+            let secrets = with_shaped(
+                shaped,
+                secrets_replaced_in(&mut out, &client_arguments, opts.direct),
+            );
             if let Some(profiler) = &mut call_profiler {
                 profiler.mark_postprocess();
             }
@@ -5603,13 +6138,14 @@ fn execute_call(
                 server_id,
                 tool,
                 ok,
-                Some(ms),
+                Some(ms + start_wait_ms),
                 err.as_deref(),
                 client,
                 client_name,
                 active_client_label().as_deref(),
                 Some(&call_args_hash),
                 pii,
+                Some(&secrets),
             );
             if let Some(profiler) = call_profiler {
                 profiler.finish();
@@ -5639,24 +6175,114 @@ fn execute_call(
             // Defend first, then audit: the error text runs through the same PII pass as
             // a successful result, and the audit row has to carry that pass's count like
             // the success path does (SBS-607).
-            let Defended { result: out, pii } =
-                defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
+            let request = json!({ "arguments": client_arguments });
+            let Defended {
+                result: mut out,
+                pii,
+                secrets: shaped,
+            } = defend_and_shape_for(
+                reg,
+                srv,
+                tool,
+                client,
+                result,
+                &trailer,
+                shape,
+                Some(&request),
+            );
+            let secrets = with_shaped(
+                shaped,
+                secrets_replaced_in(&mut out, &client_arguments, opts.direct),
+            );
             let defended_err = audited_error_text(&e, &out);
             audit::record_routed_call(
                 reg,
                 server_id,
                 tool,
                 false,
-                Some(ms),
+                Some(ms + start_wait_ms),
                 Some(&defended_err),
                 client,
                 client_name,
                 active_client_label().as_deref(),
                 Some(&call_args_hash),
                 pii,
+                Some(&secrets),
             );
             out
         }
+    }
+}
+
+/// The configured secrets a call's result carries, by name and count, for its
+/// audit row. A direct call's result is redacted here, as the final pass to the
+/// client would redact it; a code-mode step's result goes to the script as it
+/// is (the script may pass a value on), so a copy is counted instead.
+fn secrets_replaced_in(
+    out: &mut Value,
+    client_arguments: &Value,
+    direct: bool,
+) -> std::collections::BTreeMap<String, usize> {
+    let request = json!({ "arguments": client_arguments });
+    if direct {
+        conduit_lib::secret_redact::redact_outgoing_counted(out, Some(&request))
+    } else {
+        let mut copy = out.clone();
+        conduit_lib::secret_redact::redact_outgoing_counted(&mut copy, Some(&request))
+    }
+}
+
+/// The audit counts of a call: those replaced before shaping plus any the
+/// final pass found after it (a trailer, say).
+fn with_shaped(
+    shaped: Option<std::collections::BTreeMap<String, usize>>,
+    mut after: std::collections::BTreeMap<String, usize>,
+) -> std::collections::BTreeMap<String, usize> {
+    for (name, count) in shaped.into_iter().flatten() {
+        *after.entry(name).or_default() += count;
+    }
+    after
+}
+
+thread_local! {
+    /// When the request being served arrived at the gateway.
+    static REQUEST_RECEIVED: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Holds [`REQUEST_RECEIVED`] for one request and clears it afterwards.
+struct RequestReceived(Option<Instant>);
+
+impl RequestReceived {
+    fn enter() -> Self {
+        Self(REQUEST_RECEIVED.with(|cell| cell.replace(Some(Instant::now()))))
+    }
+}
+
+impl Drop for RequestReceived {
+    fn drop(&mut self) {
+        REQUEST_RECEIVED.with(|cell| cell.set(self.0));
+    }
+}
+
+thread_local! {
+    /// How long the request being served already waited before [`execute_call`],
+    /// such as for its server to start, so Activity counts it in the duration.
+    static CARRIED_START_WAIT: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+/// Holds [`CARRIED_START_WAIT`] for one call and clears it afterwards.
+struct CarriedStartWait;
+
+impl CarriedStartWait {
+    fn enter(waited: Duration) -> Self {
+        CARRIED_START_WAIT.with(|cell| cell.set(waited));
+        Self
+    }
+}
+
+impl Drop for CarriedStartWait {
+    fn drop(&mut self) {
+        CARRIED_START_WAIT.with(|cell| cell.set(Duration::ZERO));
     }
 }
 
@@ -6031,6 +6657,8 @@ fn approve_pii_release(
         client: client.map(str::to_string),
         client_name: observation::current().client_name,
         client_label: active_client_label(),
+        host: observation::current().host.map(|host| host.host),
+        host_thread: observation::current().host.and_then(|host| host.thread),
         server: server.to_string(),
         tool: tool.to_string(),
         reason: approval::ApprovalReason::PiiCrossServer,
@@ -6275,9 +6903,25 @@ fn defend_and_shape(
     srv: &str,
     tool: &str,
     client: Option<&str>,
+    result: Value,
+    trailer: &str,
+    shape: bool,
+) -> Defended {
+    defend_and_shape_for(reg, srv, tool, client, result, trailer, shape, None)
+}
+
+/// [`defend_and_shape`] for a call whose `request` exempts the client's own
+/// values from the redaction that runs before shaping.
+#[allow(clippy::too_many_arguments)]
+fn defend_and_shape_for(
+    reg: &Registry,
+    srv: &str,
+    tool: &str,
+    client: Option<&str>,
     mut result: Value,
     trailer: &str,
     shape: bool,
+    request: Option<&Value>,
 ) -> Defended {
     // Scan untrusted output for injection; record findings, optionally fail closed.
     // Block mode alone must still run the scanner: an org forceBlockOnInjection (or a
@@ -6306,6 +6950,7 @@ fn defend_and_shape(
     if !blocked {
         integrity::label_untrusted_result(srv, &mut result);
     }
+    let mut secrets = None;
     // Cap an oversized result, cache the full body, hand back a head + fetch cursor.
     // A per-server resultBudget overrides the global default (Some(0) = never shape).
     // Code-mode intermediate calls pass `shape = false`: full bodies stay in the
@@ -6324,6 +6969,13 @@ fn defend_and_shape(
 
                 budget
             });
+        // Before the cut: the head and the cached body are both redacted, so
+        // neither a head that ends inside a secret nor a fetch page that
+        // starts inside one returns part of it.
+        secrets = Some(conduit_lib::secret_redact::redact_outgoing_counted(
+            &mut result,
+            request,
+        ));
         shaping::shape_result(&mut result, budget, client);
     }
     if !blocked && shape {
@@ -6336,7 +6988,11 @@ fn defend_and_shape(
             arr.push(json!({ "type": "text", "text": trailer }));
         }
     }
-    Defended { result, pii }
+    Defended {
+        result,
+        pii,
+        secrets,
+    }
 }
 
 /// [`defend_and_shape`]'s output: the agent-facing result, plus what the PII pass did on
@@ -6349,6 +7005,8 @@ struct Defended {
     result: Value,
     /// `None` when PII redaction was off for this call -- see [`pseudonymize_if_enabled`].
     pii: Option<audit::PiiPass>,
+    /// Secrets replaced before shaping, by name; `None` when not shaped.
+    secrets: Option<std::collections::BTreeMap<String, usize>>,
 }
 
 /// Exposed tool names for code-mode `servers.*` stubs: full catalog minus gateway
@@ -6366,27 +7024,78 @@ fn script_catalog_tools(
     allowed: Option<&std::collections::HashSet<String>>,
     route_of: impl Fn(&str) -> Option<String>,
 ) -> Vec<String> {
+    // Search's own visibility rule. The router's refusals ([`tool_refused`]) were
+    // applied when the catalog was taken ([`script_source`]). Names with no server
+    // part (an override rename) stay in: they get no `servers.*` stub, but
+    // `toolport.call` and `describe` reach them, exactly as their search signature
+    // says.
     let mut names: Vec<String> = cached
         .iter()
+        .filter(|tool| tool_visible_to_model(tool, allowed, &route_of, &|_: &Value| false))
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .filter(|n| !codemode::is_code_mode_meta_tool(n))
-        .filter(|n| {
-            let Some((server, tool)) = codemode::split_exposed_name(n) else {
-                return false;
-            };
-            if server.is_empty() || tool.is_empty() {
-                return false;
-            }
-            match allowed {
-                Some(set) => route_of(n).is_some_and(|sid| server_in_allowed_scope(&sid, set)),
-                None => true,
-            }
-        })
         .map(str::to_string)
         .collect();
     names.sort();
     names.dedup();
     names
+}
+
+/// What a script may see: the catalog search would search (the cached one, or the
+/// live router's on a cold cache) without tools the router refuses
+/// ([`tool_refused`], the check search applies). A stale cache can still hold a tool
+/// that was disabled, quarantined or put outside this client's tool scope since; no
+/// stub or describe should offer it.
+fn script_source(cached: &dyn ToolCatalog, router: &Router, reg: &Registry) -> SharedTools {
+    let base = if cached.is_empty() {
+        router.shared_tools()
+    } else {
+        cached.shared()
+    };
+    drop_blocked_from_cache(base, router, reg)
+}
+
+/// `toolport.describe` over the same scoped names the `servers.*` stubs come from.
+/// The schema gets the neutralisation every listed `inputSchema` gets. The signature
+/// is complete; `truncated` is true only when a guard was reached, with the reason.
+/// A check of the live router a running script's callbacks apply on top of the
+/// catalog captured at script start ([`script_live_visible`]).
+type ScriptLiveCheck = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+fn script_describe_binding(
+    tools: SharedTools,
+    catalog: &[String],
+    live: Option<ScriptLiveCheck>,
+) -> codemode::DescribeBinding {
+    let in_scope: HashSet<String> = catalog.iter().cloned().collect();
+    Arc::new(move |name: &str| {
+        let Some(tool) = (in_scope.contains(name) && live.as_ref().is_none_or(|live| live(name)))
+            .then(|| {
+                tools
+                    .iter()
+                    .find(|tool| tool["name"].as_str() == Some(name))
+            })
+            .flatten()
+        else {
+            return Value::Null;
+        };
+        let mut schema = tool
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        integrity::neutralize_value_strings(&mut schema);
+        let full = tool_signature::full_signature(tool);
+        let mut described = json!({
+            "name": name,
+            "signature": full.as_ref().map(|full| full.signature.clone()),
+            "inputSchema": schema,
+            "truncated": full.as_ref().is_some_and(|full| full.truncated.is_some()),
+        });
+        if let Some(reason) = full.and_then(|full| full.truncated) {
+            described["truncatedReason"] = Value::String(reason);
+        }
+        described
+    })
 }
 
 /// Dry-run a code-mode script: compile it, bind the same client-scoped `servers.*`
@@ -6464,11 +7173,13 @@ fn validate_script(
     let fetch: codemode::FetchBinding =
         Arc::new(|_args: codemode::FetchArgs| json!({ "content": [], "isError": false }));
 
+    let describe = script_describe_binding(cached.shared(), &catalog, None);
     let outcome = run_code_mode_isolated(
         script,
         input,
         call,
         Some(fetch),
+        Some(describe),
         limits,
         &catalog,
         None,
@@ -6693,7 +7404,8 @@ fn run_script_dispatch(
         .unwrap_or(false)
     {
         let owners = unique_prefix_owners(reg);
-        return validate_script_dispatch(&script, input, cached, allowed, client, |name| {
+        let source = script_source(cached, router_arc, reg);
+        return validate_script_dispatch(&script, input, &source, allowed, client, |name| {
             owner_of_exposed_tool(Some(router_arc.as_ref()), &owners, name)
         });
     }
@@ -6784,29 +7496,63 @@ fn execute_script_dispatch(
         run()
     });
 
-    // Cursor handoff for any already-shaped result (prior turn, or external cursor in data).
+    // Typed `servers.*` stubs from the client-scoped catalog (meta-tools excluded).
+    let owners = unique_prefix_owners(reg);
+    let source = script_source(cached, router_arc, reg);
+    let catalog = script_catalog_tools(&source, allowed, |name| {
+        owner_of_exposed_tool(Some(router_arc.as_ref()), &owners, name)
+    });
+
+    // A script can wait on calls, and policy can change meanwhile. Its describe
+    // callback and its fetches of paged tool definitions keep the catalog and scope
+    // captured here and also ask the live router, as each `toolport.call` does.
+    // Fetching an ordinary tool-call result is not rechecked: that output stays
+    // readable to its caller after a policy change.
+    let live_check: ScriptLiveCheck = {
+        let source = source.clone();
+        let reg = reg.clone();
+        let allowed = allowed.cloned();
+        let router = Arc::clone(router_arc);
+        let live = live_router.cloned();
+        let resolver = active_live_router_resolver();
+        Arc::new(move |name: &str| {
+            script_live_visible(
+                name,
+                &source,
+                &reg,
+                allowed.as_ref(),
+                &router,
+                live.as_ref(),
+                resolver.clone(),
+            )
+        })
+    };
+
+    // Cursor handoff for any already-shaped result (prior turn, or external cursor in
+    // data). A paged tool definition is served only while the script could still
+    // see that tool: `catalog` is search's own visibility rule over this catalog.
+    // The check runs only for discovery pages, and with the shaping cache unlocked.
     let client_for_fetch = client.map(str::to_string);
+    let fetch_visible: HashSet<String> = catalog.iter().cloned().collect();
+    let fetch_live = Arc::clone(&live_check);
     let fetch: codemode::FetchBinding = Arc::new(move |args: codemode::FetchArgs| {
-        shaping::fetch_result(
+        shaping::fetch_result_visible(
             &args.cursor,
             args.offset,
             args.len,
             client_for_fetch.as_deref(),
             args.projection.as_deref(),
+            &|name| fetch_visible.contains(name) && fetch_live(name),
         )
     });
 
-    // Typed `servers.*` stubs from the client-scoped catalog (meta-tools excluded).
-    let owners = unique_prefix_owners(reg);
-    let catalog = script_catalog_tools(cached, allowed, |name| {
-        owner_of_exposed_tool(Some(router_arc.as_ref()), &owners, name)
-    });
-
+    let describe = script_describe_binding(source, &catalog, Some(live_check));
     let outcome = run_code_mode_isolated(
         script,
         input,
         call,
         Some(fetch),
+        Some(describe),
         limits,
         &catalog,
         cancel.clone(),
@@ -7549,12 +8295,15 @@ fn build_tool_surfaces(
         })
         .collect();
     let relays_apps = key.relays_apps;
+    let hints = ResultSizeHints::new(reg, allowed);
     let neutralized = |tool: &Value| {
         let mut tool = tool.clone();
         neutralize_listed_tool(&mut tool);
+        hints.apply(&mut tool, router);
         tool
     };
-    let floor = full_tool_floor(key.code_mode, key.full_fallback);
+    let mut floor = full_tool_floor(key.code_mode, key.full_fallback);
+    hints.apply_all(&mut floor, router);
     let full_tools = || {
         floor.iter().cloned().chain(
             scoped
@@ -7578,13 +8327,14 @@ fn build_tool_surfaces(
         summary: Arc::new(savings::SurfaceSummary::from_tools(full_tools())),
         key: key.clone(),
     });
-    let floor = grouped_tool_defs_from_tools(
+    let mut floor = grouped_tool_defs_from_tools(
         key.code_mode,
         scoped
             .iter()
             .copied()
             .filter(|_| mode == DiscoveryMode::Grouped),
     );
+    hints.apply_all(&mut floor, router);
     let apps = scoped
         .iter()
         .copied()
@@ -7653,7 +8403,7 @@ fn tool_surface_with_code_mode(
             owner_of_exposed_tool(Some(router), &owners, name)
         })
     };
-    match mode {
+    let mut tools = match mode {
         DiscoveryMode::Full => {
             let mut tools = full_tool_floor(code_mode, false);
             if !relays_mcp_app_html_to_active_client(router, allowed) {
@@ -7677,7 +8427,9 @@ fn tool_surface_with_code_mode(
             tools.extend(app_tools);
             tools
         }
-    }
+    };
+    ResultSizeHints::new(reg, allowed).apply_all(&mut tools, router);
+    tools
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7799,13 +8551,16 @@ fn handle_request_with_cancel(
             } else {
                 drop_blocked_from_cache(cached.shared(), router, reg)
             };
+            let hints = ResultSizeHints::new(reg, allowed);
             let mut tools = tool_surface(host, reg, router, &catalog, allowed, mode);
             if mode == DiscoveryMode::Full && full_discovery_fallback(client) {
                 tools.splice(2..2, [search_tool_def(), call_tool_def()]);
+                hints.apply_all(&mut tools[2..4], router);
             }
             let mut full = tool_surface(host, reg, router, &catalog, allowed, DiscoveryMode::Full);
             if full_discovery_fallback(client) {
                 full.splice(2..2, [search_tool_def(), call_tool_def()]);
+                hints.apply_all(&mut full[2..4], router);
             }
             let full_floor =
                 full_tool_floor(host.code_mode_enabled(), full_discovery_fallback(client)).len();
@@ -7911,10 +8666,21 @@ fn handle_request_with_cancel(
                 let len = arguments.get("len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let projection = arguments.get("projection").and_then(|v| v.as_str());
                 // Pass the calling client so a client can only fetch results it stashed
-                // (the stash is process-global in HTTP mode).
+                // (the stash is process-global in HTTP mode). The reply fits the global
+                // budget, which is what this tool's maxResultSizeChars hint advertises.
+                // A paged tool definition is served only while search would still
+                // return that tool to this caller.
+                let (budget, warning) = shaping::budget();
+                if let Some(msg) = warning {
+                    eprintln!("{msg}");
+                }
+                let visible =
+                    |name: &str| discovery_tool_visible(name, cached, router, reg, allowed);
                 return Some(success(
                     id,
-                    shaping::fetch_result(cursor, offset, len, client, projection),
+                    shaping::fetch_result_for_model_visible(
+                        cursor, offset, len, client, projection, budget, &visible,
+                    ),
                 ));
             }
 
@@ -7922,7 +8688,7 @@ fn handle_request_with_cancel(
                 return Some(success(
                     id,
                     json!({
-                        "content": [{ "type": "text", "text": with_status_notes(enabled_summary(host, reg, cached, profile, allowed)) }],
+                        "content": [{ "type": "text", "text": with_status_notes(enabled_summary_with(host, router, reg, cached, profile, allowed)) }],
                         "isError": false
                     }),
                 ));
@@ -7987,20 +8753,17 @@ fn handle_request_with_cancel(
                         .map(|entry| entry.id.as_str())
                         .or_else(|| owners.get(&selector.to_lowercase()).map(String::as_str))
                 });
+                let route_of = |name: &str| owner_of_exposed_tool(Some(router), &owners, name);
+                let deny_destructive = reg.deny_destructive_effective();
+                let refused = |tool: &Value| tool_refused(tool, router, deny_destructive);
                 let visible = |tool: &Value| {
-                    mcp_app_tool_is_model_visible(tool)
+                    tool_visible_to_model(tool, allowed, &route_of, &refused)
                         && tool
                             .get("name")
                             .and_then(Value::as_str)
                             .is_some_and(|name| {
-                                server_owner.is_none_or(|owner| {
-                                    owner_of_exposed_tool(Some(router), &owners, name).as_deref()
-                                        == Some(owner)
-                                }) && allowed.is_none_or(|allowed| {
-                                    tool_in_scope(name, allowed, &|name| {
-                                        owner_of_exposed_tool(Some(router), &owners, name)
-                                    })
-                                })
+                                server_owner
+                                    .is_none_or(|owner| route_of(name).as_deref() == Some(owner))
                             })
                 };
                 let source: Vec<&Value> = base.iter().filter(|tool| visible(tool)).collect();
@@ -8170,6 +8933,9 @@ fn handle_request_with_cancel(
                 } else {
                     format!("{lead} {} pinned prerequisite tool(s) included with full schema; unranked prerequisites listed first.", pinned.len())
                 };
+                if host.code_mode_enabled() {
+                    add_search_signatures(&mut entries, &source);
+                }
                 // Count the exact serialized payload sent to the client.
                 let payload = serde_json::to_string(&entries).unwrap_or_default();
                 let matched_schema_bytes = payload.len() as u64;
@@ -8177,9 +8943,22 @@ fn handle_request_with_cancel(
                 drop(payload);
                 let mut search_result = json!({ "content": [{ "type": "text", "text": text }], "isError": false, "low_confidence": low_confidence });
                 // A menu must keep every selected candidate visible. Only explicit
-                // describe requests page a large complete definition.
+                // describe requests page a large complete definition. Its cursor
+                // remembers the tools it describes, so a later fetch rechecks them.
                 if exact {
-                    shaping::shape_result(&mut search_result, SEARCH_DESCRIBE_BUDGET_BYTES, client);
+                    let describes = pinned
+                        .iter()
+                        .chain(matches.iter())
+                        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect();
+                    shaping::shape_discovery_result(
+                        &mut search_result,
+                        SEARCH_DESCRIBE_BUDGET_BYTES,
+                        client,
+                        describes,
+                        host.discovery_realm(),
+                    );
                 }
                 let response_content_bytes = search_result["content"][0]["text"]
                     .as_str()
@@ -8318,14 +9097,32 @@ fn handle_request_with_cancel(
                 if let Some(target) = arguments.get("_toolportTarget") {
                     let server = target.get("serverId").and_then(Value::as_str).unwrap_or("");
                     let tool = target.get("tool").and_then(Value::as_str).unwrap_or("");
-                    let Some(alias) = router.exposed_tool_name(server, tool) else {
+                    let alias = match router.exposed_tool_name(server, tool) {
+                        Some(alias) => Some(alias.to_string()),
+                        // A cold server has no routes yet (D123). Start that exact
+                        // server through the same scope, enabled and policy checks.
+                        None => match cold_start_target(
+                            reg,
+                            router,
+                            live_router,
+                            allowed,
+                            server,
+                            tool,
+                            cancel.as_ref(),
+                            req.get("params").and_then(|p| p.get("_meta")),
+                        ) {
+                            Ok(alias) => alias,
+                            Err(result) => return Some(success(id, result)),
+                        },
+                    };
+                    let Some(alias) = alias else {
                         return Some(success(
                             id,
                             json!({"content": [{"type": "text", "text": "Tool unavailable in this client's access set or blocked by gateway policy."}], "isError": true}),
                         ));
                     };
                     (
-                        alias.to_string(),
+                        alias,
                         arguments
                             .get("arguments")
                             .cloned()
@@ -8350,6 +9147,14 @@ fn handle_request_with_cancel(
                     .route_of(&name)
                     .is_some_and(|(server, _)| server_supports_mcp_app_html(router, server));
             let mrtr = MrtrRequest::from_params(params);
+            // Count what this call already waited for, such as its server
+            // starting, in its Activity duration.
+            let _start_wait = CarriedStartWait::enter(
+                REQUEST_RECEIVED
+                    .with(std::cell::Cell::get)
+                    .map(|received| received.elapsed())
+                    .unwrap_or_default(),
+            );
             let result = execute_call(
                 reg,
                 router,
@@ -8474,10 +9279,13 @@ fn handle_request_with_cancel(
                     ));
                 }
             }
-            let client_meta = params.and_then(|p| p.get("_meta")).cloned();
+            // The start notices ask is for the gateway alone; never relay it.
+            let client_meta = params
+                .and_then(|p| p.get("_meta"))
+                .map(without_start_notices);
             let mrtr = MrtrRequest::from_params(params);
             let (_progress_route, relay_owned) = match router.resource_server(uri) {
-                Some(owner) => prepare_progress(client_meta.as_ref(), owner),
+                Some(owner) => prepare_progress(client_meta.as_ref(), params, owner),
                 None => (None, None),
             };
             let client_meta = relay_owned.or(client_meta);
@@ -8630,10 +9438,13 @@ fn handle_request_with_cancel(
                     ));
                 }
             }
-            let client_meta = params.and_then(|p| p.get("_meta")).cloned();
+            // The start notices ask is for the gateway alone; never relay it.
+            let client_meta = params
+                .and_then(|p| p.get("_meta"))
+                .map(without_start_notices);
             let mrtr = MrtrRequest::from_params(params);
             let (_progress_route, relay_owned) = match router.prompt_server(name) {
-                Some(owner) => prepare_progress(client_meta.as_ref(), owner),
+                Some(owner) => prepare_progress(client_meta.as_ref(), params, owner),
                 None => (None, None),
             };
             let client_meta = relay_owned.or(client_meta);
@@ -8644,7 +9455,8 @@ fn handle_request_with_cancel(
                     DispatchTarget::Server(owner),
                     cancel.as_ref(),
                     !mrtr.is_empty(),
-                ),
+                )
+                .and_then(|()| recheck_live_prompt_visibility(live_router, owner, name)),
                 None => Ok(()),
             };
             match live_policy.and_then(|()| {
@@ -8701,6 +9513,13 @@ fn handle_request_with_cancel(
                             ));
                         }
                     }
+                    // A prompt reference is refused once its server's prompts are
+                    // hidden live; a resource-template reference is unaffected.
+                    let prompt_ref = params
+                        .get("ref")
+                        .filter(|r| r.get("type").and_then(Value::as_str) == Some("ref/prompt"))
+                        .and_then(|r| r.get("name"))
+                        .and_then(Value::as_str);
                     match prepare_dispatch(
                         router,
                         live_router,
@@ -8708,6 +9527,10 @@ fn handle_request_with_cancel(
                         cancel.as_ref(),
                         false,
                     )
+                    .and_then(|()| match prompt_ref {
+                        Some(name) => recheck_live_prompt_visibility(live_router, &server_id, name),
+                        None => Ok(()),
+                    })
                     .and_then(|()| router.complete_with_cancel(params, cancel.clone()))
                     {
                         Ok(result) => Some(success(id, result)),
@@ -9052,9 +9875,16 @@ fn registry_policy(
     let servers = router_servers(reg, profile, http_mode, daemon_mode);
     // Per-tool disables + the global destructive switch, from the same server set.
     let mut disabled = std::collections::HashMap::new();
+    // Servers whose prompts the user hid (`hidePrompts`). Carried in the policy,
+    // not baked into the connection, so the toggle applies to a live router
+    // without reconnecting the server.
+    let mut hidden_prompts = HashSet::new();
     for s in &servers {
         if !s.disabled_tools.is_empty() {
             disabled.insert(s.id.clone(), s.disabled_tools.iter().cloned().collect());
+        }
+        if s.hide_prompts {
+            hidden_prompts.insert(s.id.clone());
         }
     }
     // Tool-granular profile scope (SOU-189 / SOU-167): per-server ORIGINAL tool allow-lists.
@@ -9082,6 +9912,7 @@ fn registry_policy(
         disabled,
         allow,
         deny_destructive: reg.deny_destructive_effective(),
+        hidden_prompts,
     }
 }
 
@@ -9277,20 +10108,29 @@ fn server_credential_revision(server: &ServerEntry, generation: u64) -> String {
         return digest.clone();
     }
     let mut material = Vec::new();
+    let mut unreadable = false;
     for (key, vault_only) in keys {
+        // A router build is no use of the value: it must not ask to unlock the
+        // store (every role builds one at start). Locked, the value reads as
+        // unreadable, and the connect that first uses it asks.
         let value = if vault_only {
-            secrets::get_vault_secret_result(&server.id, &key)
+            secrets::get_vault_secret_without_prompt(&server.id, &key)
         } else {
-            secrets::get_secret_result(&server.id, &key)
+            secrets::get_secret_without_prompt(&server.id, &key)
         };
+        unreadable |= value.is_err();
         // Errors are represented without recording their possibly sensitive text.
         material.push(json!({"key":key,"value":value.as_ref().ok(),"unreadable":value.is_err()}));
     }
     let digest = registry::sha256_hex(&Value::Array(material).to_string());
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(cache_key, (generation, digest.clone()));
+    // Only a complete read is kept: one taken while the store was locked is
+    // read again by the next build.
+    if !unreadable {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(cache_key, (generation, digest.clone()));
+    }
     digest
 }
 
@@ -9403,6 +10243,10 @@ fn connect_one_result(
     } else {
         server
     };
+    // Every inline or URL-borne secret this server carries is registered before
+    // anything is launched or sent (stdio entries were registered as they
+    // resolved; this also covers the HTTP branch).
+    conduit_lib::secret_refs::register_inline_secrets(server);
     let initialize_timeout = server.initialize_timeout();
     let result = if let Err(error) = &initialize_timeout {
         Err(error.clone())
@@ -9875,6 +10719,52 @@ fn notify_list_changed_for_router_diff(
     }
 }
 
+/// Announce `notifications/prompts/list_changed` after `hidePrompts` flipped for
+/// `servers`. The stdio client always hears it. An HTTP session hears it only when
+/// its scope can see one of those servers (an unscoped session sees them all), so a
+/// client limited to other servers learns nothing about the toggle. Matching by
+/// server id also covers a daemon's `${ROOT}` servers, which only per-session
+/// rooted views hold and a base-router diff therefore cannot see.
+fn notify_prompts_changed_for_servers(
+    stdio: &SessionState,
+    mcp_sessions: Option<&McpSessions>,
+    servers: &HashSet<String>,
+) {
+    let method = "notifications/prompts/list_changed";
+    notify_list_changed(stdio, None, method);
+    let Some(sessions) = mcp_sessions else {
+        return;
+    };
+    let sessions: Vec<Arc<SessionState>> = sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .cloned()
+        .collect();
+    let msg = json!({ "jsonrpc": "2.0", "method": method });
+    for session in sessions {
+        if !session.takes_notifications() {
+            continue;
+        }
+        let in_scope = match session
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.scope.as_ref())
+        {
+            Some(scope) => scope.iter().any(|id| servers.contains(id)),
+            None => true,
+        };
+        if !in_scope {
+            continue;
+        }
+        if let Some(json) = session.notification_json(&msg) {
+            if !session.push_message(json, None) {
+                eprintln!("toolport: MCP session could not take a notification; dropped");
+            }
+        }
+    }
+}
+
 /// How long a server->client request waits for the stdio handshake to finish
 /// before giving up on it. Generous: the gap between `initialize` and the first
 /// post-handshake message is normally milliseconds, so this only ever expires for
@@ -10075,11 +10965,12 @@ fn deliver_resource_updated(
     if targets.is_empty() {
         return;
     }
-    let msg = json!({
+    let mut msg = json!({
         "jsonrpc": "2.0",
         "method": "notifications/resources/updated",
         "params": { "uri": uri }
     });
+    conduit_lib::secret_redact::redact_outgoing(&mut msg, None);
     let mut need_stdio = false;
     let mut session_ids: Vec<String> = Vec::new();
     for sid in targets {
@@ -10140,7 +11031,23 @@ struct ProgressRoute {
     /// own unique token downstream and translates back here, the same way it
     /// namespaces tool names.
     client_token: Value,
+    /// The registered values the client sent in the request (any spelling):
+    /// echoed in its progress, they are its own and are left as they are. Each
+    /// progress message is redacted whole and on its own, never held or joined
+    /// with another, so its text is delivered as it came, in order.
+    exempt: Option<Arc<std::collections::HashSet<String>>>,
+    /// The request instance that asked for it. Its progress is delivered only while
+    /// that instance is live, so a cancelled call's late progress never reaches the
+    /// client, which may already have reused the token for its next request.
+    owner: Option<downstream::CancelContext>,
 }
+
+/// A stdio progress message and the request instance it belongs to.
+type StdioProgress = (Value, Option<downstream::CancelContext>);
+
+/// `_meta` key that tells the stdio adapter which of its requests a progress
+/// message belongs to. The adapter removes it before the client sees the message.
+const ADAPTER_REQUEST_META: &str = conduit_lib::stdio_adapter::ADAPTER_REQUEST_META;
 
 /// Depth of the stdio progress hand-off queue. Bounded so a client that stops
 /// reading costs dropped notifications rather than a stalled drain thread.
@@ -10183,6 +11090,25 @@ impl Drop for ProgressRegistration {
     }
 }
 
+/// The last pass on a progress notification of `route`: every secret not in
+/// the client's own request is replaced, and the client's token restored.
+fn finish_progress_note(note: &mut Value, route: &ProgressRoute) {
+    conduit_lib::secret_redact::redact_outgoing_exempt(note, route.exempt.as_deref());
+    if let Some(params) = note.get_mut("params").and_then(Value::as_object_mut) {
+        params.insert("progressToken".to_string(), route.client_token.clone());
+        if let Some(tag) = route
+            .owner
+            .as_ref()
+            .and_then(downstream::CancelContext::adapter_tag)
+        {
+            let meta = params.entry("_meta").or_insert_with(|| json!({}));
+            if let Some(meta) = meta.as_object_mut() {
+                meta.insert(ADAPTER_REQUEST_META.to_string(), json!(tag));
+            }
+        }
+    }
+}
+
 /// Register the `progressToken` in `client_meta` (if any) for the duration of one
 /// downstream call. Returns `None` when the client asked for no progress, which
 /// is the common case.
@@ -10191,10 +11117,12 @@ impl Drop for ProgressRegistration {
 fn register_progress(
     table: &Arc<Mutex<ProgressRoutes>>,
     client_meta: Option<&Value>,
+    request: Option<&Value>,
     producer: &str,
     session: &str,
 ) -> Option<(ProgressRegistration, String)> {
     let client_token = client_meta?.get("progressToken")?.clone();
+    let exempt = conduit_lib::secret_redact::exempt_values(request);
     // Mint our own token rather than reusing the client's. Two clients picking
     // the same value (integers are common) would otherwise share a table entry,
     // so the counter lives on the table itself rather than in a global.
@@ -10209,6 +11137,8 @@ fn register_progress(
             session: session.to_string(),
             producer: producer.to_string(),
             client_token,
+            exempt,
+            owner: APPROVAL_CANCEL.with(|current| current.borrow().clone()),
         },
     );
     Some((
@@ -10228,6 +11158,7 @@ fn register_progress(
 /// rather than being repeated.
 fn prepare_progress(
     client_meta: Option<&Value>,
+    request: Option<&Value>,
     producer: &str,
 ) -> (Option<ProgressRegistration>, Option<Value>) {
     let Some(meta) = client_meta else {
@@ -10238,7 +11169,7 @@ fn prepare_progress(
     }
     match progress_target() {
         Some(session) => {
-            match register_progress(progress_routes(), client_meta, producer, &session) {
+            match register_progress(progress_routes(), client_meta, request, producer, &session) {
                 Some((registration, token)) => {
                     let mut relayed = meta.clone();
                     if let Some(obj) = relayed.as_object_mut() {
@@ -10270,13 +11201,15 @@ fn deliver_progress(
     let Some(key) = token.as_str().map(str::to_string) else {
         return;
     };
-    let (session, client_token) = {
+    let mut note = note.clone();
+    let (session, owner) = {
         let table = routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match table.active.get(&key) {
             Some(route) if route.producer == producer => {
-                (route.session.clone(), route.client_token.clone())
+                finish_progress_note(&mut note, route);
+                (route.session.clone(), route.owner.clone())
             }
             Some(route) => {
                 eprintln!(
@@ -10291,12 +11224,17 @@ fn deliver_progress(
             None => return,
         }
     };
-    // Hand the client back ITS token; ours is an internal correlator.
-    let mut note = note.clone();
-    if let Some(params) = note.get_mut("params").and_then(Value::as_object_mut) {
-        params.insert("progressToken".to_string(), client_token);
-    }
-    let note = &note;
+    deliver_progress_to(stdio, mcp_sessions, &session, &note, owner.as_ref());
+}
+
+/// Hand one finished progress notification to the client session `session`.
+fn deliver_progress_to(
+    stdio: &Arc<SessionState>,
+    mcp_sessions: &McpSessions,
+    session: &str,
+    note: &Value,
+    owner: Option<&downstream::CancelContext>,
+) {
     if session == RESOURCE_SUB_STDIO {
         // Hand off rather than write here. This runs on the downstream drain
         // thread, BEFORE that thread forwards response lines to the request loop.
@@ -10312,7 +11250,7 @@ fn deliver_progress(
             eprintln!("toolport: stdio progress for a session with no stdio face; dropped");
             return;
         };
-        if sender.try_send(note.clone()).is_err() {
+        if sender.try_send((note.clone(), owner.cloned())).is_err() {
             eprintln!("toolport: stdio progress queue full or closed; progress dropped");
         }
         return;
@@ -10323,14 +11261,23 @@ fn deliver_progress(
     let sessions = mcp_sessions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(target) = sessions.get(&session) else {
+    let Some(target) = sessions.get(session) else {
         return;
     };
     if target.is_expired() || target.closed.load(Ordering::SeqCst) {
         return;
     }
-    if !target.push_message(json, None) {
-        eprintln!("toolport: MCP session outbound queue full; progress dropped");
+    let push = || {
+        if !target.push_redacted(json, None) {
+            eprintln!("toolport: MCP session outbound queue full; progress dropped");
+        }
+    };
+    // Queued only while its request is live, as one step against its cancellation.
+    match owner {
+        Some(owner) => {
+            owner.speak_with(push);
+        }
+        None => push(),
     }
 }
 
@@ -11367,15 +12314,7 @@ fn drop_blocked_from_cache(
     // router has no `blocked` entries to consult.
     let deny_destructive = reg.deny_destructive_effective();
     let mut catalog = catalog.into();
-    catalog.retain(|tool| {
-        let Some(name) = tool.get("name").and_then(Value::as_str) else {
-            return true;
-        };
-        if deny_destructive && cached_tool_is_destructive(tool, name, router) {
-            return false;
-        }
-        !router.is_blocked(name)
-    });
+    catalog.retain(|tool| !tool_refused(tool, router, deny_destructive));
     catalog
 }
 
@@ -11395,16 +12334,18 @@ fn cached_tool_is_destructive(tool: &Value, exposed: &str, router: &Router) -> b
     let definition = router.policy_definition(tool);
     let exposed = definition["name"].as_str().unwrap_or(exposed);
     match conduit_lib::codemode::split_exposed_name(exposed) {
-        Some((_, original)) => {
-            let mut probe = (*definition).clone();
-            probe["name"] = Value::String(original.to_string());
-            is_destructive(&probe)
-        }
+        Some((_, original)) => conduit_lib::router::is_destructive_as(&definition, Some(original)),
         None => is_destructive(&definition),
     }
 }
 
 impl HostState {
+    /// This host's key for its stashed discovery results ([`shaping::forget_discovery`]):
+    /// the address of its registry, which lives as long as the host.
+    fn discovery_realm(&self) -> usize {
+        Arc::as_ptr(&self.registry) as usize
+    }
+
     /// Freeze every access profile before a refresh mutates the shared slots.
     /// A session can initialize during the refresh, so freezing only registered
     /// owners leaves its prior view unavailable at fanout time.
@@ -11611,6 +12552,9 @@ fn load_tool_cache(profile: Option<&str>) -> Vec<Value> {
         if let Some(schema) = tool.get_mut("inputSchema") {
             conduit_lib::router::normalize_tool_schema(schema);
         }
+        // A cache an older build wrote may still hold a secret a server echoed
+        // into a definition; serve it the way the live catalog now is.
+        conduit_lib::secret_redact::redact_definition(tool);
     }
     tools
 }
@@ -11694,8 +12638,22 @@ fn save_server_catalogs_for_launches(router: &Router, profile: Option<&str>, key
         })
     };
     if let Ok(raw) = raw {
-        let _ = registry::atomic_write(&path, &raw);
+        write_catalog_cache(&path, &raw);
     }
+}
+
+/// Replace a cached tool catalog under the lock the secret scrub rewrites it
+/// with, redacting inside it so a secret learned while a scrub runs is caught
+/// and the scrub cannot put back the catalog it read. A cache that cannot take
+/// the lock is not written: the next build saves it again, and the previous
+/// cache stays usable meanwhile.
+fn write_catalog_cache(path: &Path, raw: &str) {
+    let Ok(_lock) = registry::lock_at(path) else {
+        glog("tool cache not saved: its lock stayed busy past the store deadline");
+        return;
+    };
+    let raw = conduit_lib::secret_redact::redact_definition_line(raw);
+    let _ = registry::atomic_write(path, &raw);
 }
 
 fn save_tool_cache(tools: &dyn ToolCatalog, profile: Option<&str>) {
@@ -11712,7 +12670,7 @@ fn save_tool_cache(tools: &dyn ToolCatalog, profile: Option<&str>) {
         if let Ok(s) = serde_json::to_string(&wrapped) {
             // Atomic + unique temp: several gateways share this cache file, so a
             // torn or interleaved write would leave an inconsistent catalog.
-            let _ = registry::atomic_write(&path, &s);
+            write_catalog_cache(&path, &s);
         }
     }
 }
@@ -12142,6 +13100,10 @@ fn watch_tick(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             registry_trusted.store(new_source.is_authoritative(), Ordering::SeqCst);
             *live = new_reg;
+            // Scope, allow-lists and the destructive gate live in the registry: drop
+            // this host's paged definitions stashed under the previous one. Search
+            // makes fresh ones on demand.
+            shaping::forget_discovery(host.discovery_realm(), |_| true);
         };
         // Refresh the live discovery mode from the freshly-loaded registry: a per-client
         // override edit (`client_discovery`) may be the only change, and it isn't
@@ -12186,12 +13148,32 @@ fn watch_tick(
             http_mode,
             host.daemon_mode.load(Ordering::SeqCst),
         );
+        // Hiding or showing a server's prompts changes prompts/list, not tools/list,
+        // and the rebuild below only announces tools. Compare before republishing
+        // so the client re-fetches its prompts (its slash-command menu) right away.
+        // The servers whose hidePrompts flipped. The notice goes by these ids, not
+        // by diffing the base router: a daemon's `${ROOT}` servers live only in
+        // per-session rooted views, so the base router would show no change for
+        // them even though those views are rebuilt below.
+        let prompts_toggled: HashSet<String> = {
+            let live = router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            live.registry_policy()
+                .hidden_prompts
+                .symmetric_difference(&policy.hidden_prompts)
+                .cloned()
+                .collect()
+        };
         let policy_changed = republish_registry_policy(router, policy);
         publish_registry(new_reg.clone());
         if policy_changed {
             host.invalidate_root_views();
             host.invalidate_tool_scope_views();
             notify_tools_changed(stdio, mcp_sessions);
+            if !prompts_toggled.is_empty() {
+                notify_prompts_changed_for_servers(stdio, mcp_sessions, &prompts_toggled);
+            }
             glog("registry policy changed; enforcing it on live connections");
             eprintln!("toolport: registry policy changed; enforcing it on live connections");
         }
@@ -13997,6 +14979,9 @@ struct GatewayState {
     client_id: Option<String>,
     attribution_id: Option<String>,
     env_profile: Option<String>,
+    /// The app hosting this stdio gateway's client (T3 Code), display only. Process
+    /// constant; an HTTP face reads it per request from its adapter's headers.
+    app_host: Option<conduit_lib::host_attribution::Host>,
 }
 
 impl std::ops::Deref for GatewayState {
@@ -14490,7 +15475,7 @@ struct SessionState {
     /// closes over a connection instead of over whichever stdout started the
     /// process. Unused (and never created) for an HTTP face or a client that never
     /// asks for progress.
-    stdio_progress: OnceLock<std::sync::mpsc::SyncSender<Value>>,
+    stdio_progress: OnceLock<std::sync::mpsc::SyncSender<StdioProgress>>,
     /// Whether this stdio peer has spoken past `initialize`. Connection-local by
     /// decision: as a process global it silently assumed one stdio client per host,
     /// and a second connection would have inherited the first one's handshake and
@@ -14518,7 +15503,7 @@ struct SessionState {
     /// client-chosen, so two stdio clients on one host would collide. One client
     /// cancelling its id 7 could cancel another's id 7.
     cancellations: downstream::CancelRegistry,
-    owner_cancel_guard: Mutex<Option<downstream::CancelGuard>>,
+    owner_cancel_guard: Mutex<Option<downstream::CloseGuard>>,
     /// How many requests this connection is running on workers, against a cap, so a
     /// client cannot spawn unbounded workers. Per connection for the same reason as
     /// the registry: it is this peer's concurrency, not the host's.
@@ -14657,19 +15642,31 @@ impl SessionState {
     /// This session's progress hand-off, or `None` when it has no stdio face.
     /// Created on first use, so a client that never asks for progress pays for
     /// neither the queue nor the writer thread.
-    fn stdio_progress_sender(&self) -> Option<&std::sync::mpsc::SyncSender<Value>> {
+    fn stdio_progress_sender(&self) -> Option<&std::sync::mpsc::SyncSender<StdioProgress>> {
         let stdout = match &self.transport {
             SessionTransportFace::Stdio(stdout) => Arc::clone(stdout),
             SessionTransportFace::Http => return None,
         };
         Some(self.stdio_progress.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<Value>(PROGRESS_STDIO_QUEUE);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<StdioProgress>(PROGRESS_STDIO_QUEUE);
             std::thread::spawn(move || {
-                for note in rx {
-                    let mut out = stdout
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if write_json_line(&mut *out, &note).is_err() {
+                for (note, owner) in rx {
+                    let mut failed = false;
+                    let mut write = || {
+                        let mut out = stdout
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        failed = write_json_line(&mut *out, &note).is_err();
+                    };
+                    // Written only while its request is live, as one step against
+                    // that request's cancellation.
+                    match &owner {
+                        Some(owner) => {
+                            owner.speak_with(write);
+                        }
+                        None => write(),
+                    }
+                    if failed {
                         // The stdio client is gone; nothing further will be readable.
                         break;
                     }
@@ -14683,7 +15680,7 @@ impl SessionState {
     /// what the writer thread would have written. Real sessions create the queue
     /// lazily, on first use.
     #[cfg(test)]
-    fn set_stdio_progress(&self, sender: std::sync::mpsc::SyncSender<Value>) {
+    fn set_stdio_progress(&self, sender: std::sync::mpsc::SyncSender<StdioProgress>) {
         let _ = self.stdio_progress.set(sender);
     }
 
@@ -14888,6 +15885,16 @@ impl SessionState {
     /// stream; stdio writes it straight to the client. Returns false when the
     /// message could not be delivered (queue full, or a write failure).
     fn push_message(&self, json: String, request_id: Option<String>) -> bool {
+        // Notifications and server requests carry upstream text with no client
+        // request behind them.
+        let json = conduit_lib::secret_redact::redact_outgoing_json(json);
+        self.push_redacted(json, request_id)
+    }
+
+    /// [`Self::push_message`] for a message already given its last redaction
+    /// pass with the request it answers (a call's progress, which keeps the
+    /// client's own values), so that pass is not undone by one without it.
+    fn push_redacted(&self, json: String, request_id: Option<String>) -> bool {
         match &self.transport {
             SessionTransportFace::Stdio(stdout) => {
                 let Ok(value) = serde_json::from_str::<Value>(&json) else {
@@ -14962,7 +15969,7 @@ impl SessionState {
 struct McpSseReader {
     session: Arc<SessionState>,
     cleanup: Option<(GatewayState, String)>,
-    cancel_guard: Option<downstream::CancelGuard>,
+    cancel_guard: Option<downstream::CloseGuard>,
     buf: Vec<u8>,
     pos: usize,
     tools_changed: bool,
@@ -15121,14 +16128,11 @@ fn mint_mcp_session(
     let session = Arc::new(session);
     if let Some(lifetime) = lifetime {
         let weak = Arc::downgrade(&session);
-        let guard = lifetime
-            .cancellations
-            .context(sid.clone())
-            .on_cancel(Arc::new(move |_| {
-                if let Some(session) = weak.upgrade() {
-                    session.close();
-                }
-            }));
+        let guard = lifetime.cancellations.on_close(Arc::new(move |_| {
+            if let Some(session) = weak.upgrade() {
+                session.close();
+            }
+        }));
         *session
             .owner_cancel_guard
             .lock()
@@ -15281,6 +16285,8 @@ fn broker_url_elicitation(
         client: None,
         client_name: observation::current().client_name,
         client_label: None,
+        host: observation::current().host.map(|host| host.host),
+        host_thread: observation::current().host.and_then(|host| host.thread),
         server: screened.origin.clone(),
         tool: "browser interaction".to_string(),
         reason: approval::ApprovalReason::UntrustedSource,
@@ -15359,6 +16365,10 @@ struct ModernHitlApproval {
     approved_fingerprint: Option<String>,
     reason: approval::ApprovalReason,
     started: Instant,
+    /// How long the call waited for its server to start before asking. The
+    /// approved retry adds it to the call's Activity duration; the approval
+    /// wait itself is not counted.
+    start_wait: Duration,
     downstream: MrtrRequest,
     input_request: Value,
     status: ModernHitlStatus,
@@ -15392,6 +16402,7 @@ enum ModernHitlPoll {
         held_ms: u64,
         downstream: MrtrRequest,
         newly_approved: bool,
+        start_wait: Duration,
     },
 }
 
@@ -15497,6 +16508,7 @@ fn start_modern_hitl(
                 approved_fingerprint,
                 reason,
                 started: Instant::now(),
+                start_wait: Duration::ZERO,
                 downstream,
                 input_request: json!({
                     "method": "elicitation/create",
@@ -15604,6 +16616,7 @@ fn poll_modern_hitl(
                     held_ms: pending.started.elapsed().as_millis() as u64,
                     downstream: pending.downstream.clone(),
                     newly_approved,
+                    start_wait: pending.start_wait,
                 },
                 false,
             )
@@ -15613,6 +16626,13 @@ fn poll_modern_hitl(
         approvals.remove(token);
     }
     poll
+}
+
+/// Remember the start wait of the call this approval holds.
+fn set_modern_hitl_start_wait(token: &str, start_wait: Duration) {
+    session_tables().hitl().with(token, |pending| {
+        pending.start_wait = start_wait;
+    });
 }
 
 fn update_modern_hitl_downstream(token: &str, result: &mut Value) {
@@ -16390,6 +17410,11 @@ fn process_request(
     .map(GatewayResponse::into_value)
 }
 
+/// A Run from Toolport's own Tools tab, by the client ID it launches with.
+fn is_tools_tab_client(client: Option<&str>) -> bool {
+    client.map(|id| id.strip_prefix("adapter:").unwrap_or(id)) == Some(clients::TOOLS_TAB_CLIENT_ID)
+}
+
 fn catalog_wait_budget(
     discovery: DiscoveryMode,
     tool_search: bool,
@@ -16398,6 +17423,8 @@ fn catalog_wait_budget(
 ) -> Duration {
     if setup {
         downstream::SETUP_CATALOG_WAIT_BUDGET
+    } else if is_tools_tab_client(client) {
+        Duration::ZERO
     } else if discovery == DiscoveryMode::Full || tool_search {
         Duration::from_millis(
             clients::discovery_capabilities(client.unwrap_or("")).cold_full_list_wait_ms,
@@ -16487,6 +17514,11 @@ fn process_request_wire(
     }
     .map(|id| format!("adapter:{id}"));
     let display_client = display_client.as_deref().or(client);
+    let app_host = if state.http {
+        HTTP_ADAPTER_HOST.with(|current| current.borrow().clone())
+    } else {
+        state.app_host.clone()
+    };
     let name = observed_client_name(state, holder.as_deref(), display_client, client_name);
     let observed = if let Some(holder) = &holder {
         let mut current = holder
@@ -16500,11 +17532,12 @@ fn process_request_wire(
         }
         current
             .get_or_insert_with(|| {
-                observation::Session::start_attributed(
+                observation::Session::start_hosted(
                     client,
                     display_client,
                     Some(&name),
                     label.as_deref(),
+                    app_host.as_ref(),
                     if state.http { "http" } else { "stdio" },
                     reason,
                 )
@@ -16513,16 +17546,24 @@ fn process_request_wire(
     } else {
         // Modern remote HTTP has no protocol session. A request is the only
         // observable lifetime; never merge two windows merely by bearer identity.
-        observation::Session::start_attributed(
+        observation::Session::start_hosted(
             client,
             display_client,
             Some(&name),
             label.as_deref(),
+            app_host.as_ref(),
             "http_request",
             "sessionless_request",
         )
     };
-    let _context = observation::ContextGuard::enter(observed.context());
+    // The session keeps the label it started with; a request that names its own
+    // client (a multiplexing caller's later identity) is attributed to that name, and
+    // a modern request that names none is unlabelled rather than the session's.
+    let mut context = observed.context();
+    if label.is_some() || upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
+        context.client_label = label.clone();
+    }
+    let _context = observation::ContextGuard::enter(context);
     let internal = match (method, req["params"]["name"].as_str()) {
         ("server/discover", _) => Some("describe"),
         ("tools/call", Some("toolport_search_tools")) => Some("search"),
@@ -16584,6 +17625,30 @@ fn process_request_wire(
         observed.close(observation::CloseReason::RequestComplete);
     }
     if let Some(response) = &mut response {
+        // Every server's secrets, after any per-server pass: a value one server
+        // returns is never handed to a client unless the client sent it.
+        match conduit_lib::secret_redact::unavailable_reason() {
+            // Fail closed, but keep the protocol: a status call still says what
+            // is wrong, with fixed text that holds no upstream content.
+            Some(reason)
+                if method == "tools/call"
+                    && req.pointer("/params/name").and_then(Value::as_str)
+                        == Some("toolport_status")
+                    && response.envelope.get("id").is_some() =>
+            {
+                let id = response.envelope["id"].clone();
+                response.envelope = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "content": [{ "type": "text", "text": reason }], "isError": true },
+                });
+            }
+            _ => {
+                // Its result or error only: the id is the client's own, and
+                // it matches the reply by it.
+                conduit_lib::secret_redact::redact_reply(&mut response.envelope, req.get("params"));
+            }
+        }
         response.observation = Some(observed.clone());
         response.tools_list = method == "tools/list";
         response.listed_tools = holder
@@ -16591,6 +17656,46 @@ fn process_request_wire(
             .map(|holder| Arc::clone(&holder.listed_tools));
     }
     response
+}
+
+/// The display label for one request. A request that names its client (a legacy
+/// `initialize`'s `clientInfo`, or a modern request's `_meta` clientInfo) is labelled
+/// as itself, so a caller that multiplexes identities over one connection gets each
+/// request labelled correctly. A modern request without clientInfo is unlabelled: it
+/// never borrows another request's name. Only handshake-era requests fall back to the
+/// label their connection's `initialize` set.
+fn request_client_label(state: &GatewayState, req: &Value) -> Option<String> {
+    if let Some(label) = approval::client_info_label(req.get("params")) {
+        return Some(label);
+    }
+    if upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
+        return None;
+    }
+    if state.http {
+        active_mcp_session()
+            .and_then(|sid| {
+                state
+                    .mcp_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&sid)
+                    .cloned()
+            })
+            .and_then(|session| {
+                session
+                    .client_label
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            })
+    } else {
+        state
+            .stdio_upstream
+            .client_label
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 // Carry transport, profile, cancellation and client identity across dispatch.
@@ -16615,6 +17720,7 @@ fn process_request_wire_inner(
         UpstreamTransport::Stdio
     });
     let _request = UpstreamRequestGuard::enter(client.map(str::to_string));
+    let _received = RequestReceived::enter();
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     // One deadline includes startup and rooted composition, rather than granting
     // each phase another budget. Warm tools lists never enter the catalog wait.
@@ -16622,10 +17728,13 @@ fn process_request_wire_inner(
     let search_server = tool_search
         .then(|| req["params"]["arguments"]["server"].as_str())
         .flatten();
+    // Direct stdio (the in-process fallback) passes no client; the process's
+    // own client ID names it then.
+    let request_client = client.or(state.client_id.as_deref());
     let tools_list_budget = catalog_wait_budget(
         discovery,
         tool_search,
-        client,
+        request_client,
         std::env::args().any(|arg| arg == "--setup-review"),
     );
     let tools_list_deadline = Instant::now() + tools_list_budget;
@@ -16660,34 +17769,13 @@ fn process_request_wire_inner(
         std::thread::spawn(move || refresh_client_root(&st));
     }
 
-    let session_label = if state.http {
-        active_mcp_session()
-            .and_then(|sid| {
-                state
-                    .mcp_sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&sid)
-                    .cloned()
-            })
-            .and_then(|session| {
-                session
-                    .client_label
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-            })
-    } else {
-        state
-            .stdio_upstream
-            .client_label
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    };
+    let session_label = request_client_label(state, req);
     let _label = ClientLabelGuard::enter(session_label);
 
     let wait = match method {
+        // Toolport's own Tools tab never reads this list; it calls one tool,
+        // which waits for its server itself and counts that wait.
+        "tools/list" if is_tools_tab_client(request_client) => false,
         "tools/list" if discovery == DiscoveryMode::Full => true,
         "tools/list" => {
             let reg = state
@@ -17321,11 +18409,14 @@ fn write_stdio_response_then(
     true
 }
 
-fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
+fn handle_stdio_request(
+    state: GatewayState,
+    req: Value,
+    cancel_context: downstream::CancelContext,
+) {
     // The connection's own registry, so a cancel carries the reason to the worker
-    // that is running this request and nothing else.
-    let cancel_registry = state.stdio_upstream.cancellations();
-    let cancel_context = cancel_registry.context(request_key.clone());
+    // that is running this request instance and nothing else.
+    let request_key = cancel_context.request_key();
     // The guards are the stdio session's own: one connection, one search streak (P1.2).
     let guards = state.stdio_upstream.guards();
     // A panic in a handler must not kill the gateway: catch it, log it, and
@@ -17339,7 +18430,7 @@ fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
             None,
             None,
             None,
-            Some(cancel_context),
+            Some(cancel_context.clone()),
             None,
             None,
             state.discovery_mode(),
@@ -17351,27 +18442,35 @@ fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
         Some(error(id, -32603, "internal error").into())
     });
 
-    if cancel_registry.is_cancelled(&request_key) {
+    let Some(resp) = response else {
+        cancel_context.finish();
+        return;
+    };
+    // The peer has an answer on the wire now, so anything the catalog
+    // withheld may follow it. Every id-bearing request counts, not just
+    // `initialize`: whatever the client opened with, its own reply has to be
+    // the first thing it reads. This is the second of the two conditions in
+    // `stdio_may_speak`; the peer's post-handshake message is the other, and
+    // either one may land last.
+    //
+    // The reply is claimed and written as one step against a cancellation, so a
+    // request the client cancelled first gets nothing, and one it cancels while the
+    // reply is being written is answered.
+    let mut written = false;
+    let claimed = cancel_context.reply_with(|| {
+        written = write_stdio_response_then(&state.stdio_upstream, &resp, || resp.record_listed());
+    });
+    cancel_context.finish();
+    if !claimed {
         glog(&format!(
             "suppressing response for cancelled request {request_key}"
         ));
-        cancel_registry.finish_client_request(&request_key);
         return;
     }
-    cancel_registry.finish_client_request(&request_key);
-
-    if let Some(resp) = response {
-        // The peer has an answer on the wire now, so anything the catalog
-        // withheld may follow it. Every id-bearing request counts, not just
-        // `initialize`: whatever the client opened with, its own reply has to be
-        // the first thing it reads. This is the second of the two conditions in
-        // `stdio_may_speak`; the peer's post-handshake message is the other, and
-        // either one may land last.
-        if write_stdio_response_then(&state.stdio_upstream, &resp, || resp.record_listed()) {
-            resp.delivered();
-            state.stdio_upstream.mark_stdio_responded();
-            drain_stdio_deferred(&state.stdio_upstream);
-        }
+    if written {
+        resp.delivered();
+        state.stdio_upstream.mark_stdio_responded();
+        drain_stdio_deferred(&state.stdio_upstream);
     }
 }
 
@@ -17783,7 +18882,7 @@ struct McpHttpRequestHeaders<'a> {
 
 struct McpListen {
     session: Arc<SessionState>,
-    cancel_guard: Option<downstream::CancelGuard>,
+    cancel_guard: Option<downstream::CloseGuard>,
     cleanup: Option<(GatewayState, String)>,
 }
 
@@ -18423,43 +19522,59 @@ fn handle_mcp_http(
             // A cancellation POST on another connection cannot target this call.
             let cancellations =
                 http_call_cancellations(state, session_id.as_deref(), session_owner);
+            // The stdio adapter numbers each request, so its cancellation names the
+            // instance it means even when it arrives before that request does.
+            let adapter_request = HTTP_ADAPTER_REQUEST.with(std::cell::Cell::get);
             if let Some(id) = cancellation_request_id(&req) {
-                cancellations.cancel(&id, cancellation_reason(&req));
+                match adapter_request {
+                    Some(tag) => {
+                        cancellations.cancel_instance(&id, tag, cancellation_reason(&req));
+                    }
+                    None => {
+                        cancellations.cancel(&id, cancellation_reason(&req));
+                    }
+                }
                 return HttpOut::new(202, "text/plain", String::new());
             }
-            let request_key = request_id_key(&req);
-            if let Some(key) = &request_key {
-                if !cancellations.begin_client_request(key.clone()) {
-                    return mcp_rpc_response(
-                        200,
-                        error(req["id"].clone(), -32600, "duplicate or closed request id")
-                            .to_string(),
-                        session_id.as_deref(),
-                        prefer_sse,
-                    );
-                }
-            }
-            let _request_end = HttpRequestEnd {
-                cancellations: cancellations.clone(),
-                key: request_key.clone(),
+            let cancel = match request_id_key(&req) {
+                Some(key) => match cancellations.begin_instance(key, adapter_request) {
+                    Some(context) => Some(context),
+                    None => {
+                        return mcp_rpc_response(
+                            200,
+                            error(req["id"].clone(), -32600, "duplicate or closed request id")
+                                .to_string(),
+                            session_id.as_deref(),
+                            prefer_sse,
+                        );
+                    }
+                },
+                None => None,
             };
-            let cancel = request_key.map(|key| cancellations.context(key));
+            let _request_end = HttpRequestEnd {
+                cancel: cancel.clone(),
+            };
+            // A dropped socket cancels this instance through its own handle, never
+            // whatever later reuses its id.
             let _connection_cancel = HTTP_CONNECTION_CANCEL.with(|current| {
-                current.borrow().as_ref().map(|connection| {
-                    let owned = cancellations.clone();
-                    let key = cancel.clone();
-                    connection
-                        .context("connection".into())
-                        .on_cancel(Arc::new(move |_| {
-                            if let Some(context) = &key {
-                                owned.cancel(
-                                    &context.request_key(),
-                                    Some("HTTP caller disconnected"),
-                                );
-                            }
+                current
+                    .borrow()
+                    .as_ref()
+                    .zip(cancel.clone())
+                    .map(|(connection, own)| {
+                        connection.on_close(Arc::new(move |_| {
+                            own.cancel(Some("HTTP caller disconnected"));
                         }))
-                })
+                    })
             });
+            // Cancelled before it began (the adapter's cancellation overtook it):
+            // nothing runs and nothing is answered.
+            if cancel
+                .as_ref()
+                .is_some_and(downstream::CancelContext::is_cancelled)
+            {
+                return http_no_reply(session_id.as_deref());
+            }
 
             // A legacy MCP session owns its own search guard (P1.2). A request
             // with no session record keeps the listener-level guard passed in,
@@ -18501,11 +19616,17 @@ fn handle_mcp_http(
                 allowed,
                 session_owner.and_then(|owner| owner.profile.as_deref()),
                 connection_profile,
-                cancel,
+                cancel.clone(),
                 client,
                 client_name,
                 discovery,
             );
+            // Claim the reply: a request the client cancelled first gets none.
+            if let Some(cancel) = &cancel {
+                if !cancel.reply_with(|| ()) {
+                    return http_no_reply(session_id.as_deref());
+                }
+            }
             match resp {
                 Some(resp) => {
                     let status = if is_modern {
@@ -18689,13 +19810,11 @@ fn handle_http_with_headers(
             sessions.insert(key.clone(), session.clone());
         }
         let weak = Arc::downgrade(&session);
-        let guard = connection
-            .context("connection".into())
-            .on_cancel(Arc::new(move |_| {
-                if let Some(session) = weak.upgrade() {
-                    session.close();
-                }
-            }));
+        let guard = connection.on_close(Arc::new(move |_| {
+            if let Some(session) = weak.upgrade() {
+                session.close();
+            }
+        }));
         session.push_message(
             json!({"jsonrpc":"2.0","method":"notifications/toolport/connected"}).to_string(),
             None,
@@ -19351,7 +20470,32 @@ fn http_connection_cancellations() -> &'static Mutex<HashMap<SocketAddr, downstr
 thread_local! {
     static HTTP_ADAPTER_ATTRIBUTION: std::cell::RefCell<(Option<String>, Option<u32>)> = const { std::cell::RefCell::new((None, None)) };
     static HTTP_ADAPTER_INSTANCE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// The adapter's host app (T3 Code), from headers trusted only with the private
+    /// daemon bearer. Display only.
+    static HTTP_ADAPTER_HOST: std::cell::RefCell<Option<conduit_lib::host_attribution::Host>> = const { std::cell::RefCell::new(None) };
     static HTTP_CONNECTION_CANCEL: std::cell::RefCell<Option<downstream::CancelRegistry>> = const { std::cell::RefCell::new(None) };
+    /// The stdio adapter's number for the request being handled (`Toolport-Adapter-Request`).
+    static HTTP_ADAPTER_REQUEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+/// Restores the previous adapter request number when dropped.
+struct AdapterRequestScope(Option<u64>);
+impl AdapterRequestScope {
+    fn enter(tag: Option<u64>) -> Self {
+        Self(HTTP_ADAPTER_REQUEST.with(|current| current.replace(tag)))
+    }
+}
+impl Drop for AdapterRequestScope {
+    fn drop(&mut self) {
+        HTTP_ADAPTER_REQUEST.with(|current| current.set(self.0));
+    }
+}
+/// The answer to a request the client cancelled: an empty acceptance, no message.
+fn http_no_reply(session_id: Option<&str>) -> HttpOut {
+    let out = HttpOut::new(202, "text/plain", String::new());
+    match session_id {
+        Some(sid) => out.with_header("Mcp-Session-Id", sid),
+        None => out,
+    }
 }
 struct HttpConnectionScope(Option<downstream::CancelRegistry>, Option<String>);
 impl Drop for HttpConnectionScope {
@@ -19366,14 +20510,37 @@ impl Drop for AdapterAttributionScope {
         HTTP_ADAPTER_ATTRIBUTION.with(|current| current.replace(std::mem::take(&mut self.0)));
     }
 }
+/// The display-only host a stdio adapter reports, such as T3 Code and its thread. Only an
+/// adapter holding the private daemon bearer with a valid client claim is believed; any
+/// other local process gets nothing, whatever headers it sends. The host must be one
+/// Toolport records and the thread id passes `valid_thread` (length and characters)
+/// before it is stored or shown.
+fn trusted_adapter_host(
+    trusted: bool,
+    header: impl Fn(&'static str) -> Option<String>,
+) -> Option<conduit_lib::host_attribution::Host> {
+    if !trusted {
+        return None;
+    }
+    conduit_lib::host_attribution::from_parts(
+        header(conduit_lib::stdio_adapter::ADAPTER_HOST_HEADER).as_deref(),
+        header(conduit_lib::stdio_adapter::ADAPTER_HOST_THREAD_HEADER).as_deref(),
+    )
+}
+
+struct AdapterHostScope(Option<conduit_lib::host_attribution::Host>);
+impl Drop for AdapterHostScope {
+    fn drop(&mut self) {
+        HTTP_ADAPTER_HOST.with(|current| current.replace(self.0.take()));
+    }
+}
 struct HttpRequestEnd {
-    cancellations: downstream::CancelRegistry,
-    key: Option<String>,
+    cancel: Option<downstream::CancelContext>,
 }
 impl Drop for HttpRequestEnd {
     fn drop(&mut self) {
-        if let Some(key) = &self.key {
-            self.cancellations.finish_client_request(key);
+        if let Some(cancel) = &self.cancel {
+            cancel.finish();
         }
     }
 }
@@ -19590,7 +20757,6 @@ fn proxy_deadline_http_connection(
         Err(_) => return,
     };
     let cancellations = downstream::CancelRegistry::new();
-    cancellations.begin_client_request("connection".into());
     http_connection_cancellations()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -19905,6 +21071,11 @@ fn insecure_loopback_requested(args: &[String]) -> bool {
     args.iter().any(|arg| arg == INSECURE_LOOPBACK_FLAG)
 }
 
+/// The secrets a gateway learns at start, in every role: inline values only.
+fn learn_startup_secrets() {
+    conduit_lib::secret_refs::preload_inline_secrets();
+}
+
 /// Whether the operator asked this process to be the host daemon (`--daemon`).
 /// Phase 2: the daemon role currently serves the internal identity handshake and
 /// exits after an idle grace; it does not own a router yet.
@@ -20070,8 +21241,25 @@ fn spawn_daemon_idle_watchdog(
     grace: Duration,
 ) {
     let poll = Duration::from_millis(200).min(grace);
+    // The app was deleted, moved to the Trash, or replaced by a package upgrade.
+    // Keep serving any connected client, but exit the moment none is, instead of
+    // lingering for the idle grace on a binary that is no longer installed. The
+    // watch only decides "gone" after the mismatch has held for several spaced
+    // looks, and never on a path it cannot read.
+    let mut executable = conduit_lib::daemon::BinaryWatch::current();
+    let mut binary_gone = false;
     std::thread::spawn(move || loop {
         std::thread::sleep(poll);
+        if !binary_gone && executable.poll(std::time::Instant::now()) {
+            binary_gone = true;
+            glog(&format!(
+                "daemon: executable {} was removed or replaced; exiting once no client is connected",
+                executable
+                    .path()
+                    .map_or_else(|| "<unknown>".into(), |path| path.display().to_string())
+            ));
+            host.shutdown_if_idle.store(true, Ordering::Release);
+        }
         if inflight.load(Ordering::Relaxed) > 0 {
             continue;
         }
@@ -20110,7 +21298,29 @@ fn spawn_daemon_idle_watchdog(
             let _ = conduit_lib::daemon::write_descriptor(&descriptor_path, &descriptor);
             continue;
         }
-        glog(if update_requested {
+        // Dragged to the Trash with Launch at login on: the LaunchAgent would
+        // start a missing app at every login. Done here, after the last client,
+        // because unloading the agent may end processes launchd started from it.
+        #[cfg(target_os = "macos")]
+        if binary_gone {
+            if let Some(path) = executable.path() {
+                let report = conduit_lib::purge::remove_stale_launch_agents(path);
+                for removed in &report.removed {
+                    glog(&format!(
+                        "daemon: removed launch at login {removed}: its app is gone"
+                    ));
+                }
+                for left in &report.leftovers {
+                    glog(&format!(
+                        "daemon: could not remove launch at login {}: {}",
+                        left.path, left.error
+                    ));
+                }
+            }
+        }
+        glog(if binary_gone {
+            "daemon_exit reason=binary_removed prior=healthy"
+        } else if update_requested {
             "daemon_exit reason=update_idle prior=healthy"
         } else {
             "daemon_exit reason=idle_timeout prior=healthy"
@@ -21274,6 +22484,21 @@ fn handle_connection(
                 let previous_instance =
                     HTTP_ADAPTER_INSTANCE.with(|current| current.replace(instance));
                 let _connection_scope = HttpConnectionScope(previous, previous_instance);
+                let _adapter_request = AdapterRequestScope::enter(
+                    private_daemon_bearer
+                        .then(|| {
+                            request
+                                .headers()
+                                .iter()
+                                .find(|header| {
+                                    header
+                                        .field
+                                        .equiv(conduit_lib::stdio_adapter::ADAPTER_REQUEST_HEADER)
+                                })
+                                .and_then(|header| header.value.as_str().parse::<u64>().ok())
+                        })
+                        .flatten(),
+                );
                 let attribution = if private_daemon_bearer && valid_adapter_claim {
                     let id = request
                         .headers()
@@ -21297,6 +22522,16 @@ fn handle_connection(
                 let _attribution = AdapterAttributionScope(
                     HTTP_ADAPTER_ATTRIBUTION.with(|current| current.replace(attribution)),
                 );
+                let app_host =
+                    trusted_adapter_host(private_daemon_bearer && valid_adapter_claim, |name| {
+                        request
+                            .headers()
+                            .iter()
+                            .find(|h| h.field.equiv(name))
+                            .map(|h| h.value.as_str().to_string())
+                    });
+                let _app_host =
+                    AdapterHostScope(HTTP_ADAPTER_HOST.with(|current| current.replace(app_host)));
                 // A panic in a handler must return 500, not kill the listener.
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     handle_http_with_headers(
@@ -21444,6 +22679,9 @@ enum ArgAction {
     },
     DisconnectAll {
         dry_run: bool,
+        /// Also remove Toolport's own launch-at-login entry: the app is going
+        /// away (an uninstaller runs this), so the entry would point at nothing.
+        uninstall: bool,
     },
     /// Fall through to normal gateway startup.
     Run,
@@ -21503,14 +22741,17 @@ fn parse_args(args: &[String]) -> ArgAction {
         };
     }
     if args.iter().any(|arg| arg == "--disconnect-all") {
-        if let Some(arg) = args
-            .iter()
-            .find(|arg| !matches!(arg.as_str(), "--disconnect-all" | "--dry-run"))
-        {
+        if let Some(arg) = args.iter().find(|arg| {
+            !matches!(
+                arg.as_str(),
+                "--disconnect-all" | "--dry-run" | "--uninstall"
+            )
+        }) {
             return ArgAction::Unknown(arg.clone());
         }
         return ArgAction::DisconnectAll {
             dry_run: args.iter().any(|arg| arg == "--dry-run"),
+            uninstall: args.iter().any(|arg| arg == "--uninstall"),
         };
     }
     // Checked before the unknown-flag scan, and never added to KNOWN_FLAGS: falling
@@ -21541,6 +22782,7 @@ fn run_code_mode_isolated(
     input: codemode::ScriptInput,
     call: codemode::CallBinding,
     fetch: Option<codemode::FetchBinding>,
+    describe: Option<codemode::DescribeBinding>,
     limits: codemode::Limits,
     catalog: &[String],
     cancel: Option<downstream::CancelContext>,
@@ -21554,11 +22796,11 @@ fn run_code_mode_isolated(
         // Cargo's unit-test harness cannot re-enter the gateway's worker mode.
         // Integration tests exercise the real executable and process boundary.
         let _ = (cancel, host_calls);
-        codemode::run_script_with_input(script, input, call, fetch, limits, catalog)
+        codemode::run_script_with_describe(script, input, call, fetch, describe, limits, catalog)
     }
     #[cfg(not(test))]
     worker::run_script(
-        script, input, call, fetch, limits, catalog, cancel, host_calls,
+        script, input, call, fetch, describe, limits, catalog, cancel, host_calls,
     )
 }
 
@@ -21567,7 +22809,7 @@ fn run_code_mode_isolated(
 fn usage() -> String {
     format!(
         "toolport-gateway {version}\n\
-         Local-first MCP gateway - see docs/headless.md for the full guide.\n\
+         Local-first MCP gateway - https://github.com/btsouth/toolport/blob/main/docs/headless.md\n\
          \n\
          USAGE:\n    toolport-gateway [FLAGS]\n\
          \n\
@@ -21575,16 +22817,17 @@ fn usage() -> String {
          \x20   --http [port]         Serve over HTTP instead of stdio (default port 8765, 0 picks a free port)\n\
          \x20   --http-proxy [port]   Desktop HTTP bridge to the host daemon (internal)\n\
          \x20   {insecure}   Allow unauthenticated HTTP access on a loopback bind\n\
-         \x20   --daemon             Run as the host daemon for this host (Phase 2;\n\
+         \x20   --daemon             Run as the host daemon for this host (\n\
          \x20                        internal rendezvous endpoint, not the user HTTP\n\
          \x20                        surface)\n\
          \x20   --stdio-adapter      Proxy stdio to the host daemon instead of running\n\
-         \x20                        the in-process gateway (Phase 2; opt-in)\n\
+         \x20                        the in-process gateway (internal)\n\
          \x20   --private-gateway    One adapter's own gateway while the host daemon is\n\
          \x20                        unresponsive (internal)\n\
          \x20   --installer-preflight <absolute-install-dir> Defer installation while client gateways are open\n\
          \x20   --remove-data [--dry-run | --confirm] Remove this install's data; --all-installs also clears shared credentials\n\
-         \x20   --disconnect-all [--dry-run] Restore all client configs and exit; JSON per-client results\n\
+         \x20   --disconnect-all [--dry-run] [--uninstall] Restore all client configs and exit; JSON per-client results.\n\
+         \x20                                --uninstall also removes Toolport's launch-at-login entry (uninstallers)\n\
          \x20   --setup-review       Private setup verification with a 30-second catalog wait\n\
          \x20   --selftest-secrets    Diagnostic: read every vaulted secret and report\n\
          \x20   --toolport-hook EVENT Deprecated no-op accepted so hook entries an\n\
@@ -21640,11 +22883,17 @@ fn detach_from_client_session() {}
 
 /// Entry point: classify the command line, then run the requested role.
 fn main() {
+    gateway_main(std::env::args().skip(1).collect());
+    // A role that returns (the stdio loop, the HTTP servers) lands its last
+    // stderr lines; every other exit goes through `telemetry::exit_with`.
+    conduit_lib::daemon_log::flush_stderr_relay(Duration::from_millis(500));
+}
+
+fn gateway_main(cli_args: Vec<String>) {
     conduit_lib::secret_refs::enable_gateway_cache();
     // `--help`/`--version`/an unrecognized flag are decided before anything
     // else touches disk, the keychain, or stdin - see #605. Positional args
     // and the existing four flags fall through to `Run` unchanged.
-    let cli_args: Vec<String> = std::env::args().skip(1).collect();
     if cli_args.first().map(String::as_str) == Some(worker::WORKER_ARG) {
         worker::worker_main();
     }
@@ -21715,31 +22964,76 @@ fn main() {
                 }
                 conduit_lib::purge::exit_after_removal(if dry_run { 0 } else { 2 });
             }
-            match conduit_lib::purge::run_with_scope(all_installs) {
-                Ok(report) => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&report).expect("serializable removal report")
-                    );
-                    conduit_lib::purge::exit_after_removal(if report.leftovers.is_empty() {
-                        0
-                    } else {
-                        1
-                    });
-                }
+            let report_path = match conduit_lib::purge::plan_with_scope(all_installs) {
+                Ok(plan) => std::path::PathBuf::from(plan.report_path),
                 Err(error) => {
                     println!(
                         "{}",
-                        json!({"removed":[], "leftovers":[{"path":conduit_lib::registry::conduit_dir().map(|path| path.display().to_string()), "error":error}]})
+                        json!({"clients":[], "removed":[], "leftovers":[{"path":conduit_lib::registry::conduit_dir().map(|path| path.display().to_string()), "error":error}]})
                     );
                     conduit_lib::purge::exit_after_removal(1);
                 }
+            };
+            let mut report =
+                conduit_lib::purge::run_with_scope(all_installs).unwrap_or_else(|error| {
+                    let mut report = conduit_lib::purge::Report::default();
+                    report.leftovers.push(conduit_lib::purge::Leftover {
+                        path: conduit_lib::registry::conduit_dir()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default(),
+                        error,
+                    });
+                    report
+                });
+            if !after_exit {
+                if let Err(error) = conduit_lib::purge::write_report(&report_path, &report) {
+                    eprintln!(
+                        "Could not write removal report {}: {error}",
+                        report_path.display()
+                    );
+                    report.leftovers.push(conduit_lib::purge::Leftover {
+                        path: report_path.display().to_string(),
+                        error: format!("Could not write removal report: {error}"),
+                    });
+                } else {
+                    eprintln!("Removal report: {}", report_path.display());
+                }
             }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).expect("serializable removal report")
+            );
+            conduit_lib::purge::exit_after_removal(if report.leftovers.is_empty() { 0 } else { 1 });
         }
-        ArgAction::DisconnectAll { dry_run } => {
+        ArgAction::DisconnectAll { dry_run, uninstall } => {
             if conduit_lib::registry::conduit_dir().is_none_or(|dir| !dir.exists()) {
                 eprintln!("No Toolport data dir found. Run --disconnect-all as the desktop user; root reads root's data dir.");
             }
+            // Independent of client restoration: a client that could not be
+            // restored must not leave a login item pointing at a removed app.
+            let startup_failed = uninstall
+                && !dry_run
+                && match conduit_lib::purge::remove_startup_entries() {
+                    Ok(report) => {
+                        for removed in &report.removed {
+                            eprintln!("Removed launch at login: {removed}");
+                        }
+                        for preserved in &report.preserved {
+                            eprintln!("Kept: {preserved}");
+                        }
+                        for left in &report.leftovers {
+                            eprintln!(
+                                "Could not remove launch at login {}: {}",
+                                left.path, left.error
+                            );
+                        }
+                        !report.leftovers.is_empty()
+                    }
+                    Err(error) => {
+                        eprintln!("Could not remove launch at login: {error}");
+                        true
+                    }
+                };
             match conduit_lib::clients::disconnect_all(dry_run) {
                 Ok(results) => {
                     println!(
@@ -21747,7 +23041,7 @@ fn main() {
                         serde_json::to_string(&results).expect("serializable disconnect results")
                     );
                     conduit_lib::telemetry::exit_with(
-                        if results.iter().any(|result| result.error.is_some()) {
+                        if startup_failed || results.iter().any(|result| result.error.is_some()) {
                             1
                         } else {
                             0
@@ -21771,6 +23065,11 @@ fn main() {
         }
         ArgAction::Run => {}
     }
+    // Every serving role (adapter, private gateway, daemon, HTTP bridge and
+    // proxy, direct stdio) redacts its stderr from here on: an adapter's goes
+    // to the client's log, the daemon's to daemon.log. A relay that cannot
+    // start leaves stderr on the null device, never unredacted.
+    conduit_lib::daemon_log::install_stderr_redaction();
     if daemon_requested(&cli_args) {
         gateway_memory::configure_daemon();
     }
@@ -21783,7 +23082,9 @@ fn main() {
             Some(value) => match value.parse::<u16>() {
                 Ok(port) if port > 0 => port,
                 _ => {
-                    eprintln!("toolport-gateway: invalid HTTP proxy port: {value}");
+                    // Not the value: this runs before the configured
+                    // secrets are known, and it may be one.
+                    eprintln!("toolport-gateway: invalid HTTP proxy port");
                     conduit_lib::telemetry::exit_with(1);
                 }
             },
@@ -21837,7 +23138,29 @@ fn main() {
     }
     // Persist org rate-limit counters across restarts (SOU-340). Safe if dir missing;
     // counters then stay process-local until the first successful bind.
+    // Sealed result spills of gateways that exited without cleaning up. Their keys
+    // died with them, so the files are unreadable; reclaim the disk now rather than
+    // at this run's first spill.
+    std::thread::spawn(conduit_lib::shaping::remove_stale_spills);
     if let Some(dir) = registry::conduit_dir() {
+        // Inline secrets are known to the redactor before this process replays
+        // or writes diagnostic text. Stored ones are learned by the read that
+        // first uses them (a server's launch registers its values before the
+        // child starts), so no role reads the vault, or waits on a keyring
+        // prompt, before it serves.
+        learn_startup_secrets();
+        // Values retired while a log could still hold them live in the vault
+        // too: only the daemon retries their cleanup, off the startup path.
+        if daemon_requested(&cli_args) {
+            std::thread::spawn(|| {
+                let retired = conduit_lib::secrets::retry_retired_scrubs();
+                if retired > 0 {
+                    glog(&format!(
+                        "{retired} replaced or deleted secret(s) still wait for their log cleanup; kept in the vault until it succeeds"
+                    ));
+                }
+            });
+        }
         conduit_lib::rate_limits::bind_data_dir(&dir);
         // Share downstream 429 backoff windows across gateway processes
         // (issue #874) until the host daemon lands. Missing state = no backoff.
@@ -21845,6 +23168,9 @@ fn main() {
         // Record the servers this gateway starts, and stop the ones a killed or
         // crashed gateway left behind.
         conduit_lib::child_ledger::bind_data_dir(&dir);
+        // Once this process resolves a server's secrets, rewrite any copy an older
+        // build left in the logs (once per secret name, off the call path).
+        conduit_lib::secret_redact::enable_background_scrub();
         let reaped = conduit_lib::child_ledger::reap_orphans(&dir);
         if reaped > 0 {
             glog(&format!(
@@ -22230,6 +23556,11 @@ fn main() {
             .ok()
             .filter(|id| clients::known_adapter_name(id).is_some()),
         env_profile: env_profile.clone(),
+        app_host: if http_mode {
+            None
+        } else {
+            conduit_lib::host_attribution::detect()
+        },
     };
 
     let cache_host = Arc::clone(&state.host);
@@ -22248,6 +23579,18 @@ fn main() {
     let _cache_maintenance = spawn_cache_maintenance(cache_interval, move || {
         let idle = cache_host.idle_for() >= Duration::from_secs(30);
         conduit_lib::shaping::maintain_cache(idle && !was_idle);
+        // A tool quarantined, disabled or put outside its allow-list since its
+        // definition was paged: drop that page. Fetch rechecks visibility anyway;
+        // this keeps the text from sitting in memory until the TTL.
+        let live = Arc::clone(
+            &cache_host
+                .router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        conduit_lib::shaping::forget_discovery(cache_host.discovery_realm(), |name| {
+            live.is_blocked(name)
+        });
         was_idle = idle;
         #[cfg(feature = "test-support")]
         if let Some(path) = &probe {
@@ -22273,6 +23616,8 @@ fn main() {
 
     if let Some(port) = http_port_opt {
         serve_http(state, port);
+        // Land queued telemetry and remove this process's result spills.
+        conduit_lib::telemetry::shutdown();
         return;
     }
 
@@ -22345,7 +23690,8 @@ fn main() {
             );
             continue;
         };
-        if !cancel_registry.begin_client_request(request_key.clone()) {
+        // The instance's handle comes from the same step that registers it.
+        let Some(cancel_context) = cancel_registry.begin_client_request(request_key.clone()) else {
             gtrace(&format!(
                 "rejected duplicate in-flight request id {request_key}"
             ));
@@ -22355,11 +23701,10 @@ fn main() {
                 break;
             }
             continue;
-        }
-
+        };
         let state = state.clone();
         let job = move || {
-            handle_stdio_request(state, req, request_key);
+            handle_stdio_request(state, req, cancel_context);
         };
         if let Some(handle) = spawn_or_run_stdio_inflight(&stdio_inflight, job) {
             stdio_workers.push(handle);
@@ -22376,8 +23721,142 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn adapter_host_headers_need_the_private_bearer_and_a_valid_thread() {
+        let headers = |thread: &'static str| {
+            move |name: &'static str| match name {
+                conduit_lib::stdio_adapter::ADAPTER_HOST_HEADER => Some("t3-code".to_string()),
+                conduit_lib::stdio_adapter::ADAPTER_HOST_THREAD_HEADER => Some(thread.to_string()),
+                _ => None,
+            }
+        };
+        // Any local process without the private bearer: nothing, whatever it sends.
+        assert_eq!(
+            super::trusted_adapter_host(false, headers("465774fd")),
+            None
+        );
+        let host = super::trusted_adapter_host(true, headers("465774fd")).unwrap();
+        assert_eq!(
+            (host.host.as_str(), host.thread.as_deref()),
+            ("t3-code", Some("465774fd"))
+        );
+        // A thread id that is too long or has other characters is dropped before storage.
+        for bad in ["a b", "x\ny", "<script>", "\u{202e}abc"] {
+            assert_eq!(
+                super::trusted_adapter_host(true, headers(bad))
+                    .unwrap()
+                    .thread,
+                None,
+                "{bad}"
+            );
+        }
+        let long: &'static str = Box::leak("a".repeat(129).into_boxed_str());
+        assert_eq!(
+            super::trusted_adapter_host(true, headers(long))
+                .unwrap()
+                .thread,
+            None
+        );
+        // An unknown host is not recorded at all.
+        assert_eq!(
+            super::trusted_adapter_host(true, |name: &'static str| {
+                (name == conduit_lib::stdio_adapter::ADAPTER_HOST_HEADER)
+                    .then(|| "other".to_string())
+            }),
+            None
+        );
+    }
+
     mod search_scale {
         include!("../gateway/search_eval_scale.rs");
+    }
+
+    /// Child half of `every_gateway_role_redacts_its_stderr`: runs the real
+    /// entry point in its own process, because it replaces the process's stderr.
+    #[test]
+    fn gateway_stderr_child() {
+        let Some(secret) = std::env::var_os("TOOLPORT_GATEWAY_STDERR_CHILD") else {
+            return;
+        };
+        let secret = secret.to_string_lossy().to_string();
+        // An invalid port is reported before the configured secrets are
+        // preloaded, so the value may be a secret the redactor does not know.
+        super::gateway_main(vec!["--http-proxy".into(), secret]);
+    }
+
+    /// Failure mode: no role learns a stored value at start any more, so the
+    /// read that launches a server must register it before the server can echo
+    /// it: here the server's first (and only) output line quotes its token.
+    #[cfg(unix)]
+    #[test]
+    fn a_value_read_at_launch_is_redacted_from_the_servers_first_output() {
+        let _data = DataDirTestEnv::new("a_value_read_at_launch_is_redacted");
+        let secret = "launch-only-secret-4Wd8Qm";
+        std::env::set_var("TOOLPORT_SECRET_LAUNCH_ONLY_TOKEN", secret);
+        let server: ServerEntry = serde_json::from_value(json!({
+            "id": "launch-srv", "name": "Launch", "enabled": true, "source": "fixture",
+            "transport": "stdio", "command": "/bin/sh",
+            "args": ["-c", "echo \"server says $LAUNCH_ONLY_TOKEN\" >&2; exit 3"],
+            "inheritEnv": false,
+            "env": [{"key": "LAUNCH_ONLY_TOKEN", "secret": true}]
+        }))
+        .unwrap();
+        let mut reg = Registry::default();
+        reg.servers.push(server.clone());
+        registry::save(&reg).unwrap();
+        // What every role runs at start reads no stored value.
+        super::learn_startup_secrets();
+        let at_start = conduit_lib::secret_redact::redact_text(secret).into_owned();
+        let dirty = Arc::new(AtomicU8::new(0));
+        let handler: ServerRequestHandler = Arc::new(|_| None);
+        let failure = match connect_one_result(&server, &dirty, handler, None, None) {
+            Err(failure) => failure.message,
+            Ok(_) => panic!("the server exits at once"),
+        };
+        // The launch read registers the value before the child is spawned, so
+        // the line the server writes first is already covered.
+        let first_line =
+            conduit_lib::secret_redact::redact_text(&format!("server says {secret}")).into_owned();
+        std::env::remove_var("TOOLPORT_SECRET_LAUNCH_ONLY_TOKEN");
+        assert_eq!(at_start, secret, "a stored value was learned at start");
+        assert!(!failure.contains(secret), "{failure}");
+        assert_eq!(first_line, "server says [secret:LAUNCH_ONLY_TOKEN]");
+    }
+
+    /// Before the relay was installed for every role, only the daemon's stderr
+    /// was redacted; an adapter's or proxy's went straight to the client's log.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn every_gateway_role_redacts_its_stderr() {
+        let dir = std::env::temp_dir().join(format!(
+            "tp-gateway-stderr-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("client-stderr.log");
+        let secret = "proxy-canary-5Rt9-SECRET";
+        let file = std::fs::File::create(&log).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::gateway_stderr_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("TOOLPORT_GATEWAY_STDERR_CHILD", secret)
+            .stdout(std::process::Stdio::null())
+            .stderr(file)
+            .status()
+            .unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!status.success(), "an invalid port exits 1: {text}");
+        assert!(!text.contains(secret), "{text}");
+        assert!(text.contains("invalid HTTP proxy port"), "{text}");
     }
 
     #[test]
@@ -22583,11 +24062,24 @@ mod tests {
     fn disconnect_all_is_a_standalone_role_and_dry_run_cannot_start_gateway() {
         assert_eq!(
             parse_args(&["--disconnect-all".into()]),
-            ArgAction::DisconnectAll { dry_run: false }
+            ArgAction::DisconnectAll {
+                dry_run: false,
+                uninstall: false
+            }
+        );
+        assert_eq!(
+            parse_args(&["--disconnect-all".into(), "--uninstall".into()]),
+            ArgAction::DisconnectAll {
+                dry_run: false,
+                uninstall: true
+            }
         );
         assert_eq!(
             parse_args(&["--disconnect-all".into(), "--dry-run".into()]),
-            ArgAction::DisconnectAll { dry_run: true }
+            ArgAction::DisconnectAll {
+                dry_run: true,
+                uninstall: false
+            }
         );
         assert!(matches!(
             parse_args(&["--dry-run".into()]),
@@ -23264,6 +24756,59 @@ mod tests {
             out["to"], "ada@example.com",
             "resource-minted PII must resolve for a tool on the same server"
         );
+    }
+
+    /// Failure mode: the result was cut and its full body cached before it
+    /// was redacted, so a secret crossing the head boundary left its first
+    /// characters in the reply, and a fetch page starting inside it the rest.
+    #[test]
+    fn a_shaped_result_never_returns_part_of_a_secret() {
+        let _data = DataDirTestEnv::new("a_shaped_result_never_returns_part_of_a_secret");
+        let secret = "shape-secret-7Wq2Kd9Lm4Xp";
+        conduit_lib::secret_redact::register("shape-srv", "SHAPE_KEY", secret);
+        let mut reg = Registry::default();
+        reg.result_budgets.insert("shape-srv".to_string(), 4096);
+        // Copies at every alignment, so the head and any page cut one.
+        let text: String = (0..4000)
+            .map(|i| format!("{}{secret}", "x".repeat(i % 11)))
+            .collect();
+        let result = json!({ "content": [{ "type": "text", "text": text }] });
+        let shaped =
+            defend_and_shape(&reg, "shape-srv", "shape-srv__read", None, result, "", true).result;
+        let head = shaped["content"][0]["text"].as_str().unwrap().to_string();
+        let cursor = head
+            .split("\"cursor\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("a shaped result")
+            .to_string();
+        let mut pages = vec![head];
+        for offset in [0, 3, 1000, 1007, 4096, 4101] {
+            let page = shaping::fetch_result(&cursor, offset, 997, None, None);
+            pages.push(
+                page["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+        let whole = shaping::fetch_result(&cursor, 0, usize::MAX, None, None);
+        pages.push(
+            whole["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+        for page in pages {
+            for piece in secret.as_bytes().windows(8) {
+                let piece = std::str::from_utf8(piece).unwrap();
+                assert!(
+                    !page.contains(piece),
+                    "{piece} in {}",
+                    &page[..page.len().min(300)]
+                );
+            }
+        }
     }
 
     #[test]
@@ -24113,6 +25658,24 @@ mod tests {
                 "{method} returned the rooted tools-only cache"
             );
         }
+    }
+
+    /// A server's `hidePrompts` flag reaches the router through the registry
+    /// policy (so it applies live), and only for that server.
+    #[test]
+    fn registry_policy_carries_hide_prompts_per_server() {
+        let _env = DataDirTestEnv::new("registry-policy-hide-prompts");
+        let mut reg = Registry::default();
+        for (id, hide) in [("docs", true), ("other", false)] {
+            let mut server = stub_server(id, id);
+            server.enabled = true;
+            server.hide_prompts = hide;
+            reg.servers.push(server);
+            reg.profiles[0].enabled_server_ids.push(id.into());
+        }
+        let policy = registry_policy(&reg, None, false, false);
+        assert_eq!(policy.hidden_prompts, HashSet::from(["docs".to_string()]));
+        assert!(policy.disabled.is_empty(), "tools are not disabled by it");
     }
 
     #[test]
@@ -25045,6 +26608,52 @@ mod tests {
         .is_empty());
     }
 
+    /// Failure mode: a tool catalog is replaced without the scrub's lock, so a
+    /// catalog saved while a scrub runs keeps a secret the scrub just learned,
+    /// or the scrub's replace puts back the older catalog.
+    #[test]
+    fn tool_caches_wait_for_the_scrub_lock_and_redact_inside_it() {
+        let _env = DataDirTestEnv::new("tool-cache-scrub-lock");
+        let text = conduit_lib::secret_redact::append_during_scrub_for_test(
+            &tool_cache_path(None).unwrap(),
+            ("tool-cache-lock", "TOKEN", "cache-late-token-P3vN8kQd"),
+            || {
+                let tools = vec![
+                    json!({"name":"cache__t", "description":"uses cache-late-token-P3vN8kQd"}),
+                ];
+                save_tool_cache(&tools, None);
+            },
+        );
+        assert!(text.contains("cache__t"), "{text}");
+        assert!(!text.contains("cache-late-token-P3vN8kQd"), "{text}");
+
+        let text = conduit_lib::secret_redact::append_during_scrub_for_test(
+            &server_catalog_path(None).unwrap(),
+            ("tool-cache-lock", "SERVERS", "servers-late-token-T6jR4mWx"),
+            || {
+                let mut router = Router::new();
+                router.add_supervised(
+                    "cache".into(),
+                    vec![
+                        json!({"name":"cached", "description":"uses servers-late-token-T6jR4mWx"}),
+                    ],
+                    Arc::new(|| {
+                        let mut server =
+                            DownstreamServer::connect("cache".into(), Box::new(CacheRoute))
+                                .unwrap();
+                        server.load_resources_prompts();
+                        Ok(server)
+                    }),
+                    ReconnectBackoff::default(),
+                    json!({"revision":1}),
+                );
+                save_server_catalogs(&router, None);
+            },
+        );
+        assert!(text.contains("\"cached\""), "{text}");
+        assert!(!text.contains("servers-late-token-T6jR4mWx"), "{text}");
+    }
+
     #[test]
     fn inherited_catalog_cache_requires_current_version_and_launch_spec() {
         let _env = DataDirTestEnv::new("inherited-catalog-version-spec");
@@ -25539,6 +27148,11 @@ mod tests {
         state.ready.store(false, Ordering::SeqCst);
         let mut live = Router::new();
         live.add(DownstreamServer::connect("late".into(), Box::new(CacheRoute)).unwrap());
+        // Test builds encode search vectors inline on the request thread, while
+        // production hands them to the encoder thread. Encode this catalog once
+        // before timing, so the bound measures the bootstrap wait and not a
+        // debug-build BGE pass that only exists under cfg(test).
+        drop(CatalogSnapshot::new(live.shared_tools()));
         *state.router.lock().unwrap() = Arc::new(live);
         let requester = state.clone();
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
@@ -27098,6 +28712,7 @@ mod tests {
                 input_request: json!({ "method": "elicitation/create" }),
                 status: ModernHitlStatus::AwaitingClient,
                 abandoned_audit: None,
+                start_wait: Duration::ZERO,
                 _cancel_guard: None,
             },
         );
@@ -27147,6 +28762,7 @@ mod tests {
                         input_request: json!({ "method": "elicitation/create" }),
                         status: ModernHitlStatus::AwaitingClient,
                         abandoned_audit: None,
+                        start_wait: Duration::ZERO,
                         _cancel_guard: None,
                     },
                 );
@@ -27256,6 +28872,8 @@ mod tests {
             client: None,
             client_name: observation::current().client_name,
             client_label: None,
+            host: observation::current().host.map(|host| host.host),
+            host_thread: observation::current().host.and_then(|host| host.thread),
             server: "db".into(),
             tool: "drop".into(),
             reason: approval::ApprovalReason::Destructive,
@@ -27314,6 +28932,8 @@ mod tests {
             client: None,
             client_name: observation::current().client_name,
             client_label: None,
+            host: observation::current().host.map(|host| host.host),
+            host_thread: observation::current().host.and_then(|host| host.thread),
             server: "crm".into(),
             tool: "export_all".into(),
             reason: approval::ApprovalReason::Destructive,
@@ -28385,11 +30005,25 @@ mod tests {
         };
         let names = script_catalog_tools(&cached, Some(&allowed), route);
         assert_eq!(names, vec!["file_system__read".to_string()]);
-        // Unscoped sees every namespaced non-meta tool, still drops bare + meta.
+        // Unscoped sees every non-meta tool. A bare (override-renamed) name stays
+        // describable and callable; it just gets no `servers.*` stub.
         let all = script_catalog_tools(&cached, None, |_| None);
         assert_eq!(
             all,
-            vec!["file_system__read".to_string(), "other__tool".to_string(),]
+            vec![
+                "file_system__read".to_string(),
+                "no_separator".to_string(),
+                "other__tool".to_string(),
+            ]
+        );
+        // Scoped, a bare name needs an owner in scope, as search requires.
+        let routed = |name: &str| match name {
+            "no_separator" => Some("file-system".to_string()),
+            other => route(other),
+        };
+        assert_eq!(
+            script_catalog_tools(&cached, Some(&allowed), routed),
+            vec!["file_system__read".to_string(), "no_separator".to_string()]
         );
     }
 
@@ -29874,6 +31508,7 @@ mod tests {
             client_id: None,
             attribution_id: None,
             env_profile: None,
+            app_host: None,
         }
     }
 
@@ -31763,6 +33398,7 @@ mod tests {
                 url: None,
                 source: None,
                 disabled_tools: vec![],
+                hide_prompts: false,
                 cwd: None,
                 client_credentials: None,
                 request_timeout_ms: None,
@@ -31836,6 +33472,7 @@ mod tests {
                 url: Some(format!("https://mcp.{id}.example/mcp")),
                 source: None,
                 disabled_tools: vec![],
+                hide_prompts: false,
                 cwd: None,
                 client_credentials: None,
                 request_timeout_ms: None,
@@ -31923,6 +33560,7 @@ mod tests {
             url: Some("https://mcp.github.example/mcp".into()),
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -33619,6 +35257,7 @@ mod tests {
             url: None,
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -35744,8 +37383,10 @@ mod tests {
         let gate = OpenGate::new();
         let cancellations = downstream::CancelRegistry::new();
         let request_id = "resource-sub-waiter".to_string();
-        assert!(cancellations.begin_client_request(request_id.clone()));
-        let cancel = cancellations.context(request_id.clone());
+        let ctx_request_id = cancellations
+            .begin_client_request(request_id.clone())
+            .expect("begins");
+        let cancel = ctx_request_id.clone();
         let cancel_registry = cancellations.clone();
         let cancel_id = request_id.clone();
         let canceller = std::thread::spawn(move || {
@@ -35771,8 +37412,10 @@ mod tests {
         let gate = OpenGate::new();
         let cancellations = downstream::CancelRegistry::new();
         let request_id = "resource-sub-already-cancelled".to_string();
-        assert!(cancellations.begin_client_request(request_id.clone()));
-        let cancel = cancellations.context(request_id.clone());
+        let ctx_request_id = cancellations
+            .begin_client_request(request_id.clone())
+            .expect("begins");
+        let cancel = ctx_request_id.clone();
         assert!(cancellations.cancel(&request_id, Some("client went away")));
 
         let err = gate
@@ -35791,8 +37434,10 @@ mod tests {
         let gate = OpenGate::new();
         let cancellations = downstream::CancelRegistry::new();
         let request_id = "resource-sub-finish-cancel-race".to_string();
-        assert!(cancellations.begin_client_request(request_id.clone()));
-        let cancel = cancellations.context(request_id.clone());
+        let ctx_request_id = cancellations
+            .begin_client_request(request_id.clone())
+            .expect("begins");
+        let cancel = ctx_request_id.clone();
         gate.finish(Ok(()));
         assert!(cancellations.cancel(&request_id, Some("client went away")));
 
@@ -35841,8 +37486,10 @@ mod tests {
 
         let cancellations = downstream::CancelRegistry::new();
         let request_id = "cancelled-listen-request".to_string();
-        assert!(cancellations.begin_client_request(request_id.clone()));
-        let cancel = cancellations.context(request_id.clone());
+        let ctx_request_id = cancellations
+            .begin_client_request(request_id.clone())
+            .expect("begins");
+        let cancel = ctx_request_id.clone();
         let cancel_registry = cancellations.clone();
         let cancel_id = request_id.clone();
         let canceller = std::thread::spawn(move || {
@@ -36045,7 +37692,8 @@ mod tests {
     /// test can assert what the session's writer thread would have written to
     /// stdout. The session normally creates that queue lazily on first use; the
     /// test seam injects one up front.
-    fn stdio_session_with_progress() -> (Arc<SessionState>, std::sync::mpsc::Receiver<Value>) {
+    fn stdio_session_with_progress() -> (Arc<SessionState>, std::sync::mpsc::Receiver<StdioProgress>)
+    {
         let session = Arc::new(SessionState::new_stdio(Arc::new(Mutex::new(
             std::io::stdout(),
         ))));
@@ -37689,7 +39337,7 @@ mod tests {
         );
 
         let meta = json!({ "progressToken": "must-not-route" });
-        let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
+        let (registration, relayed) = prepare_progress(Some(&meta), None, "alpha");
         assert!(registration.is_none());
         assert!(relayed
             .expect("metadata is relayed without progress")
@@ -37717,7 +39365,7 @@ mod tests {
             "no session and no stdio: nowhere to deliver"
         );
 
-        let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
+        let (registration, relayed) = prepare_progress(Some(&meta), None, "alpha");
         assert!(registration.is_none(), "nothing to register against");
         let relayed = relayed.expect("_meta is still relayed, minus the token");
         assert!(
@@ -37746,7 +39394,7 @@ mod tests {
         );
 
         let meta = json!({ "progressToken": 7 });
-        let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
+        let (registration, relayed) = prepare_progress(Some(&meta), None, "alpha");
         assert!(
             registration.is_some(),
             "a deliverable token gets a live route"
@@ -37777,6 +39425,7 @@ mod tests {
         let (_registration, wire_token) = register_progress(
             &routes,
             Some(&json!({ "progressToken": "tok-1" })),
+            None,
             "alpha",
             &s1,
         )
@@ -37810,6 +39459,145 @@ mod tests {
     }
 
     #[test]
+    fn each_progress_message_is_redacted_on_its_own_and_delivered_as_it_came() {
+        let _data = DataDirTestEnv::new("progress-per-message");
+        conduit_lib::secret_redact::register("alpha", "TOKEN", "sk-SECRETVALUE1234");
+        conduit_lib::secret_redact::register("alpha", "OWN", "sk-OwnProgress789");
+        let state = http_state(false);
+        let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (stdio, _stdio_rx) = stdio_session_with_progress();
+        let request = json!({ "arguments": { "key": "sk-OwnProgress789" } });
+        let (registration, wire) = register_progress(
+            &routes,
+            Some(&json!({ "progressToken": "tok-each" })),
+            Some(&request),
+            "alpha",
+            &s1,
+        )
+        .unwrap();
+        let messages = [
+            "Fetching items",
+            "Processing items",
+            "Step 3 of 7",
+            "using sk-SECRETVALUE1234 now",
+            "echo sk-OwnProgress789 ok",
+            "Done: 12 files",
+        ];
+        for (i, message) in messages.iter().enumerate() {
+            deliver_progress(
+                &stdio,
+                &state.mcp_sessions,
+                &routes,
+                "alpha",
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {"progressToken": wire, "progress": i, "message": message}
+                }),
+            );
+        }
+        let got: Vec<Value> = drain_session(&state, &s1)
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let texts: Vec<&str> = got
+            .iter()
+            .map(|n| n["params"]["message"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "Fetching items",
+                "Processing items",
+                "Step 3 of 7",
+                "using [secret:TOKEN] now",
+                // The client sent this value: its echo is its own.
+                "echo sk-OwnProgress789 ok",
+                "Done: 12 files",
+            ]
+        );
+        for (i, note) in got.iter().enumerate() {
+            assert_eq!(note["params"]["progress"], i, "{note}");
+            assert_eq!(note["params"]["progressToken"], "tok-each", "{note}");
+        }
+        // Nothing waits for the end of the call.
+        drop(registration);
+        assert!(drain_session(&state, &s1).is_empty());
+    }
+
+    #[test]
+    fn a_reply_keeps_its_request_id_when_the_id_equals_a_secret() {
+        let _data = DataDirTestEnv::new("reply-id-secret");
+        conduit_lib::secret_redact::register("alpha", "PIN", "482193");
+        conduit_lib::secret_redact::register("alpha", "KEY", "sk-ReplyIdSecret77");
+        let state = http_state(false);
+        for id in [json!(482193), json!("sk-ReplyIdSecret77")] {
+            for req in [
+                json!({"jsonrpc":"2.0","id":id,"method":"ping"}),
+                json!({"jsonrpc":"2.0","id":id,"method":"ping","params":{}}),
+            ] {
+                let reply = process_request_wire(
+                    &state,
+                    &req,
+                    &SearchGuard::default(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    DiscoveryMode::Full,
+                )
+                .expect("a reply")
+                .into_value();
+                assert_eq!(reply["id"], id, "{reply}");
+                assert_eq!(reply["jsonrpc"], "2.0", "{reply}");
+            }
+        }
+    }
+
+    #[test]
+    fn without_secret_redaction_clients_get_valid_replies_and_status_says_why() {
+        let _data = DataDirTestEnv::new("redaction-unavailable");
+        conduit_lib::secret_redact::register("alpha", "KEY", "sk-UnavailableSecret12");
+        conduit_lib::secret_redact::force_unavailable_for_test(true);
+        let state = http_state(false);
+        let call = |req: Value| {
+            process_request_wire(
+                &state,
+                &req,
+                &SearchGuard::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+            .expect("a reply")
+            .into_value()
+        };
+        let status = call(
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"toolport_status","arguments":{}}}),
+        );
+        let list = call(json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}));
+        conduit_lib::secret_redact::force_unavailable_for_test(false);
+        assert_eq!(status["jsonrpc"], "2.0");
+        assert_eq!(status["id"], 3);
+        let text = status["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("Secret redaction is unavailable"),
+            "{text}"
+        );
+        assert_eq!(
+            list,
+            json!({"jsonrpc":"2.0","id":4,"error":{"code":-32603,"message":conduit_lib::secret_redact::WITHHELD_RESPONSE}})
+        );
+    }
+
+    #[test]
     fn identical_client_tokens_from_two_clients_do_not_collide() {
         let _data =
             DataDirTestEnv::new("f3-identical-client-tokens-from-two-clients-do-not-collide");
@@ -37825,10 +39613,22 @@ mod tests {
         let (stdio, _stdio_rx) = stdio_session_with_progress();
 
         // Same client token, same downstream server, two different clients.
-        let (_r1, wire1) =
-            register_progress(&routes, Some(&json!({ "progressToken": 1 })), "alpha", &s1).unwrap();
-        let (_r2, wire2) =
-            register_progress(&routes, Some(&json!({ "progressToken": 1 })), "alpha", &s2).unwrap();
+        let (_r1, wire1) = register_progress(
+            &routes,
+            Some(&json!({ "progressToken": 1 })),
+            None,
+            "alpha",
+            &s1,
+        )
+        .unwrap();
+        let (_r2, wire2) = register_progress(
+            &routes,
+            Some(&json!({ "progressToken": 1 })),
+            None,
+            "alpha",
+            &s2,
+        )
+        .unwrap();
         assert_ne!(wire1, wire2, "each call gets its own downstream token");
         assert_eq!(
             routes.lock().unwrap().active.len(),
@@ -37862,6 +39662,7 @@ mod tests {
         let (registration, wire_token) = register_progress(
             &routes,
             Some(&json!({ "progressToken": "tok-1" })),
+            None,
             "alpha",
             &s1,
         )
@@ -37939,6 +39740,7 @@ mod tests {
         let (_reg, wire) = register_progress(
             &routes,
             Some(&json!({ "progressToken": "tok-1" })),
+            None,
             "alpha",
             RESOURCE_SUB_STDIO,
         )
@@ -37952,7 +39754,7 @@ mod tests {
             &progress_note(&wire),
         );
 
-        let delivered = stdio_rx
+        let (delivered, _owner) = stdio_rx
             .try_recv()
             .expect("the stdio client's progress must be queued");
         // Translated back to the client's own token, same as the HTTP path.
@@ -37980,7 +39782,7 @@ mod tests {
             .stdio_progress_sender()
             .expect("a stdio session owns a progress hand-off");
         for _ in 0..PROGRESS_STDIO_QUEUE {
-            let _ = sender.try_send(json!({}));
+            let _ = sender.try_send((json!({}), None));
         }
         deliver_progress(
             &stdio,
@@ -38041,10 +39843,11 @@ mod tests {
         // leave no state behind.
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
         let (_stdio, _stdio_rx) = stdio_session_with_progress();
-        assert!(register_progress(&routes, None, "alpha", "stdio").is_none());
+        assert!(register_progress(&routes, None, None, "alpha", "stdio").is_none());
         assert!(register_progress(
             &routes,
             Some(&json!({ "traceparent": "x" })),
+            None,
             "alpha",
             "stdio"
         )
@@ -38213,6 +40016,7 @@ mod tests {
             url: None,
             source: None,
             disabled_tools: vec![],
+            hide_prompts: false,
             cwd: None,
             client_credentials: None,
             request_timeout_ms: None,
@@ -38488,6 +40292,642 @@ mod tests {
         .unwrap();
         assert_eq!(result["result"]["isError"], true, "{result}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A downstream for the D123 cold Tools tab tests: one tool, counted calls.
+    struct ColdTargetRoute {
+        calls: Arc<AtomicUsize>,
+        destructive: bool,
+        tools: &'static [&'static str],
+    }
+
+    impl conduit_lib::downstream::Transport for ColdTargetRoute {
+        fn request(
+            &mut self,
+            method: &str,
+            params: Value,
+        ) -> Result<Value, conduit_lib::downstream::TransportError> {
+            match method {
+                "initialize" => Ok(json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": { "tools": {} }
+                })),
+                "tools/list" => {
+                    let annotations = if self.destructive {
+                        json!({"destructiveHint": true})
+                    } else {
+                        json!({"readOnlyHint": true, "destructiveHint": false})
+                    };
+                    let tools: Vec<_> = self
+                        .tools
+                        .iter()
+                        .map(|name| json!({"name": name, "inputSchema": {"type": "object"}, "annotations": annotations}))
+                        .collect();
+                    Ok(json!({ "tools": tools }))
+                }
+                "tools/call" => {
+                    let name = params["name"].as_str().unwrap_or_default();
+                    assert!(self.tools.contains(&name), "{params}");
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"content":[{"type":"text","text":"cold result"}],"isError":false}))
+                }
+                "resources/list" => Ok(json!({ "resources": [] })),
+                "resources/templates/list" => Ok(json!({ "resourceTemplates": [] })),
+                "prompts/list" => Ok(json!({ "prompts": [] })),
+                other => Err(conduit_lib::downstream::TransportError::Fatal(format!(
+                    "unexpected {other}"
+                ))),
+            }
+        }
+
+        fn notify(
+            &mut self,
+            _method: &str,
+            _params: Value,
+        ) -> Result<(), conduit_lib::downstream::TransportError> {
+            Ok(())
+        }
+    }
+
+    struct ColdTarget {
+        state: GatewayState,
+        starts: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    /// A gateway whose only server, `cold`, is supervised and has never started:
+    /// it has no routes, so a Tools tab target cannot resolve without a start.
+    fn cold_target(reg: Registry, destructive: bool) -> ColdTarget {
+        cold_target_with(reg, destructive, Arc::new(|| {}))
+    }
+
+    /// `before_connect` runs inside the supervisor's start, before the server
+    /// connects, so a test can hold the first catalog at a known point.
+    fn cold_target_with(
+        reg: Registry,
+        destructive: bool,
+        before_connect: Arc<dyn Fn() + Send + Sync>,
+    ) -> ColdTarget {
+        cold_target_tools(reg, destructive, &["run-item"], before_connect)
+    }
+
+    fn cold_target_tools(
+        reg: Registry,
+        destructive: bool,
+        tools: &'static [&'static str],
+        before_connect: Arc<dyn Fn() + Send + Sync>,
+    ) -> ColdTarget {
+        let state = http_state(false);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = router_with_registry_policy(&reg);
+        let (counted_starts, counted_calls) = (Arc::clone(&starts), Arc::clone(&calls));
+        router.add_supervised(
+            "cold".into(),
+            Vec::new(),
+            Arc::new(move || {
+                counted_starts.fetch_add(1, Ordering::SeqCst);
+                before_connect();
+                let mut server = DownstreamServer::connect(
+                    "cold".to_string(),
+                    Box::new(ColdTargetRoute {
+                        calls: Arc::clone(&counted_calls),
+                        destructive,
+                        tools,
+                    }),
+                )
+                .unwrap();
+                server.load_resources_prompts();
+                Ok(server)
+            }),
+            ReconnectBackoff::default(),
+            json!({"revision":1}),
+        );
+        assert!(router.exposed_tool_name("cold", tools[0]).is_none());
+        *state.host.registry.lock().unwrap() = reg;
+        *state.router.lock().unwrap() = Arc::new(router);
+        ColdTarget {
+            state,
+            starts,
+            calls,
+        }
+    }
+
+    fn cold_registry(enabled: bool, disabled_tools: Vec<String>) -> Registry {
+        Registry {
+            servers: vec![ServerEntry {
+                enabled,
+                disabled_tools,
+                ..stub_server("cold", "Cold")
+            }],
+            safety_level: None,
+            // Version 3 reads enablement from the server rows.
+            version: 3,
+            ..Registry::default()
+        }
+    }
+
+    /// Send one Tools tab Run while a helper thread publishes finished starts, the
+    /// way the gateway's reconnect loop does in production.
+    fn cold_target_request() -> Value {
+        json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params": {
+            "name":"toolport_call_tool", "arguments": {
+                "_toolportTarget":{"serverId":"cold", "tool":"run-item"}, "arguments":{}
+            }
+        }})
+    }
+
+    fn run_cold_target(
+        fixture: &ColdTarget,
+        allowed: Option<&std::collections::HashSet<String>>,
+    ) -> Value {
+        run_cold_request(fixture, allowed, cold_target_request())
+    }
+
+    /// The same call by exposed name, as any MCP client can send it.
+    fn cold_by_name_request() -> Value {
+        json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params": {
+            "name":"toolport_call_tool", "arguments": {"name":"cold__run_item", "arguments":{}}
+        }})
+    }
+
+    fn run_cold_request(
+        fixture: &ColdTarget,
+        allowed: Option<&std::collections::HashSet<String>>,
+        req: Value,
+    ) -> Value {
+        let state = &fixture.state;
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::SeqCst) {
+                    drive_reconnects(&state.host, &state.stdio_upstream, &state.profile);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            let reply = process_request(
+                state,
+                &req,
+                &SearchGuard::default(),
+                allowed,
+                None,
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            );
+            stop.store(true, Ordering::SeqCst);
+            reply.unwrap()
+        })
+    }
+
+    #[test]
+    fn tools_tab_target_starts_a_cold_server_once_and_runs() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-start");
+        let fixture = cold_target(cold_registry(true, Vec::new()), false);
+        let started = Instant::now();
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert_eq!(reply["result"]["content"][0]["text"], "cold result");
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            started.elapsed() < downstream::SETUP_CATALOG_WAIT_BUDGET,
+            "the cold Run waited out its budget"
+        );
+        // Warm now: the next Run resolves its route and never starts it again.
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_turned_off_server() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-disabled");
+        let fixture = cold_target(cold_registry(false, Vec::new()), false);
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            "Blocked by Toolport: cold is turned off. Change it in Toolport > Servers."
+        );
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_server_outside_the_access_set() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-scope");
+        let fixture = cold_target(cold_registry(true, Vec::new()), false);
+        let allowed = std::collections::HashSet::from(["other".to_string()]);
+        let reply = run_cold_target(&fixture, Some(&allowed));
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            "Tool unavailable in this client's access set or blocked by gateway policy."
+        );
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn tools_tab_cold_destructive_target_still_needs_human_approval() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-approval");
+        let reg = Registry {
+            confirm_destructive: true,
+            ..cold_registry(true, Vec::new())
+        };
+        assert_eq!(reg.safety_level_selected(), registry::SafetyLevel::Ask);
+        let fixture = cold_target(reg, true);
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert!(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("approval service was unreachable"),
+            "{reply}"
+        );
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture.calls.load(Ordering::SeqCst),
+            0,
+            "the destructive downstream call must not run without approval"
+        );
+    }
+
+    #[test]
+    fn tools_tab_cold_target_cancelled_before_its_catalog_never_runs_later() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-cancel");
+        // A destructive tool under Ask: had the abandoned Run gone on, it would
+        // have reached approval and said the approval service was unreachable.
+        let reg = Registry {
+            confirm_destructive: true,
+            ..cold_registry(true, Vec::new())
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let started_tx = Mutex::new(started_tx);
+        let release_rx = Mutex::new(release_rx);
+        let fixture = cold_target_with(
+            reg,
+            true,
+            Arc::new(move || {
+                let _ = started_tx.lock().unwrap().send(());
+                let _ = release_rx.lock().unwrap().recv();
+            }),
+        );
+        let state = &fixture.state;
+        let cancellations = downstream::CancelRegistry::new();
+        let cancel = cancellations
+            .begin_client_request("run".into())
+            .expect("a fresh request id begins");
+        let req = cold_target_request();
+        let stop = AtomicBool::new(false);
+        let reply = std::thread::scope(|scope| {
+            let driver = scope.spawn(|| {
+                while !stop.load(Ordering::SeqCst) {
+                    drive_reconnects(&state.host, &state.stdio_upstream, &state.profile);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            let request = scope.spawn(|| {
+                process_request(
+                    state,
+                    &req,
+                    &SearchGuard::default(),
+                    None,
+                    None,
+                    None,
+                    Some(cancel),
+                    None,
+                    None,
+                    DiscoveryMode::Full,
+                )
+                .unwrap()
+            });
+            // The server is starting and its first catalog is held. The caller
+            // goes away now, as an adapter whose Tools tab gave up does.
+            started_rx.recv().unwrap();
+            assert!(cancellations.cancel("run", Some("HTTP caller disconnected")));
+            let reply = request.join().unwrap();
+            // Only now let the catalog publish, and wait until the route exists.
+            release_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while state
+                .router
+                .lock()
+                .unwrap()
+                .exposed_tool_name("cold", "run-item")
+                .is_none()
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            stop.store(true, Ordering::SeqCst);
+            driver.join().unwrap();
+            reply
+        });
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            "Toolport: request cancelled while the server was starting",
+            "{reply}"
+        );
+        assert!(
+            state
+                .router
+                .lock()
+                .unwrap()
+                .exposed_tool_name("cold", "run-item")
+                .is_some(),
+            "the held catalog never published"
+        );
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture.calls.load(Ordering::SeqCst),
+            0,
+            "an abandoned Run reached the downstream after its catalog published"
+        );
+    }
+
+    #[test]
+    fn tools_tab_cold_target_for_a_blocked_tool_stays_unavailable() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-blocked");
+        let fixture = cold_target(cold_registry(true, vec!["run-item".to_string()]), false);
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            "Tool unavailable in this client's access set or blocked by gateway policy."
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture.starts.load(Ordering::SeqCst),
+            0,
+            "a switched-off tool must not start its server"
+        );
+    }
+
+    /// Replace the fixture's live router policy before the Run.
+    fn edit_cold_router(fixture: &ColdTarget, edit: impl FnOnce(&mut Router)) {
+        let mut slot = fixture.state.router.lock().unwrap();
+        edit(Arc::make_mut(&mut slot));
+    }
+
+    fn assert_cold_refused_without_start(fixture: &ColdTarget, reply: &Value) {
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            "Tool unavailable in this client's access set or blocked by gateway policy.",
+            "{reply}"
+        );
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 0, "{reply}");
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0, "{reply}");
+    }
+
+    #[test]
+    fn tools_tab_cold_target_exposes_the_default_alias() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-alias");
+        let fixture = cold_target(cold_registry(true, Vec::new()), false);
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        // The quarantine tests below key on this alias.
+        assert_eq!(
+            fixture
+                .state
+                .router
+                .lock()
+                .unwrap()
+                .exposed_tool_name("cold", "run-item"),
+            Some("cold__run_item")
+        );
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_server_for_a_quarantined_tool() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-quarantine");
+        // The default alias, and the spelling a dashed client view uses.
+        for alias in ["cold__run_item", "cold-run_item", "cold__run_item_2"] {
+            let fixture = cold_target(cold_registry(true, Vec::new()), false);
+            edit_cold_router(&fixture, |router| {
+                router.requarantine(BTreeSet::from([alias.to_string()]));
+            });
+            let reply = run_cold_target(&fixture, None);
+            assert_cold_refused_without_start(&fixture, &reply);
+        }
+    }
+
+    #[test]
+    fn tools_tab_target_starts_a_server_whose_quarantine_is_another_servers() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-other-quarantine");
+        let fixture = cold_target(cold_registry(true, Vec::new()), false);
+        // `cold_api` shares the `cold` prefix; its quarantine is not this tool's.
+        edit_cold_router(&fixture, |router| {
+            router.requarantine(BTreeSet::from(["cold_api__run_item".to_string()]));
+        });
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn cold_target_request_for(tool: &str) -> Value {
+        let mut req = cold_target_request();
+        req["params"]["arguments"]["_toolportTarget"]["tool"] = json!(tool);
+        req
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_server_for_a_quarantined_renamed_tool() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-renamed-quarantine");
+        let fixture = cold_target(cold_registry(true, Vec::new()), false);
+        edit_cold_router(&fixture, |router| {
+            router.set_overrides(HashMap::from([(
+                "cold".to_string(),
+                HashMap::from([(
+                    "run-item".to_string(),
+                    registry::ToolOverride {
+                        name: Some("say".into()),
+                        ..Default::default()
+                    },
+                )]),
+            )]));
+            router.requarantine(BTreeSet::from(["say".to_string()]));
+        });
+        let reply = run_cold_target(&fixture, None);
+        assert_cold_refused_without_start(&fixture, &reply);
+    }
+
+    #[test]
+    fn tools_tab_target_quarantine_matches_the_whole_tool_name() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-whole-name");
+        let quarantined = || {
+            let fixture = cold_target_tools(
+                cold_registry(true, Vec::new()),
+                false,
+                &["user", "get_user"],
+                Arc::new(|| {}),
+            );
+            edit_cold_router(&fixture, |router| {
+                router.requarantine(BTreeSet::from(["cold__get_user".to_string()]));
+            });
+            fixture
+        };
+        // `get_user` ends with `user`, but `user` is not quarantined.
+        let fixture = quarantined();
+        let reply = run_cold_request(&fixture, None, cold_target_request_for("user"));
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+
+        let fixture = quarantined();
+        let reply = run_cold_request(&fixture, None, cold_target_request_for("get_user"));
+        assert_cold_refused_without_start(&fixture, &reply);
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_server_while_the_catalog_fails_closed() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-fail-closed");
+        let fixture = cold_target(cold_registry(true, Vec::new()), false);
+        edit_cold_router(&fixture, Router::fail_closed_catalog);
+        let reply = run_cold_target(&fixture, None);
+        assert_cold_refused_without_start(&fixture, &reply);
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_server_for_a_tool_outside_the_tool_scope() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-tool-scope");
+        let fixture = cold_target(cold_registry(true, Vec::new()), false);
+        edit_cold_router(&fixture, |router| {
+            *router = router.with_tool_allow(HashMap::from([(
+                "cold".to_string(),
+                HashSet::from(["other-tool".to_string()]),
+            )]));
+        });
+        let reply = run_cold_target(&fixture, None);
+        assert_cold_refused_without_start(&fixture, &reply);
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_team_server_awaiting_review() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-team-review");
+        let mut reg = cold_registry(false, Vec::new());
+        reg.servers[0].source = Some("team:acme".into());
+        reg.servers[0]
+            .unknown_fields
+            .insert("teamEnableReview".into(), json!(true));
+        assert!(reg.servers[0].needs_team_enable_review());
+        assert!(reg.servers[0].check_enable_allowed(false).is_err());
+        let fixture = cold_target(reg, false);
+        let reply = run_cold_target(&fixture, None);
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            "Blocked by Toolport: cold is turned off. Change it in Toolport > Servers."
+        );
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn tools_tab_target_never_starts_a_server_missing_from_the_registry() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-unknown");
+        // The supervisor exists, but the registry no longer lists the server.
+        let fixture = cold_target(
+            Registry {
+                servers: Vec::new(),
+                ..cold_registry(true, Vec::new())
+            },
+            false,
+        );
+        let reply = run_cold_target(&fixture, None);
+        assert_cold_refused_without_start(&fixture, &reply);
+    }
+
+    /// The target form adds no reach: any MCP client could already demand-start
+    /// a cold server it can see by calling a tool by name, and neither form
+    /// starts one outside its access set.
+    #[test]
+    fn tools_tab_target_starts_only_what_a_call_by_name_already_could() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-by-name");
+        let outside = std::collections::HashSet::from(["other".to_string()]);
+        for request in [cold_target_request(), cold_by_name_request()] {
+            let fixture = cold_target(cold_registry(true, Vec::new()), false);
+            let reply = run_cold_request(&fixture, Some(&outside), request.clone());
+            assert_eq!(reply["result"]["isError"], true, "{request} {reply}");
+            assert_eq!(fixture.starts.load(Ordering::SeqCst), 0, "{request}");
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 0, "{request}");
+
+            let fixture = cold_target(cold_registry(true, Vec::new()), false);
+            let reply = run_cold_request(&fixture, None, request.clone());
+            assert_eq!(reply["result"]["isError"], false, "{request} {reply}");
+            assert_eq!(fixture.starts.load(Ordering::SeqCst), 1, "{request}");
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1, "{request}");
+        }
+    }
+
+    #[test]
+    fn tools_tab_cold_target_turned_off_while_starting_never_runs() {
+        let _env = DataDirTestEnv::new("tools-tab-cold-off-mid-start");
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let started_tx = Mutex::new(started_tx);
+        let release_rx = Mutex::new(release_rx);
+        let fixture = cold_target_with(
+            cold_registry(true, Vec::new()),
+            false,
+            Arc::new(move || {
+                let _ = started_tx.lock().unwrap().send(());
+                let _ = release_rx.lock().unwrap().recv();
+            }),
+        );
+        let state = &fixture.state;
+        let req = cold_target_request();
+        let stop = AtomicBool::new(false);
+        let reply = std::thread::scope(|scope| {
+            let driver = scope.spawn(|| {
+                while !stop.load(Ordering::SeqCst) {
+                    drive_reconnects(&state.host, &state.stdio_upstream, &state.profile);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            let request = scope.spawn(|| {
+                process_request(
+                    state,
+                    &req,
+                    &SearchGuard::default(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    DiscoveryMode::Full,
+                )
+                .unwrap()
+            });
+            started_rx.recv().unwrap();
+            // The user turns the server off while it is still starting.
+            let off = cold_registry(false, Vec::new());
+            edit_cold_router(&fixture, |router| {
+                router.apply_registry_policy(registry_policy(&off, None, false, false));
+            });
+            release_tx.send(()).unwrap();
+            let reply = request.join().unwrap();
+            stop.store(true, Ordering::SeqCst);
+            driver.join().unwrap();
+            reply
+        });
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(fixture.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture.calls.load(Ordering::SeqCst),
+            0,
+            "a server turned off mid-start still ran the call"
+        );
     }
 
     #[test]
@@ -39417,12 +41857,12 @@ mod tests {
                     .get(request.remote_addr().unwrap())
                     .unwrap()
                     .clone();
-                assert!(registry.begin_client_request("1".into()));
+                let ctx_1 = registry.begin_client_request("1".into()).expect("begins");
                 let seen = f2.clone();
-                guards.push(registry.context("1".into()).on_cancel(Arc::new(move |_| {
+                guards.push(ctx_1.clone().on_cancel(Arc::new(move |_| {
                     seen.fetch_add(1, Ordering::SeqCst);
                 })));
-                registry.finish_client_request("1");
+                ctx_1.finish();
                 respond_http(
                     request,
                     tiny_http::Response::from_string(
@@ -39491,11 +41931,11 @@ mod tests {
             .unwrap()
             .insert(key, session.clone());
         let calls = session.cancellations();
-        assert!(calls.begin_client_request("held".into()));
+        let ctx_held = calls.begin_client_request("held".into()).expect("begins");
         let free = Arc::new(AtomicBool::new(false));
         let observed = free.clone();
         let sessions = state.mcp_sessions.clone();
-        let _hook = calls.context("held".into()).on_cancel(Arc::new(move |_| {
+        let _hook = ctx_held.clone().on_cancel(Arc::new(move |_| {
             observed.store(sessions.try_lock().is_ok(), Ordering::SeqCst);
         }));
         let _scope = HttpConnectionScope(
@@ -39552,12 +41992,12 @@ mod tests {
             let _scope = p08_connection_scope(first);
             http_call_cancellations(&state, None, Some(&owner))
         };
-        assert!(a.begin_client_request("1".into()));
+        let _ctx_1 = a.begin_client_request("1".into()).expect("begins");
         let b = {
             let _scope = p08_connection_scope(second);
             http_call_cancellations(&state, None, Some(&owner))
         };
-        assert!(b.begin_client_request("1".into()));
+        let _ctx_1 = b.begin_client_request("1".into()).expect("begins");
         a.close();
         assert!(!b.is_cancelled("1"));
     }
@@ -39573,7 +42013,7 @@ mod tests {
             let _scope = p08_connection_scope(first);
             http_call_cancellations(&state, None, Some(&owner))
         };
-        assert!(a.begin_client_request("1".into()));
+        let _ctx_1 = a.begin_client_request("1".into()).expect("begins");
         let _scope = p08_connection_scope(downstream::CancelRegistry::new());
         let out = handle_mcp_http(
             &state,
@@ -39606,14 +42046,16 @@ mod tests {
         };
         let cancelled = Arc::new(AtomicUsize::new(0));
         let mut hooks = Vec::new();
+        let mut contexts = HashMap::new();
         for key in ["active", "retained"] {
-            assert!(registry.begin_client_request(key.into()));
+            let context = registry.begin_client_request(key.into()).expect("begins");
             let seen = cancelled.clone();
-            hooks.push(registry.context(key.into()).on_cancel(Arc::new(move |_| {
+            hooks.push(context.on_cancel(Arc::new(move |_| {
                 seen.fetch_add(1, Ordering::SeqCst);
             })));
+            contexts.insert(key, context);
         }
-        registry.finish_client_request("retained");
+        contexts["retained"].finish();
         for id in 0..100 {
             let _scope = p08_connection_scope(downstream::CancelRegistry::new());
             let other = test_caller(&format!("client:other-{id}"), None);
@@ -39634,7 +42076,9 @@ mod tests {
         let state = http_state(false);
         let owner = test_caller("adapter:p08-long-lived", None).session_owner;
         let connection = downstream::CancelRegistry::new();
-        assert!(connection.begin_client_request("connection".into()));
+        let _ctx_connection = connection
+            .begin_client_request("connection".into())
+            .expect("begins");
         let _scope = HttpConnectionScope(
             HTTP_CONNECTION_CANCEL.with(|current| current.replace(Some(connection.clone()))),
             HTTP_ADAPTER_INSTANCE.with(|current| current.replace(Some("p08-ttl".into()))),
@@ -39653,7 +42097,10 @@ mod tests {
         );
         assert_eq!(out.status, 200);
         let lifetime = adapter_lifetime(&state, Some(&owner)).unwrap();
-        assert!(lifetime.cancellations.begin_client_request("held".into()));
+        let _ctx_held = lifetime
+            .cancellations
+            .begin_client_request("held".into())
+            .expect("begins");
         *lifetime.last_seen.lock().unwrap() =
             Instant::now() - MCP_SESSION_TTL - Duration::from_secs(1);
         mint_mcp_session(&state, Some(&owner)).unwrap_or_else(|_| panic!("session capacity"));
@@ -39685,7 +42132,8 @@ mod tests {
         let replacement = Arc::new(replacement);
         assert!(replacement
             .cancellations
-            .begin_client_request("held".into()));
+            .begin_client_request("held".into())
+            .is_some());
         state
             .mcp_sessions
             .lock()
@@ -39809,7 +42257,7 @@ mod tests {
                 }
             });
             let registry = downstream::CancelRegistry::new();
-            assert!(registry.begin_client_request("1".into()));
+            let ctx_1 = registry.begin_client_request("1".into()).expect("begins");
             let decision = request_human_decision_with_cancel(
                 approval::ApprovalRequest {
                     token: String::new(),
@@ -39817,6 +42265,8 @@ mod tests {
                     client: None,
                     client_name: observation::current().client_name,
                     client_label: None,
+                    host: observation::current().host.map(|host| host.host),
+                    host_thread: observation::current().host.and_then(|host| host.thread),
                     server: "s".into(),
                     tool: "t".into(),
                     reason: approval::ApprovalReason::Destructive,
@@ -39825,7 +42275,7 @@ mod tests {
                     url_elicitation: None,
                     pii_release: None,
                 },
-                Some(&registry.context("1".into())),
+                Some(&ctx_1.clone()),
             );
             // On the old denial path the second connection never happens.
             if decision == approval::ApprovalDecision::Denied && reply.is_empty() {
@@ -39915,7 +42365,8 @@ mod tests {
         assert_eq!(deleted.status, 204);
         closed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let out = call.join().unwrap();
-        assert!(out.body.contains("isError"), "{}", out.body);
+        // The session's end cancelled the call, so its POST gets no message.
+        assert_eq!((out.status, out.body.as_str()), (202, ""));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         late_allow_tx.send(()).unwrap();
         let other = handle_http(
@@ -39991,12 +42442,10 @@ mod tests {
                 .unwrap()
                 .clone();
             let (released_tx, released_rx) = std::sync::mpsc::channel();
-            let _guard = registry
-                .context("connection".into())
-                .on_cancel(Arc::new(move |_| {
-                    closed_tx.send(()).unwrap();
-                    released_tx.send(()).unwrap();
-                }));
+            let _guard = registry.on_close(Arc::new(move |_| {
+                closed_tx.send(()).unwrap();
+                released_tx.send(()).unwrap();
+            }));
             parked_tx.send(()).unwrap();
             released_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             let _ = request.respond(tiny_http::Response::from_string("x"));
@@ -40115,8 +42564,10 @@ mod tests {
     fn p10c_modern_approval_records_owner_close_once() {
         let _env = DataDirTestEnv::new("p10c-modern-withdrawal");
         let registry = downstream::CancelRegistry::new();
-        assert!(registry.begin_client_request("modern-approval".into()));
-        let _cancel = ApprovalCancelGuard::enter(Some(registry.context("modern-approval".into())));
+        let ctx_modern_approval = registry
+            .begin_client_request("modern-approval".into())
+            .expect("begins");
+        let _cancel = ApprovalCancelGuard::enter(Some(ctx_modern_approval.clone()));
         let hash = audit::args_hash(&json!({}));
         let token = start_modern_hitl(
             "s__work",
@@ -40130,7 +42581,7 @@ mod tests {
             MrtrRequest::default(),
         )
         .unwrap();
-        registry.finish_client_request("modern-approval");
+        ctx_modern_approval.finish();
         registry.close();
         assert!(matches!(
             poll_modern_hitl(
@@ -40254,7 +42705,10 @@ mod tests {
             .get(&second)
             .unwrap()
             .clone();
-        assert!(session.cancellations.begin_client_request("new".into()));
+        let _ctx_new = session
+            .cancellations
+            .begin_client_request("new".into())
+            .expect("begins");
         lifetime.close();
         assert!(session.cancellations.is_cancelled("new"));
     }
@@ -40263,17 +42717,28 @@ mod tests {
     fn p08_closing_a_session_cancels_all_and_rejects_late_requests() {
         let session = SessionState::new_http(None);
         let other = SessionState::new_http(None);
+        let mut contexts = Vec::new();
         for id in ["blocked", "approval"] {
-            assert!(session.cancellations.begin_client_request(id.into()));
-            assert!(other.cancellations.begin_client_request(id.into()));
+            let mine = session
+                .cancellations
+                .begin_client_request(id.into())
+                .expect("begins");
+            let theirs = other
+                .cancellations
+                .begin_client_request(id.into())
+                .expect("begins");
+            contexts.push((mine, theirs));
         }
         session.close();
         session.close();
-        for id in ["blocked", "approval"] {
-            assert!(session.cancellations.context(id.into()).is_cancelled());
-            assert!(!other.cancellations.context(id.into()).is_cancelled());
+        for (mine, theirs) in &contexts {
+            assert!(mine.is_cancelled());
+            assert!(!theirs.is_cancelled());
         }
-        assert!(!session.cancellations.begin_client_request("late".into()));
+        assert!(session
+            .cancellations
+            .begin_client_request("late".into())
+            .is_none());
     }
 
     #[test]
@@ -40285,18 +42750,21 @@ mod tests {
         let other_registry = other.cancellations();
         let id = "1".to_string();
 
+        let asking_context = asking_registry.begin_client_request(id.clone());
         assert!(
-            asking_registry.begin_client_request(id.clone()),
+            asking_context.is_some(),
             "a fresh connection accepts its first request id"
         );
+        let other_context = other_registry.begin_client_request(id.clone());
         assert!(
-            other_registry.begin_client_request(id.clone()),
+            other_context.is_some(),
             "the same id on another connection is that connection's own request, not a duplicate"
         );
 
         // Cancel through the asking connection's context, which is how the dispatch
         // observes it, then check both registries.
-        let asking_context = asking_registry.context(id.clone());
+        let asking_context = asking_context.unwrap();
+        let other_context = other_context.unwrap();
         assert!(
             asking_registry.cancel(&id, Some("user")),
             "the owning connection cancels its own in-flight request"
@@ -40306,7 +42774,7 @@ mod tests {
             "the connection that cancelled sees it"
         );
         assert!(
-            !other_registry.context(id.clone()).is_cancelled(),
+            !other_context.is_cancelled(),
             "one connection cancelling its id must not cancel another's"
         );
 
@@ -42418,6 +44886,165 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A prompt request admitted before `hidePrompts` went live still holds a
+    /// router that routes the prompt; the live recheck must refuse it like an
+    /// unknown prompt, and only for the server whose prompts are hidden.
+    #[test]
+    fn live_prompt_recheck_refuses_prompts_hidden_after_admission() {
+        let live = Router::with_policy(
+            RegistryPolicy {
+                hidden_prompts: HashSet::from(["docs".to_string()]),
+                ..RegistryPolicy::default()
+            }
+            .with_quarantine(BTreeSet::new(), false),
+        );
+        let slot = Arc::new(Mutex::new(Arc::new(live)));
+        assert_eq!(
+            recheck_live_prompt_visibility(Some(&slot), "docs", "docs__init"),
+            Err("no route for prompt 'docs__init'".to_string())
+        );
+        assert!(recheck_live_prompt_visibility(Some(&slot), "github", "github__review").is_ok());
+        assert!(recheck_live_prompt_visibility(None, "docs", "docs__init").is_ok());
+    }
+
+    /// The hidePrompts notice is keyed by server id, so it reaches a session whose
+    /// toggled server is not in the base router at all (a daemon's `${ROOT}`
+    /// server lives only in rooted views) and skips sessions scoped elsewhere.
+    #[test]
+    fn prompt_visibility_notice_follows_server_scope_not_the_base_router() {
+        let session = |scope: Option<&str>| {
+            Arc::new(SessionState::new_http(Some(McpSessionOwner {
+                identity: "client".into(),
+                profile: None,
+                tool_scope: None,
+                scope: scope.map(|id| vec![id.to_string()]),
+            })))
+        };
+        let rooted = session(Some("rooted"));
+        let unscoped = session(None);
+        let elsewhere = session(Some("other"));
+        let sessions: McpSessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions.lock().unwrap().extend([
+            ("rooted".into(), Arc::clone(&rooted)),
+            ("unscoped".into(), Arc::clone(&unscoped)),
+            ("elsewhere".into(), Arc::clone(&elsewhere)),
+        ]);
+        let stdio = test_stdio_session();
+        notify_prompts_changed_for_servers(
+            &stdio,
+            Some(&sessions),
+            &HashSet::from(["rooted".to_string()]),
+        );
+        assert_eq!(rooted.outbound.lock().unwrap().len(), 1);
+        assert_eq!(unscoped.outbound.lock().unwrap().len(), 1);
+        assert!(elsewhere.outbound.lock().unwrap().is_empty());
+        assert_eq!(
+            deferred_count(&stdio, "notifications/prompts/list_changed"),
+            1
+        );
+    }
+
+    /// Turning on `hidePrompts` for a connected server hides its prompts on the
+    /// live router through the policy republish (no reconnect), keeps its tools,
+    /// and tells the client to re-fetch prompts/list.
+    #[test]
+    fn watch_tick_hides_a_servers_prompts_live_and_announces_it() {
+        let _env = DataDirTestEnv::new("hide-prompts-tick");
+        let mut live = Registry {
+            servers: vec![stub_server("cache", "Cache")],
+            ..Default::default()
+        };
+        live.servers[0].enabled = true;
+        let mut router = router_with_registry_policy(&live);
+        let mut server =
+            DownstreamServer::connect("cache".to_string(), Box::new(CacheRoute)).unwrap();
+        server.load_resources_prompts();
+        router.add(server);
+        assert_eq!(router.aggregated_prompts().len(), 1);
+
+        let reg_path = registry::resolved_path().unwrap();
+        let mut on_disk = live.clone();
+        on_disk.servers[0].hide_prompts = true;
+        registry::save_to(&reg_path, &on_disk).unwrap();
+        // Treat the edit as already rebuilt so this checks the live policy path
+        // on the existing connection, not a fresh router.
+        let mut watcher = WatchLoopState {
+            last_mtime: None,
+            last_relevant: router_relevant(&on_disk),
+        };
+        let host = host_from_parts(
+            Arc::new(Mutex::new(live)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(Mutex::new(Arc::new(router))),
+            Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(|_| None),
+            Arc::new(Mutex::new(())),
+            None,
+            None,
+        );
+        // HTTP sessions scoped to the toggled server and to an unrelated one.
+        // Only the first one's prompt list changes, so only it hears about it.
+        let session = |server: &str| {
+            Arc::new(SessionState::new_http(Some(McpSessionOwner {
+                identity: server.into(),
+                profile: None,
+                tool_scope: None,
+                scope: Some(vec![server.into()]),
+            })))
+        };
+        let affected = session("cache");
+        let unrelated = session("other");
+        host.mcp_sessions.lock().unwrap().extend([
+            ("affected".into(), Arc::clone(&affected)),
+            ("unrelated".into(), Arc::clone(&unrelated)),
+        ]);
+        let prompt_notices = |session: &SessionState| {
+            session
+                .outbound
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|queued| {
+                    serde_json::from_str::<Value>(&queued.json).unwrap()["method"]
+                        == "notifications/prompts/list_changed"
+                })
+                .count()
+        };
+        let stdio = test_stdio_session();
+        watch_tick(
+            &reg_path,
+            &stdio,
+            &Arc::new(Mutex::new(None)),
+            None,
+            None,
+            false,
+            &Arc::new(Mutex::new(None)),
+            None,
+            &mut watcher,
+            &host,
+        );
+
+        assert_eq!(prompt_notices(&affected), 1);
+        assert_eq!(
+            prompt_notices(&unrelated),
+            0,
+            "a session scoped away from the server must not hear about its prompts"
+        );
+        let current = Arc::clone(&host.router.lock().unwrap());
+        assert!(current.aggregated_prompts().is_empty());
+        assert!(current.get_prompt("cache__cached", json!({})).is_err());
+        assert_eq!(
+            current.aggregated_tools().len(),
+            1,
+            "the server's tools stay listed"
+        );
+        assert_eq!(
+            deferred_count(&stdio, "notifications/prompts/list_changed"),
+            1
+        );
+    }
+
     #[test]
     fn watch_tick_publishes_client_discovery_without_catalog_fanout() {
         let _env = DataDirTestEnv::new("client-discovery-tick");
@@ -42541,6 +45168,53 @@ mod tests {
             .aggregated_tools()
             .iter()
             .any(|tool| tool["name"] == "one__greet"));
+    }
+
+    /// Failure mode: a gateway start (any role) read a server's stored values
+    /// the way that asks to unlock the store: the router build digests every
+    /// server's credentials, and the daemon retried retired-value cleanups, so
+    /// a locked keyring raised a prompt nobody asked for.
+    #[test]
+    fn no_gateway_start_makes_a_prompting_read() {
+        let _env = DataDirTestEnv::new("start-no-prompt");
+        let mut stdio = stub_server("start-vaulted", "Vaulted");
+        stdio.enabled = true;
+        stdio.env =
+            vec![serde_json::from_value(json!({"key": "START_TOKEN", "secret": true})).unwrap()];
+        let mut remote = stub_server("start-remote", "Remote");
+        remote.enabled = true;
+        remote.command = None;
+        remote.transport = "http".into();
+        remote.url = Some("https://remote.example.invalid/mcp".into());
+        let mut reg = Registry {
+            servers: vec![stdio, remote],
+            ..Default::default()
+        };
+        for id in ["start-vaulted", "start-remote"] {
+            reg.profiles[0].enabled_server_ids.push(id.into());
+        }
+        registry::save(&reg).unwrap();
+        let dir = registry::conduit_dir().unwrap();
+        std::fs::write(dir.join(conduit_lib::secret_redact::SCRUB_PENDING_FILE), "").unwrap();
+        let prompts = conduit_lib::secrets::locked_store::prompts_during(|| {
+            learn_startup_secrets();
+            let _ = conduit_lib::secrets::retry_retired_scrubs();
+            for daemon in [true, false] {
+                let _router = build_router(
+                    &reg,
+                    None,
+                    daemon,
+                    daemon,
+                    &Arc::new(AtomicU8::new(0)),
+                    Arc::new(|_| None),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        });
+        assert!(prompts.is_empty(), "{prompts:?}");
     }
 
     /// P1.3: the discovery mode belongs to the host, so one host's switch cannot decide what
@@ -44111,6 +46785,66 @@ mod tests {
     }
 
     #[test]
+    fn advertised_output_schema_accepts_small_and_shaped_results() {
+        let _env = DataDirTestEnv::new("shaped-output-schema");
+        let host = dispatch_host(false);
+        let router = routed_router("x", "getItem");
+        let cat = vec![json!({
+            "name": "x__getItem",
+            "inputSchema": {"type": "object", "properties": {
+                "outputSchema": {"type": "string"}
+            }},
+            "outputSchema": {"type": "object", "required": ["answer"],
+                "properties": {"answer": {"type": "integer"}}},
+            "annotations": {"readOnlyHint": true}
+        })];
+        for budget in [0, 1024] {
+            let mut reg = Registry::default();
+            reg.result_budgets.insert("x".into(), budget);
+            let tools = tool_surface(&host, &reg, &router, &cat, None, DiscoveryMode::Full);
+            let tool = tools.iter().find(|t| t["name"] == "x__getItem").unwrap();
+            assert_eq!(tool["inputSchema"], cat[0]["inputSchema"]);
+            assert_eq!(tool["annotations"], cat[0]["annotations"]);
+            for bytes in [4, 100_000] {
+                let data = json!({"answer": 42, "payload": "x".repeat(bytes)});
+                let original = json!({"content": [{"type": "text", "text": data.to_string()}],
+                    "structuredContent": data, "isError": false});
+                let result =
+                    defend_and_shape(&reg, "x", "x__getItem", None, original, "", true).result;
+                if let Some(schema) = tool.get("outputSchema") {
+                    let structured = result.get("structuredContent").expect(
+                        "advertised outputSchema requires structuredContent even after shaping",
+                    );
+                    assert!(jsonschema::is_valid(schema, structured));
+                }
+                if budget == 0 || bytes == 4 {
+                    assert_eq!(result["structuredContent"], data);
+                } else {
+                    assert!(result.get("structuredContent").is_none());
+                    let text = result["content"][0]["text"].as_str().unwrap();
+                    let cursor = text
+                        .split("\"cursor\":\"")
+                        .nth(1)
+                        .unwrap()
+                        .split('"')
+                        .next()
+                        .unwrap();
+                    let fetched = shaping::fetch_result(cursor, 0, 0, None, Some("answer"));
+                    assert_ne!(fetched["isError"], true);
+                    assert!(fetched["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("42"));
+                }
+            }
+        }
+        assert!(
+            cat[0].get("outputSchema").is_some(),
+            "source catalog must remain intact"
+        );
+    }
+
+    #[test]
     fn exact_exposed_name_promotes_tool_and_restores_schema() {
         let cat = vec![
             json!({
@@ -44138,10 +46872,13 @@ mod tests {
             "string"
         );
         assert!(hits[0].get("schemaOmitted").is_none());
+        let mut expected = cat[1].clone();
+        expected.as_object_mut().unwrap().remove("outputSchema");
         assert_eq!(
-            hits[0], cat[1],
-            "exact lookup must keep the full definition"
+            hits[0], expected,
+            "exact lookup must keep the input contract"
         );
+        assert!(cat[1].get("outputSchema").is_some());
         let index = CatalogSearchIndex::build(&cat);
         let indexed = search_catalog_indexed(
             &cat,
@@ -44230,10 +46967,11 @@ mod tests {
         .unwrap();
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         let hits: Vec<Value> = serde_json::from_str(text.split_once("\n\n").unwrap().1).unwrap();
+        let mut expected = cat.clone();
+        expected[1].as_object_mut().unwrap().remove("outputSchema");
         assert_eq!(
-            hits,
-            vec![cat[0].clone(), cat[1].clone()],
-            "exact lookup must preserve the complete definition and prerequisite"
+            hits, expected,
+            "exact lookup must preserve input definitions and prerequisites"
         );
         assert!(text.contains("pinned prerequisite tool(s) included with full schema"));
         assert!(text.contains("Pick by description"));
@@ -45771,6 +48509,587 @@ mod tests {
         (reg, Arc::new(router), catalog)
     }
 
+    fn listed_view(
+        host: &HostState,
+        reg: &Registry,
+        router: &Arc<Router>,
+        snapshot: &Arc<CatalogSnapshot>,
+        allowed: Option<&HashSet<String>>,
+        mode: DiscoveryMode,
+    ) -> Vec<Value> {
+        let exposed = cached_tool_surfaces(host, reg, router, snapshot, allowed, None, mode).1;
+        serde_json::from_str(exposed.json.get()).unwrap()
+    }
+
+    fn listed_named<'a>(tools: &'a [Value], name: &str) -> &'a Value {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} not listed: {tools:?}"))
+    }
+
+    #[test]
+    fn claude_always_load_marks_the_working_meta_tools_in_every_mode() {
+        let _env = DataDirTestEnv::new("claude-always-load");
+        let (reg, router, snapshot) = tool_surface_fixture();
+        let working = [
+            "toolport_search_tools",
+            "toolport_call_tool",
+            "toolport_fetch_result",
+            "toolport_run_script",
+        ];
+        for code_mode in [false, true] {
+            let host = dispatch_host(code_mode);
+            for mode in [
+                DiscoveryMode::Lazy,
+                DiscoveryMode::Grouped,
+                DiscoveryMode::Full,
+            ] {
+                let tools = listed_view(&host, &reg, &router, &snapshot, None, mode);
+                for tool in &tools {
+                    let name = tool["name"].as_str().unwrap();
+                    assert_eq!(
+                        tool["_meta"][CLAUDE_ALWAYS_LOAD_META] == true,
+                        working.contains(&name),
+                        "{mode:?} code_mode={code_mode}: {tool}"
+                    );
+                }
+                assert_eq!(
+                    tools.iter().any(|t| t["name"] == "toolport_run_script"),
+                    code_mode
+                );
+            }
+        }
+        // The direct dispatch path and the full-discovery fallback agree.
+        let host = dispatch_host(true);
+        let direct = tool_surface(
+            &host,
+            &reg,
+            &router,
+            &snapshot.tools,
+            None,
+            DiscoveryMode::Lazy,
+        );
+        assert_eq!(
+            direct
+                .iter()
+                .filter(|t| t["_meta"][CLAUDE_ALWAYS_LOAD_META] == true)
+                .count(),
+            4
+        );
+        // Drift fingerprints never cover _meta, so the key cannot raise a drift warning.
+        let mut bare = search_tool_def();
+        bare.as_object_mut().unwrap().remove("_meta");
+        assert_eq!(
+            integrity::fingerprint(&search_tool_def()),
+            integrity::fingerprint(&bare)
+        );
+    }
+
+    #[test]
+    fn claude_always_load_bytes_per_tools_list() {
+        let bpe = tiktoken_rs::o200k_base().unwrap();
+        let strip = |mut tools: Vec<Value>| {
+            for tool in &mut tools {
+                tool.as_object_mut().unwrap().remove("_meta");
+            }
+            serde_json::to_string(&tools).unwrap()
+        };
+        for code_mode in [false, true] {
+            let tools = floor_tool_defs_with_code_mode(code_mode);
+            let with = serde_json::to_string(&tools).unwrap();
+            let without = strip(tools);
+            let per_tool = r#","_meta":{"anthropic/alwaysLoad":true}"#.len();
+            assert_eq!(
+                with.len() - without.len(),
+                per_tool * if code_mode { 4 } else { 3 }
+            );
+            println!(
+                "CLAUDE_META code_mode={code_mode} bytes {} -> {} tokens {} -> {}",
+                without.len(),
+                with.len(),
+                bpe.encode_ordinary(&without).len(),
+                bpe.encode_ordinary(&with).len()
+            );
+        }
+    }
+
+    #[test]
+    fn meta_tool_input_schemas_fit_codex_schema_limit() {
+        // Codex drops parameter descriptions from an input schema over
+        // `tool_input_schema_max_bytes` (default 5000 bytes).
+        const CODEX_DEFAULT_SCHEMA_MAX_BYTES: usize = 5_000;
+        let mut tools = floor_tool_defs_with_code_mode(true);
+        tools.push(help_tool_def("synthetic00", 618));
+        for tool in tools {
+            let bytes = serde_json::to_vec(&tool["inputSchema"]).unwrap().len();
+            println!(
+                "META_SCHEMA_BYTES {} {bytes}",
+                tool["name"].as_str().unwrap()
+            );
+            assert!(
+                bytes <= CODEX_DEFAULT_SCHEMA_MAX_BYTES,
+                "{} input schema is {bytes} bytes",
+                tool["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn claude_result_size_hint_follows_the_shaping_budget() {
+        assert_eq!(claude_result_size_hint(shaping::DEFAULT_BUDGET_BYTES), None);
+        assert_eq!(claude_result_size_hint(2048), None);
+        assert_eq!(claude_result_size_hint(CLAUDE_RESULT_CHARS_DEFAULT), None);
+        assert_eq!(claude_result_size_hint(50_001), Some(50_001));
+        assert_eq!(claude_result_size_hint(200_000), Some(200_000));
+        assert_eq!(
+            claude_result_size_hint(900_000),
+            Some(CLAUDE_RESULT_CHARS_CEILING)
+        );
+        assert_eq!(
+            claude_result_size_hint(0),
+            Some(CLAUDE_RESULT_CHARS_CEILING)
+        );
+
+        // A raised global budget covers fetch-result and scripts too.
+        let router = Router::new();
+        let hints = ResultSizeHints {
+            global: 120_000,
+            servers: HashMap::new(),
+            call: 120_000,
+        };
+        let mut tools = floor_tool_defs_with_code_mode(true);
+        hints.apply_all(&mut tools, &router);
+        for tool in &tools {
+            let expected = match tool["name"].as_str().unwrap() {
+                "toolport_call_tool" | "toolport_fetch_result" | "toolport_run_script" => {
+                    json!(120_000)
+                }
+                _ => Value::Null,
+            };
+            assert_eq!(tool["_meta"][CLAUDE_RESULT_SIZE_META], expected, "{tool}");
+        }
+    }
+
+    #[test]
+    fn raised_server_budgets_advertise_claude_result_size() {
+        let _env = DataDirTestEnv::new("claude-result-size");
+        let (base, router, snapshot) = tool_surface_fixture();
+        // One host for every case: the surface cache must not serve a stale budget.
+        let host = dispatch_host(false);
+        let size = |tool: &Value| tool["_meta"][CLAUDE_RESULT_SIZE_META].as_u64();
+
+        // Default budgets: nothing is added anywhere.
+        for mode in [DiscoveryMode::Lazy, DiscoveryMode::Full] {
+            let tools = listed_view(&host, &base, &router, &snapshot, None, mode);
+            assert!(tools.iter().all(|t| size(t).is_none()), "{tools:?}");
+        }
+
+        for (budget, expected) in [(200_000, 200_000), (0, 500_000), (900_000, 500_000)] {
+            let mut reg = base.clone();
+            reg.result_budgets.insert("alpha".into(), budget);
+            let full = listed_view(&host, &reg, &router, &snapshot, None, DiscoveryMode::Full);
+            assert_eq!(size(listed_named(&full, "alpha__read")), Some(expected));
+            assert_eq!(size(listed_named(&full, "beta__read")), None);
+            // Fetch-result pages use the global budget, which did not change.
+            assert_eq!(size(listed_named(&full, "toolport_fetch_result")), None);
+            let lazy = listed_view(&host, &reg, &router, &snapshot, None, DiscoveryMode::Lazy);
+            assert_eq!(
+                size(listed_named(&lazy, "toolport_call_tool")),
+                Some(expected)
+            );
+            assert_eq!(size(listed_named(&lazy, "toolport_search_tools")), None);
+            assert_eq!(size(listed_named(&lazy, "toolport_status")), None);
+            // A client scoped away from alpha cannot reach its larger results.
+            let beta_only = HashSet::from(["beta".to_string()]);
+            let scoped = listed_view(
+                &host,
+                &reg,
+                &router,
+                &snapshot,
+                Some(&beta_only),
+                DiscoveryMode::Lazy,
+            );
+            assert_eq!(size(listed_named(&scoped, "toolport_call_tool")), None);
+        }
+
+        // An upstream tool that set its own value keeps it.
+        let mut reg = base.clone();
+        reg.result_budgets.insert("alpha".into(), 300_000);
+        let hints = ResultSizeHints::new(&reg, None);
+        let mut own =
+            json!({"name":"alpha__read", "_meta":{CLAUDE_RESULT_SIZE_META: 1234, "x": 1}});
+        hints.apply(&mut own, &router);
+        assert_eq!(own["_meta"], json!({CLAUDE_RESULT_SIZE_META: 1234, "x": 1}));
+        let mut other_meta = json!({"name":"alpha__read", "_meta":{"x": 1}});
+        hints.apply(&mut other_meta, &router);
+        assert_eq!(
+            other_meta["_meta"],
+            json!({CLAUDE_RESULT_SIZE_META: 300_000, "x": 1})
+        );
+    }
+
+    /// Characters as Claude Code counts them: UTF-16 code units over the text blocks.
+    fn claude_text_chars(result: &Value) -> usize {
+        let blocks = result["content"].as_array().cloned().unwrap_or_default();
+        let texts: Vec<&str> = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
+        texts
+            .iter()
+            .map(|t| t.encode_utf16().count())
+            .sum::<usize>()
+            + texts.len().saturating_sub(1)
+    }
+
+    #[test]
+    fn meta_tool_outputs_fit_their_advertised_result_size() {
+        let _env = DataDirTestEnv::new("meta-tool-output-hints");
+        let previous = std::env::var("TOOLPORT_RESULT_BUDGET").ok();
+        std::env::set_var("TOOLPORT_RESULT_BUDGET", "100000");
+        let host = dispatch_host(true);
+        let mut reg = Registry::default();
+        reg.servers.push(stub_server("s", "s"));
+        reg.result_budgets.insert("s".into(), 150_000);
+        // Astral characters count twice in UTF-16, the worst case for a char-sized page.
+        let body = "a😀".repeat(200_000);
+        let router = Arc::new(paging_router(body.clone()));
+        let hints = ResultSizeHints::new(&reg, None);
+        let mut floor = floor_tool_defs_with_code_mode(true);
+        hints.apply_all(&mut floor, &router);
+        let hint = |name: &str| {
+            listed_named(&floor, name)["_meta"][CLAUDE_RESULT_SIZE_META]
+                .as_u64()
+                .unwrap_or(CLAUDE_RESULT_CHARS_DEFAULT as u64) as usize
+        };
+        let call_on = |router: &Router, name: &str, arguments: Value| {
+            let req = json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            });
+            handle_request(
+                &host,
+                &req,
+                &reg,
+                router,
+                &[],
+                true,
+                None,
+                &SearchGuard::default(),
+                None,
+                None,
+            )
+            .unwrap()["result"]
+                .clone()
+        };
+        let call = |name: &str, arguments: Value| call_on(&router, name, arguments);
+        let mut outputs = Vec::new();
+
+        // toolport_call_tool: the largest per-server budget in scope.
+        let called = call("toolport_call_tool", json!({ "name": "s__big" }));
+        outputs.push(("toolport_call_tool", "call", called));
+        // Text whose JSON encoding is much longer than the text itself (escaped
+        // backslashes, quotes and control characters) is still the body, not an
+        // oversized envelope, so it is shaped too.
+        for escaped in ["\\".repeat(300_000), "\\\"\u{1}é".repeat(60_000)] {
+            let router = paging_router(escaped);
+            let called = call_on(&router, "toolport_call_tool", json!({ "name": "s__big" }));
+            outputs.push(("toolport_call_tool", "escaped", called));
+        }
+
+        // toolport_fetch_result: a default page and a structured projection.
+        let structured = json!({ "rows": vec!["r😀".repeat(50); 6_000] });
+        let cursor = shaping::stash_payload(body.clone(), Some(structured), None).unwrap();
+        for offset in [0, 1, 150_000] {
+            let page = call(
+                "toolport_fetch_result",
+                json!({ "cursor": cursor, "offset": offset }),
+            );
+            outputs.push(("toolport_fetch_result", "page", page));
+        }
+        let long_len = call(
+            "toolport_fetch_result",
+            json!({ "cursor": cursor, "offset": 0, "len": 10_000_000 }),
+        );
+        outputs.push(("toolport_fetch_result", "len", long_len));
+        let projection = call(
+            "toolport_fetch_result",
+            json!({ "cursor": cursor, "projection": "rows" }),
+        );
+        outputs.push(("toolport_fetch_result", "projection", projection));
+        let escaped = json!({ "s": "\\".repeat(60_000), "q": "\"\u{1}".repeat(30_000) });
+        let escaped_cursor = shaping::stash_payload(body.clone(), Some(escaped), None).unwrap();
+        for path in ["s", "q"] {
+            let projection = call(
+                "toolport_fetch_result",
+                json!({ "cursor": escaped_cursor, "projection": path }),
+            );
+            outputs.push(("toolport_fetch_result", "escaped projection", projection));
+        }
+        // Error replies echo a short preview of what they were given, never all of it.
+        let huge = "x".repeat(100_001);
+        let echoes = [
+            call("toolport_fetch_result", json!({ "cursor": huge })),
+            call(
+                "toolport_fetch_result",
+                json!({ "cursor": cursor, "projection": huge }),
+            ),
+        ];
+
+        // toolport_run_script: a large aggregate and a large failure.
+        for script in [
+            "return 'b😀'.repeat(300000);",
+            "toolport.call('s__big', {}); throw new Error('E😀'.repeat(300000));",
+        ] {
+            let result = run_script_dispatch(
+                &reg,
+                Some(&router),
+                &[],
+                None,
+                None,
+                None,
+                None,
+                &json!({ "script": script }),
+                None,
+            );
+            outputs.push(("toolport_run_script", "script", result));
+        }
+
+        match previous {
+            Some(value) => std::env::set_var("TOOLPORT_RESULT_BUDGET", value),
+            None => std::env::remove_var("TOOLPORT_RESULT_BUDGET"),
+        }
+        assert_eq!(hint("toolport_call_tool"), 150_000);
+        assert_eq!(hint("toolport_fetch_result"), 100_000);
+        assert_eq!(hint("toolport_run_script"), 100_000);
+        for echo in echoes {
+            assert!(
+                claude_text_chars(&echo) < 400,
+                "{}",
+                &echo.to_string()[..400]
+            );
+        }
+        for (tool, case, output) in outputs {
+            let chars = claude_text_chars(&output);
+            assert!(
+                chars > 50_000,
+                "{tool} {case} must be a large output: {chars}"
+            );
+            assert!(
+                chars <= hint(tool),
+                "{tool} {case}: {chars} chars over the advertised {}",
+                hint(tool)
+            );
+        }
+    }
+
+    fn stdio_state() -> GatewayState {
+        let mut state = http_state(false);
+        let mut host = Arc::try_unwrap(state.host).ok().expect("a fresh host");
+        host.http = false;
+        state.host = Arc::new(host);
+        state
+    }
+
+    /// The Tools tab's gateway can serve its own stdio when the shared daemon is
+    /// unavailable. There the request carries no client, and the process's
+    /// client ID still skips the catalog wait the Tools tab never reads.
+    #[test]
+    fn a_direct_stdio_tools_tab_does_not_wait_for_catalogs() {
+        let _env = DataDirTestEnv::new("direct-stdio-tools-tab");
+        let mut state = stdio_state();
+        state.client_id = Some(clients::TOOLS_TAB_CLIENT_ID.into());
+        state.ready.store(false, Ordering::SeqCst);
+        let started = Instant::now();
+        process_request(
+            &state,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+            &SearchGuard::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            DiscoveryMode::Full,
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?} for catalogs",
+            started.elapsed()
+        );
+    }
+
+    /// An approved retry finds the server ready; the start the asking request
+    /// waited for travels with the approval so the call's duration counts it.
+    #[test]
+    fn an_approval_carries_the_start_wait_to_the_approved_retry() {
+        let _env = DataDirTestEnv::new("approval-carries-start-wait");
+        session_tables().hitl().clear();
+        let arguments = json!({ "target": "x" });
+        let hash = audit::args_hash(&arguments);
+        let token = start_modern_hitl(
+            "s__wipe",
+            hash.clone(),
+            None,
+            approval::ApprovalReason::Destructive,
+            Some("cursor"),
+            "s",
+            "wipe",
+            &arguments,
+            MrtrRequest::default(),
+        )
+        .unwrap();
+        set_modern_hitl_start_wait(&token, Duration::from_millis(2500));
+        let approved = poll_modern_hitl(
+            &token,
+            "s__wipe",
+            &hash,
+            Some("cursor"),
+            Some(json!({"toolport_approval": {"action": "accept", "content": {"approved": true}}})),
+        );
+        let ModernHitlPoll::Approved { start_wait, .. } = approved else {
+            panic!("accepted approval should resume")
+        };
+        assert_eq!(start_wait, Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn a_modern_stdio_client_is_named_on_its_approval() {
+        let _env = DataDirTestEnv::new("modern-client-label-approval");
+        session_tables().hitl().clear();
+        let state = stdio_state();
+        state
+            .registry
+            .lock()
+            .unwrap()
+            .set_safety_level(registry::SafetyLevel::Ask);
+        let router = routed_router("s", "delete");
+        *state.cached_tools.lock().unwrap() =
+            Arc::new(CatalogSnapshot::new(router.aggregated_tools()));
+        swap_router(&state, router);
+        let request = |id: i64, name: Option<&str>| {
+            let mut meta = json!({
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+            });
+            if let Some(name) = name {
+                meta["io.modelcontextprotocol/clientInfo"] =
+                    json!({ "name": name, "version": "2.1.290" });
+            }
+            json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "s__delete", "arguments": { "id": id }, "_meta": meta }
+            })
+        };
+        let call = |req: &Value| {
+            process_request(
+                &state,
+                req,
+                &SearchGuard::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                DiscoveryMode::Full,
+            )
+            .unwrap()
+        };
+        let reply = call(&request(1, Some("Claude Code")));
+        assert_eq!(reply["result"]["resultType"], "input_required", "{reply}");
+        // A multiplexing caller names a different client on a later request. That
+        // request is labelled with its own name. The same caller then sends a modern
+        // request with no clientInfo: it is unlabelled, never named after an earlier
+        // request's client. Only an initialize sets a connection's fallback label.
+        let second = call(&request(2, Some("Someone Else")));
+        let third = call(&request(3, None));
+        assert_eq!(
+            state.stdio_upstream.client_label.lock().unwrap().as_deref(),
+            None
+        );
+        for reply in [&reply, &second, &third] {
+            let token = reply["result"]["requestState"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let pending = session_tables()
+                .hitl()
+                .with(&token, |approval| approval.abandoned_audit.take())
+                .flatten()
+                .expect("the approval keeps its audit record");
+            pending.finish("withdrawn", 0);
+        }
+        let rows = audit::read_all().unwrap();
+        // Each approval writes more than one row; every row of one call carries the
+        // label of the request that made it.
+        let labels: HashMap<String, HashSet<String>> = rows
+            .iter()
+            .filter(|row| row["kind"] == "approval")
+            .fold(HashMap::new(), |mut labels, row| {
+                labels
+                    .entry(row["argsHash"].as_str().unwrap().to_string())
+                    .or_default()
+                    .insert(row["clientLabel"].as_str().unwrap_or("").to_string());
+                labels
+            });
+        let mut per_call: Vec<Vec<String>> = labels
+            .into_values()
+            .map(|set| set.into_iter().collect())
+            .collect();
+        per_call.sort();
+        assert_eq!(
+            per_call,
+            [
+                vec![String::new()],
+                vec!["Claude Code 2.1.290".to_string()],
+                vec!["Someone Else 2.1.290".to_string()]
+            ],
+            "{rows:?}"
+        );
+        session_tables().hitl().clear();
+    }
+
+    #[test]
+    fn only_handshake_era_requests_fall_back_to_the_initialize_label() {
+        let _env = DataDirTestEnv::new("handshake-era-label-fallback");
+        let state = stdio_state();
+        let legacy_init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2025-06-18","capabilities":{},
+            "clientInfo":{"name":"Codex","version":"1"}}});
+        let _ = process_request(
+            &state,
+            &legacy_init,
+            &SearchGuard::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            DiscoveryMode::Full,
+        );
+        let legacy = json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
+        assert_eq!(
+            request_client_label(&state, &legacy).as_deref(),
+            Some("Codex 1")
+        );
+        let modern = |info: Value| {
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientInfo": info}}})
+        };
+        assert_eq!(
+            request_client_label(&state, &modern(json!({"name":"B","version":"2"}))).as_deref(),
+            Some("B 2")
+        );
+        let mut bare = modern(Value::Null);
+        bare["params"]["_meta"]
+            .as_object_mut()
+            .unwrap()
+            .remove("io.modelcontextprotocol/clientInfo");
+        assert_eq!(request_client_label(&state, &bare), None);
+    }
+
     #[test]
     fn full_discovery_reserved_aliases_are_unique_cached_and_uncached() {
         let _env = DataDirTestEnv::new("full-discovery-reserved-aliases");
@@ -47111,6 +50430,8 @@ mod tests {
     }
 
     include!("../gateway/token_budget_tests.rs");
+    include!("../gateway/code_mode_signature_tests.rs");
+    include!("../gateway/code_mode_off_identity_tests.rs");
 
     #[test]
     fn discovery_surface_token_measurement() {
@@ -47595,9 +50916,12 @@ mod tests {
         let second = Arc::new(Mutex::new(ProgressRoutes::default()));
         let meta = json!({ "progressToken": 7 });
 
-        let (first_a, token_a) = register_progress(&first, Some(&meta), "alpha", "s1").unwrap();
-        let (first_b, token_b) = register_progress(&first, Some(&meta), "alpha", "s2").unwrap();
-        let (_second_a, token_c) = register_progress(&second, Some(&meta), "alpha", "s3").unwrap();
+        let (first_a, token_a) =
+            register_progress(&first, Some(&meta), None, "alpha", "s1").unwrap();
+        let (first_b, token_b) =
+            register_progress(&first, Some(&meta), None, "alpha", "s2").unwrap();
+        let (_second_a, token_c) =
+            register_progress(&second, Some(&meta), None, "alpha", "s3").unwrap();
 
         assert_ne!(token_a, token_b, "one table must never mint a token twice");
         assert_eq!(token_a, "tp-1");

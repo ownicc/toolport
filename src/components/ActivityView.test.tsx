@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, act, fireEvent, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ActivityView } from "./ActivityView";
+import { setLanguage } from "@/lib/i18n";
 import type { AuditEntry, SearchTrace } from "@/lib/types";
 import type { SecurityEvent } from "@/lib/api";
 
@@ -14,18 +15,20 @@ const releaseActivityRevision = vi.fn();
 const getAuditLog = vi.fn();
 const getSearchTraces = vi.fn();
 const getSecurityEvents = vi.fn();
+const getActivitySafety = vi.fn();
 const getToolIdentities = vi.fn();
 const getInspectLog = vi.fn();
 const getSavingsSummary = vi.fn();
 const getAuditStats = vi.fn();
 
 const clearActivityLogs = vi.fn();
+const exportAuditToPath = vi.fn();
 const releaseQuarantine = vi.fn();
 
 vi.mock("@/lib/api", () => ({
   releaseQuarantine: (...a: unknown[]) => releaseQuarantine(...a),
   clearActivityLogs: (...a: unknown[]) => clearActivityLogs(...a),
-  exportAuditToPath: vi.fn(),
+  exportAuditToPath: (...a: unknown[]) => exportAuditToPath(...a),
   getActivityRevision: (...a: unknown[]) => getActivityRevision(...a),
   releaseActivityRevision: (...a: unknown[]) => releaseActivityRevision(...a),
   getActivityHealth: (...a: unknown[]) => getActivityHealth(...a),
@@ -35,6 +38,7 @@ vi.mock("@/lib/api", () => ({
   getSavingsSummary: (...a: unknown[]) => getSavingsSummary(...a),
   getSearchTraces: (...a: unknown[]) => getSearchTraces(...a),
   getSecurityEvents: (...a: unknown[]) => getSecurityEvents(...a),
+  getActivitySafety: (...a: unknown[]) => getActivitySafety(...a),
   getToolIdentities: (...a: unknown[]) => getToolIdentities(...a),
 }));
 
@@ -44,7 +48,8 @@ vi.mock("sonner", () => ({
 
 vi.mock("@/lib/toast", () => ({ toastError: vi.fn() }));
 
-vi.mock("@tauri-apps/plugin-dialog", () => ({ save: vi.fn() }));
+const save = vi.fn();
+vi.mock("@tauri-apps/plugin-dialog", () => ({ save: (...a: unknown[]) => save(...a) }));
 
 function entry(over: Partial<AuditEntry> = {}): AuditEntry {
   return {
@@ -86,6 +91,11 @@ beforeEach(() => {
   getAuditLog.mockResolvedValue(initialLog);
   getSearchTraces.mockResolvedValue([]);
   getSecurityEvents.mockResolvedValue([]);
+  getActivitySafety.mockResolvedValue({
+    toolChangeReviews: true,
+    blocksNothing: false,
+    reviewsConfirmed: true,
+  });
   getToolIdentities.mockResolvedValue([]);
   getInspectLog.mockResolvedValue([]);
   getSavingsSummary.mockResolvedValue(null);
@@ -118,16 +128,62 @@ it("p10c shows approval outcomes without treating them as call errors", async ()
   getAuditStats.mockResolvedValue({ total: 2, errors: 1, errorRate: 0.5, servers: [] });
   render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   expect(screen.getByText("calls recorded").parentElement).toHaveTextContent(
     /2\s*calls recorded/,
   );
   expect(screen.getByText("errors (50%)").parentElement).toHaveTextContent(/1\s*errors/);
   for (const [, label] of outcomes) expect(screen.getByText(label)).toBeInTheDocument();
+  // Approvals are rows but not calls, so the shown rows are counted as entries,
+  // and 2 calls are not set beside more entries.
+  expect(
+    screen.getByText(
+      `Showing the latest ${outcomes.length + initialLog.length} entries.`,
+    ),
+  ).toBeInTheDocument();
+  expect(screen.queryByText(/calls recorded on this computer/)).not.toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: /errors only/i }));
   expect(screen.getByText("merge_pr")).toBeInTheDocument();
   for (const [, label] of outcomes)
     expect(screen.queryByText(label)).not.toBeInTheDocument();
+  expect(
+    screen.getByText(
+      `Showing 1 matching entry from the latest ${outcomes.length + initialLog.length}.`,
+    ),
+  ).toBeInTheDocument();
+});
+
+it("counts Activity rows as entries in singular and plural", async () => {
+  getAuditLog.mockResolvedValue([entry(), entry({ ts: 1700000003000 })]);
+  getAuditStats.mockResolvedValue({ total: 2, errors: 0, errorRate: 0, servers: [] });
+  const view = render(<ActivityView refreshKey={0} registry={null} />);
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  // The list starts open; closed, the line says how many entries it holds.
+  const toggle = await screen.findByRole("button", {
+    name: /recent calls/i,
+    expanded: true,
+  });
+  expect(screen.getByText("Showing the latest 2 entries.")).toBeInTheDocument();
+  await user.click(toggle);
+  expect(screen.getByText("Latest 2 entries available.")).toBeInTheDocument();
+  await user.click(toggle);
+  await user.click(screen.getByRole("button", { name: /errors only/i }));
+  expect(
+    screen.getByText("Showing 0 matching entries from the latest 2."),
+  ).toBeInTheDocument();
+  expect(screen.getByText("No errors in the latest 2 entries.")).toBeInTheDocument();
+  view.unmount();
+
+  getAuditLog.mockResolvedValue([entry()]);
+  getAuditStats.mockResolvedValue({ total: 1, errors: 0, errorRate: 0, servers: [] });
+  render(<ActivityView refreshKey={0} registry={null} />);
+  const single = await screen.findByRole("button", { name: /recent calls/i });
+  expect(screen.getByText("Showing the latest entry.")).toBeInTheDocument();
+  await user.click(single);
+  expect(screen.getByText("Latest entry available.")).toBeInTheDocument();
+  await user.click(single);
+  await user.click(screen.getByRole("button", { name: /errors only/i }));
+  expect(screen.getByText("No errors in the latest entry.")).toBeInTheDocument();
 });
 
 it("p10c shows an approval-only history even when no tools ran", async () => {
@@ -136,8 +192,7 @@ it("p10c shows an approval-only history even when no tools ran", async () => {
   ]);
   getAuditStats.mockResolvedValue({ total: 0, errors: 0, errorRate: 0, servers: [] });
   render(<ActivityView refreshKey={0} registry={null} />);
-  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   expect(screen.getByText("Withdrawn")).toBeInTheDocument();
   expect(screen.queryByText("No activity yet")).not.toBeInTheDocument();
   expect(screen.queryByText("calls recorded")).not.toBeInTheDocument();
@@ -363,14 +418,14 @@ describe("ActivityView trust-state loading", () => {
 
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    expect(screen.getByText(/latest 2/)).toBeInTheDocument();
+    expect(screen.getByText("latest 2")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear activity" }));
     await act(async () => {});
 
     expect(toast.success).toHaveBeenCalledWith("Cleared retained activity");
-    expect(screen.queryByText(/latest 2/)).not.toBeInTheDocument();
+    expect(screen.queryByText("latest 2")).not.toBeInTheDocument();
     expect(
       screen.getByText(/can't verify that the log is still empty/i),
     ).toBeInTheDocument();
@@ -392,7 +447,7 @@ describe("ActivityView trust-state loading", () => {
 
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    expect(screen.getByText(/latest 2/)).toBeInTheDocument();
+    expect(screen.getByText("latest 2")).toBeInTheDocument();
 
     // A live tick starts a refetch that is still in flight when the user clears.
     await act(async () => {
@@ -407,7 +462,7 @@ describe("ActivityView trust-state loading", () => {
     await act(async () => {});
 
     expect(toast.success).toHaveBeenCalledWith("Cleared retained activity");
-    expect(screen.queryByText(/latest 2/)).not.toBeInTheDocument();
+    expect(screen.queryByText("latest 2")).not.toBeInTheDocument();
     expect(
       screen.getByText(/can't verify that the log is still empty/i),
     ).toBeInTheDocument();
@@ -436,9 +491,6 @@ describe("ActivityView trust-state loading", () => {
   });
 
   it("preserves last-known calls and offers retry when a live refresh fails", async () => {
-    const user = userEvent.setup({
-      advanceTimers: (ms) => vi.advanceTimersByTime(ms),
-    });
     getAuditLog
       .mockResolvedValueOnce(initialLog)
       .mockResolvedValueOnce(initialLog)
@@ -446,7 +498,7 @@ describe("ActivityView trust-state loading", () => {
 
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    await user.click(screen.getByRole("button", { name: /recent calls/i }));
+    await screen.findByRole("button", { name: /recent calls/i, expanded: true });
 
     await act(async () => {
       vi.advanceTimersByTime(3000);
@@ -464,16 +516,22 @@ describe("ActivityView trust-state loading", () => {
     const user = userEvent.setup({
       advanceTimers: (ms) => vi.advanceTimersByTime(ms),
     });
+    const cause = "Couldn't read the activity log: Is a directory (os error 21)";
     getAuditLog
-      .mockRejectedValueOnce(new Error("offline"))
-      .mockRejectedValueOnce(new Error("offline"))
+      .mockRejectedValueOnce(cause)
+      .mockRejectedValueOnce(cause)
       .mockResolvedValueOnce([]);
 
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
 
     expect(screen.getByText("Couldn't load activity")).toBeInTheDocument();
+    // The real cause, as GTK shows it, not a fixed sentence.
+    expect(screen.getByText(cause)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View log" })).toBeInTheDocument();
     expect(screen.queryByText("No activity yet")).not.toBeInTheDocument();
+    // Protection still shows its real state while the log is unreadable.
+    expect(screen.getByText("Protection active.")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Retry activity log" }));
     await act(async () => {});
@@ -500,12 +558,11 @@ describe("ActivityView recent calls", () => {
       }),
     ]);
     render(<ActivityView refreshKey={0} registry={null} />);
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-    await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+    await screen.findByRole("button", { name: /recent calls/i, expanded: true });
     expect(screen.getByText("Searched tools")).toBeInTheDocument();
     expect(screen.queryByText(/Nothing searched yet/)).not.toBeInTheDocument();
     expect(screen.queryByText(/warm catalog|dispatch 3/)).not.toBeInTheDocument();
-    expect(screen.getByText(/Unrecorded client ·/)).toHaveAttribute(
+    expect(screen.getByText("Unrecorded client").parentElement).toHaveAttribute(
       "title",
       expect.stringContaining("dispatch 3 ms"),
     );
@@ -514,7 +571,7 @@ describe("ActivityView recent calls", () => {
       expect.stringContaining("before reaching the model"),
     );
     expect(screen.getByText(/5,225 calls recorded/)).toHaveTextContent(
-      "Showing the latest 1.",
+      "Showing the latest entry.",
     );
     expect(screen.getByRole("button", { name: "Export" })).toHaveAttribute("title");
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));
@@ -537,7 +594,7 @@ describe("ActivityView recent calls", () => {
     ]);
     render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    await user.click(screen.getByRole("button", { name: /recent calls/i }));
+    await screen.findByRole("button", { name: /recent calls/i, expanded: true });
     expect(screen.queryByText(`Run: ${runId}`)).not.toBeInTheDocument();
     await user.click(screen.getByText("run_script"));
     expect(screen.getByText("script exception", { exact: true })).toBeInTheDocument();
@@ -545,12 +602,9 @@ describe("ActivityView recent calls", () => {
   });
 
   it("gives each call row one status color, on its chip", async () => {
-    const user = userEvent.setup({
-      advanceTimers: (ms) => vi.advanceTimersByTime(ms),
-    });
     const { container } = render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    await user.click(screen.getByRole("button", { name: /recent calls/i }));
+    await screen.findByRole("button", { name: /recent calls/i, expanded: true });
     const list = container.querySelector(".toolport-list")!;
     const chips = [...list.querySelectorAll('[data-slot="badge"]')];
     expect(chips.map((chip) => chip.textContent)).toEqual(["Failed", "Succeeded"]);
@@ -569,7 +623,7 @@ describe("ActivityView recent calls", () => {
     render(<ActivityView refreshKey={0} registry={null} />);
 
     await act(async () => {});
-    await user.click(screen.getByRole("button", { name: /recent calls/i }));
+    await screen.findByRole("button", { name: /recent calls/i, expanded: true });
 
     // Expand the failed call's error detail.
     await user.click(screen.getByText("merge_pr"));
@@ -586,9 +640,6 @@ describe("ActivityView recent calls", () => {
   });
 
   it("shows the pseudonymization count, and flags a pass that did not fully apply", async () => {
-    const user = userEvent.setup({
-      advanceTimers: (ms) => vi.advanceTimersByTime(ms),
-    });
     getAuditLog.mockResolvedValue([
       entry({ tool: "redacted_call", piiReplaced: 3 }),
       entry({
@@ -603,7 +654,7 @@ describe("ActivityView recent calls", () => {
     render(<ActivityView refreshKey={0} registry={null} />);
 
     await act(async () => {});
-    await user.click(screen.getByRole("button", { name: /recent calls/i }));
+    await screen.findByRole("button", { name: /recent calls/i, expanded: true });
 
     expect(screen.getByText("3 values masked")).toBeInTheDocument();
 
@@ -786,8 +837,14 @@ it("keeps contradictory pre-session history outside all measured totals", async 
   render(<ActivityView refreshKey={0} registry={null} />);
   await act(async () => {});
   expect(screen.getByText(/100 baseline tokens/)).toHaveTextContent(
-    "100 baseline tokens − 50 catalog response tokens − 60 search response tokens = -10 net tokens saved.",
+    "100 baseline tokens − 50 catalog response tokens − 60 search response tokens = -10 net token change. A negative change means responses used more tokens than the baseline.",
   );
+  const net = screen.getByText(/-10/, { selector: "span.text-3xl" });
+  expect(net).toHaveTextContent("-10 net token change");
+  // A net cost is not drawn as a saving: no green.
+  expect(net).not.toHaveClass("text-success");
+  expect(net.closest(".toolport-alert")).not.toHaveClass("border-success");
+  expect(screen.queryByText("net tokens saved")).not.toBeInTheDocument();
   expect(screen.getByText(/1 client sessions/)).toHaveTextContent("2 catalog responses");
   expect(screen.getByText(/1.2 KB baseline catalog text/)).toHaveTextContent(
     "2.4 KB catalog text sent",
@@ -819,6 +876,28 @@ it("shows preserved history without a shareable savings headline", async () => {
   expect(screen.getByText(/Old estimate:/)).toBeVisible();
   expect(screen.getByText(/Old estimate:/)).toHaveTextContent("195,640,064 tokens");
   expect(screen.queryByRole("button", { name: "Share" })).not.toBeInTheDocument();
+});
+
+it("labels zero measured savings as savings, not as a change", async () => {
+  getSavingsSummary.mockResolvedValue({
+    tokensSaved: 0,
+    fullTokens: 50,
+    exposedTokens: 40,
+    discoveryTokens: 10,
+    tokenizedLoads: 1,
+    listLoads: 1,
+    peakCatalog: 1,
+    sinceTs: 1,
+  });
+  render(<ActivityView refreshKey={0} registry={null} />);
+  await act(async () => {});
+  expect(screen.getByText(/^0/, { selector: "span.text-3xl" })).toHaveTextContent(
+    "0 net tokens saved",
+  );
+  expect(screen.getByText(/50 baseline tokens/)).toHaveTextContent(
+    "= 0 net tokens saved.",
+  );
+  expect(screen.queryByText(/net token change/)).not.toBeInTheDocument();
 });
 
 it("preserves a negative old estimate separately from new measured savings", async () => {
@@ -862,8 +941,9 @@ it("shares a token savings statement without a billing claim", async () => {
   await act(async () => {});
   await user.click(screen.getByRole("button", { name: "Share" }));
   expect(writeText).toHaveBeenCalledWith(
-    expect.stringContaining("-123 net tokens saved"),
+    expect.stringContaining("a net token change of -123 across 1 client sessions"),
   );
+  expect(writeText.mock.calls[0][0]).not.toContain("tokens saved");
   expect(writeText.mock.calls[0][0]).toContain("not a billing figure");
   expect(writeText.mock.calls[0][0]).toContain("cl100k_base");
   expect(writeText.mock.calls[0][0]).not.toMatch(
@@ -1111,8 +1191,8 @@ describe("ActivityView security drift dismissals", () => {
       expect(screen.getByText(/Settings > Quarantined tools/)).toBeInTheDocument();
       const card = within(row.parentElement!);
       expect(
-        card.getByRole("button", { name: "Accept all for this server" }),
-      ).toBeDisabled();
+        card.queryByRole("button", { name: "Accept all for this server" }),
+      ).not.toBeInTheDocument();
       fireEvent.click(row);
       const accept = card.getByRole("button", { name: "Accept this tool" });
       expect(accept).toBeDisabled();
@@ -1172,6 +1252,208 @@ describe("ActivityView security drift dismissals", () => {
     expect(screen.getAllByRole("button", { name: /srv: 1 tool changed/ })).toHaveLength(
       2,
     );
+  });
+
+  it("keeps verified-unblocked tool changes as history when Safety is effectively Off", async () => {
+    localStorage.clear();
+    const change = (tool: string, blocked: boolean | null, historical = false) => ({
+      ...warnEvent(1_700_000_000_000),
+      tool: `srv__${tool}`,
+      new_fp: `v2:${tool}`,
+      blocked,
+      ...(blocked ? { blocked_profiles: ["work"] } : {}),
+      ...(historical ? { historical: true } : {}),
+    });
+    const unblocked = [change("read", false), change("list", false, true)];
+    const OFF = {
+      toolChangeReviews: false,
+      blocksNothing: true,
+      reviewsConfirmed: false,
+    };
+    // The registry prop no longer decides: Rust answers through the command.
+    const shown = async (
+      safety:
+        | {
+            toolChangeReviews: boolean;
+            blocksNothing: boolean;
+            reviewsConfirmed: boolean;
+          }
+        | Error,
+      events: SecurityEvent[],
+    ) => {
+      if (safety instanceof Error) getActivitySafety.mockRejectedValue(safety);
+      else getActivitySafety.mockResolvedValue(safety);
+      getSecurityEvents.mockResolvedValue(events);
+      const view = render(<ActivityView refreshKey={0} registry={null} />);
+      await act(async () => {});
+      const text = view.container.textContent ?? "";
+      const accept = screen.queryAllByRole("button", {
+        name: "Accept all for this server",
+      }).length;
+      view.unmount();
+      return { text, accept };
+    };
+    const offCard = "Toolport records tool changes but does not block them.";
+
+    const off = await shown(OFF, unblocked);
+    expect(off.accept).toBe(0);
+    expect(off.text).not.toContain("Review the changes or accept them");
+    expect(off.text).not.toContain("Open history to review them");
+    expect(off.text).toContain("2 tool-change records");
+    expect(off.text).toContain("Safety is Off.");
+    expect(off.text).toContain(offCard);
+    expect(off.text).not.toContain("Protection active.");
+    // The state comes first, then the records.
+    expect(off.text.indexOf("Safety is Off.")).toBeLessThan(
+      off.text.indexOf("2 tool-change records"),
+    );
+
+    // A blocked, unknown or held change on screen: never the Off card.
+    const blocked = await shown(OFF, [...unblocked, change("delete", true)]);
+    expect(blocked.accept).toBe(1);
+    expect(blocked.text).toContain("1 tool is blocked");
+    expect(blocked.text).toContain("2 tool-change records");
+    expect(blocked.text).not.toContain(offCard);
+    expect(blocked.text).not.toContain("Protection active.");
+    const olderBlocked = await shown(OFF, [change("old", true, true)]);
+    expect(olderBlocked.text).toContain("1 older tool-change records");
+    expect(olderBlocked.text).not.toContain(offCard);
+    const unknown = await shown(OFF, [change("read", null)]);
+    expect(unknown.text).toContain("Blocking status unavailable");
+    expect(unknown.text).not.toContain("tool-change records");
+    expect(unknown.text).not.toContain(offCard);
+    const review = await shown(OFF, [
+      { ...change("read", false), review_required: true },
+    ]);
+    expect(review.text).toContain("Review the captured definition in Settings");
+    expect(review.text).not.toContain("tool-change records");
+    expect(review.text).not.toContain(offCard);
+    // A tool held in a store but not on screen: Rust says Off does not block nothing.
+    const held = await shown(
+      { toolChangeReviews: false, blocksNothing: false, reviewsConfirmed: false },
+      unblocked,
+    );
+    expect(held.text).toContain("2 tool-change records");
+    expect(held.text).not.toContain(offCard);
+    expect(held.text).not.toContain("Protection active.");
+
+    // Tool security notices block nothing at Off: the card stays, first, then the
+    // records, then the notices. A held tool still hides it.
+    const notices = [
+      {
+        ts: 1_700_000_000_000,
+        type: "tool_poison_flag",
+        server: "srv",
+        tool: "srv__poisoned",
+        change: "poison",
+        severity: "high" as const,
+      },
+      {
+        ts: 1_700_000_000_000,
+        type: "result_injection",
+        server: "srv",
+        tool: "srv__fetch",
+        change: "result",
+        severity: "high" as const,
+      },
+    ];
+    const withNotices = await shown(OFF, [...unblocked, ...notices]);
+    expect(withNotices.text).toContain("Tool security notices");
+    expect(withNotices.text).toContain(offCard);
+    expect(withNotices.text).not.toContain("Protection active.");
+    expect(withNotices.text.indexOf("Safety is Off.")).toBeLessThan(
+      withNotices.text.indexOf("2 tool-change records"),
+    );
+    expect(withNotices.text.indexOf("2 tool-change records")).toBeLessThan(
+      withNotices.text.indexOf("Tool security notices"),
+    );
+    const noticesHeld = await shown(
+      { toolChangeReviews: false, blocksNothing: false, reviewsConfirmed: false },
+      [...unblocked, ...notices],
+    );
+    expect(noticesHeld.text).toContain("Tool security notices");
+    expect(noticesHeld.text).not.toContain(offCard);
+    const noticesBlocked = await shown(OFF, [
+      ...unblocked,
+      change("delete", true),
+      ...notices,
+    ]);
+    expect(noticesBlocked.text).toContain("Tool security notices");
+    expect(noticesBlocked.text).not.toContain(offCard);
+
+    // A refresh never pairs fresh events with the previous Safety answer: a block
+    // that arrives before Safety does must not appear under the Off card.
+    getActivitySafety.mockResolvedValue(OFF);
+    getSecurityEvents.mockResolvedValue(unblocked);
+    const racing = render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(racing.container.textContent).toContain(offCard);
+    let answerSafety: (value: typeof OFF) => void = () => {};
+    getActivitySafety.mockReturnValue(
+      new Promise((resolve) => {
+        answerSafety = resolve;
+      }),
+    );
+    getSecurityEvents.mockResolvedValue([
+      ...unblocked,
+      {
+        ts: 1_700_000_000_000,
+        type: "result_injection_blocked",
+        server: "srv",
+        tool: "srv__fetch",
+        change: "result",
+        severity: "high" as const,
+      },
+    ]);
+    racing.rerender(<ActivityView refreshKey={1} registry={null} />);
+    await act(async () => {});
+    const between = racing.container.textContent ?? "";
+    expect(between.includes(offCard) && between.includes("Tool security notices")).toBe(
+      false,
+    );
+    await act(async () => {
+      answerSafety({
+        toolChangeReviews: false,
+        blocksNothing: false,
+        reviewsConfirmed: false,
+      });
+    });
+    expect(racing.container.textContent).toContain("Tool security notices");
+    expect(racing.container.textContent).not.toContain(offCard);
+    racing.unmount();
+
+    // Reviews on, or an unanswered check, keep the cards as before.
+    for (const safety of [
+      { toolChangeReviews: true, blocksNothing: false, reviewsConfirmed: true },
+      new Error("registry unreadable"),
+    ]) {
+      const ask = await shown(safety, unblocked);
+      expect(ask.text).toContain("Not blocked. Review the changes or accept them.");
+      expect(ask.text).toContain("1 older tool-change records");
+      expect(ask.text).not.toContain("2 tool-change records");
+      expect(ask.text).not.toContain("Safety is Off.");
+    }
+    const resting = await shown(
+      { toolChangeReviews: true, blocksNothing: false, reviewsConfirmed: true },
+      [],
+    );
+    expect(resting.text).toContain("Protection active.");
+    // Only a successful read that confirmed reviews may claim protection: not
+    // after a failed read, an unconfirmed answer, or while the read is pending.
+    for (const safety of [
+      new Error("registry unreadable"),
+      { toolChangeReviews: true, blocksNothing: false, reviewsConfirmed: false },
+    ]) {
+      const unknown = await shown(safety, []);
+      expect(unknown.text).not.toContain("Protection active.");
+      expect(unknown.text).not.toContain("Safety is Off.");
+    }
+    getActivitySafety.mockReturnValue(new Promise(() => {}));
+    getSecurityEvents.mockResolvedValue([]);
+    const pending = render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(pending.container.textContent).not.toContain("Protection active.");
+    pending.unmount();
   });
 });
 
@@ -1290,15 +1572,73 @@ it("uses one server filter and one identity, time and wait meta line", async () 
   ]);
   render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
-  expect(screen.getByText("Claude Code · 2m ago · waited 1.5 s")).toHaveAttribute(
-    "title",
-    expect.stringContaining("adapter:claude-code"),
-  );
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
+  const meta = screen
+    .getAllByText("Claude Code")
+    .map((name) => name.parentElement!)
+    .find((line) => line.textContent === "Claude Code · 2m ago · waited 1.5 s");
+  expect(meta).toHaveAttribute("title", expect.stringContaining("adapter:claude-code"));
   expect(screen.queryByText("adapter:claude-code")).not.toBeInTheDocument();
   await user.click(screen.getByRole("combobox"));
   expect(screen.getAllByRole("option", { name: /^team_slack$/ })).toHaveLength(1);
   expect(screen.queryByRole("option", { name: /^team-slack$/ })).not.toBeInTheDocument();
+});
+
+it("names a Tools tab Run as Toolport and shows its whole duration", async () => {
+  const ts = Date.now() - 120000;
+  // As the backend returns it: the Tools tab's own ID and trusted name, no label.
+  getAuditLog.mockResolvedValue([
+    entry({
+      ts,
+      tool: "echo",
+      client: "adapter:toolport-tools-tab",
+      clientName: "Toolport Tools tab",
+      durationMs: 9200,
+    }),
+  ]);
+  render(<ActivityView refreshKey={0} registry={null} />);
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
+  expect(detailLine("Toolport Tools tab · 2m ago · 9.2 s")).toBeVisible();
+  expect(
+    screen.queryByText(/toolport-gtk|toolport-gateway|reports/),
+  ).not.toBeInTheDocument();
+  // A name Toolport gives, so it follows the language.
+  await act(() => setLanguage("fr"));
+  try {
+    expect(screen.getByText("Toolport, onglet Outils")).toBeVisible();
+  } finally {
+    await act(() => setLanguage("en"));
+  }
+});
+
+/** The row's detail line, whose client name and time are separate spans. */
+function detailLine(text: string) {
+  return screen.getByText(
+    (_, element) => element?.tagName === "DIV" && element.textContent === text,
+  );
+}
+
+it("keeps the time and duration visible when the client name is long", async () => {
+  const ts = Date.now() - 120000;
+  const longName = `Agent ${"with a very long reported name ".repeat(6)}`.trim();
+  getAuditLog.mockResolvedValue([
+    entry({ ts, clientName: longName, client: "adapter:long", durationMs: 850 }),
+  ]);
+  render(<ActivityView refreshKey={0} registry={null} />);
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
+  const name = screen.getByText(longName);
+  // On a wide row only the name truncates; the time and duration sit beside it and
+  // never shrink. A narrow row wraps the whole line instead.
+  expect(name).toHaveClass("@xl:truncate", "@xl:min-w-0");
+  expect(name).toHaveAttribute("dir", "auto");
+  const when = name.nextElementSibling!;
+  expect(when).toHaveTextContent("· 2m ago · 850 ms");
+  expect(when).toHaveClass("@xl:shrink-0");
+  expect(when).not.toHaveClass("@xl:truncate");
+  expect(name.parentElement).toHaveAttribute(
+    "title",
+    expect.stringContaining(`${longName} · 2m ago · 850 ms`),
+  );
 });
 
 it("uses one server option for hyphenated call and approval identities", async () => {
@@ -1316,7 +1656,7 @@ it("uses one server option for hyphenated call and approval identities", async (
   ]);
   render(<ActivityView refreshKey={0} registry={null} />);
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  await user.click(await screen.findByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   await user.click(screen.getByRole("combobox"));
   expect(screen.getAllByRole("option", { name: /^team_slack$/ })).toHaveLength(1);
   expect(screen.queryByRole("option", { name: /^team-slack$/ })).not.toBeInTheDocument();
@@ -1373,7 +1713,7 @@ it.each(["success", "cancellation"] as const)(
     getAuditLog.mockResolvedValue(refreshedLog);
     const fresh = render(<ActivityView refreshKey={0} registry={null} />);
     await act(async () => {});
-    fireEvent.click(screen.getByRole("button", { name: /recent calls/i }));
+    await screen.findByRole("button", { name: /recent calls/i, expanded: true });
     expect(screen.getByText("list_issues")).toBeInTheDocument();
     const reads = getAuditLog.mock.calls.length;
     await act(async () => {
@@ -1405,7 +1745,7 @@ it("reconciles a write between initial panel snapshot and first revision baselin
   await act(async () => {});
   const calls = getAuditLog.mock.calls.length;
   expect(calls).toBe(1);
-  fireEvent.click(screen.getByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   // A real new append is now available to panel readers. The queued initial
   // digest observes it, after the first panel reader has returned older bytes.
   getAuditLog.mockResolvedValue(refreshedLog);
@@ -1433,7 +1773,7 @@ it("reconciles after an initial revision error and rejects obsolete panel comple
   await act(async () => {});
   expect(screen.getByText(/Activity change checks are unavailable/)).toBeInTheDocument();
   await act(() => vi.advanceTimersByTimeAsync(3000));
-  fireEvent.click(screen.getByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   expect(screen.getByText("list_issues")).toBeInTheDocument();
   await act(async () => finishOld(initialLog));
   expect(screen.getByText("list_issues")).toBeInTheDocument();
@@ -1462,9 +1802,86 @@ it("reconciles hide/show with a delayed first revision and no overlapping checks
   expect(getActivityRevision).toHaveBeenCalledTimes(1);
   await act(async () => finish("obsolete"));
   await act(() => vi.advanceTimersByTimeAsync(3000));
-  fireEvent.click(screen.getByRole("button", { name: /recent calls/i }));
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
   expect(screen.getByText("list_issues")).toBeInTheDocument();
   const calls = getAuditLog.mock.calls.length;
   await act(() => vi.advanceTimersByTimeAsync(60_000));
   expect(getAuditLog).toHaveBeenCalledTimes(calls);
+});
+
+it("names calls made through T3 Code and shows their thread", async () => {
+  const ts = Date.now() - 120000;
+  const thread = "0f8e2c1a-9b7d-4e3f-a1b2-c3d4e5f60718";
+  getAuditLog.mockResolvedValue([
+    entry({
+      ts,
+      tool: "hosted",
+      clientName: "Codex",
+      host: "t3-code",
+      hostThread: thread,
+    }),
+    entry({ ts, tool: "hosted_no_thread", clientName: "Cursor", host: "t3-code" }),
+    entry({
+      ts,
+      tool: "hosted_reports",
+      clientName: "Claude Code (claude_personal)",
+      clientLabel: "claude-code-cli",
+      host: "t3-code",
+    }),
+    entry({ ts, tool: "plain_reports", clientName: "Gemini", clientLabel: "my-agent" }),
+    entry({ ts, tool: "other_host", clientName: "Zed", host: "other", hostThread: "x1" }),
+    entry({ ts, tool: "plain", clientName: "Claude Code" }),
+  ]);
+  render(<ActivityView refreshKey={0} registry={null} />);
+  await screen.findByRole("button", { name: /recent calls/i, expanded: true });
+  expect(detailLine("Codex via T3 Code · 2m ago · 120 ms")).toBeVisible();
+  const chip = screen.getByText("Thread 0f8e2c1a");
+  expect(chip).toHaveAttribute("title", `T3 Code thread ${thread}`);
+  // A control that copies the full id.
+  expect(screen.getByRole("button", { name: `Copy thread id ${thread}` })).toBe(chip);
+  expect(detailLine("Cursor via T3 Code · 2m ago · 120 ms")).toBeVisible();
+  // The host stays beside the client it describes; what it reported comes next.
+  expect(
+    detailLine(
+      'Claude Code (claude_personal) via T3 Code · reports "claude-code-cli" · 2m ago · 120 ms',
+    ),
+  ).toBeVisible();
+  expect(detailLine('Gemini · reports "my-agent" · 2m ago · 120 ms')).toBeVisible();
+  expect(screen.getAllByText(/^Thread /)).toHaveLength(1);
+  expect(detailLine("Zed · 2m ago · 120 ms")).toBeVisible();
+  expect(detailLine("Claude Code · 2m ago · 120 ms")).toBeVisible();
+  expect(screen.queryByText(/Zed via/)).not.toBeInTheDocument();
+});
+
+describe("ActivityView header actions", () => {
+  it("offers Export and Clear on an empty log, as on a busy one", async () => {
+    getAuditLog.mockResolvedValue([]);
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    expect(screen.getByText("No activity yet")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear" })).toBeInTheDocument();
+  });
+
+  it("exports the format picked from the Export menu", async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    save.mockResolvedValue("/tmp/toolport-activity.json");
+    exportAuditToPath.mockResolvedValue(undefined);
+    render(<ActivityView refreshKey={0} registry={null} />);
+    await act(async () => {});
+    await user.click(screen.getByRole("button", { name: "Export" }));
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+      "Export JSON",
+      "Export CSV",
+    ]);
+    await user.click(screen.getByRole("menuitem", { name: "Export JSON" }));
+    await act(async () => {});
+    expect(save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        defaultPath: "toolport-activity.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      }),
+    );
+    expect(exportAuditToPath).toHaveBeenCalledWith("/tmp/toolport-activity.json", "json");
+  });
 });

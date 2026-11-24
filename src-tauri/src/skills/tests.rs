@@ -4215,6 +4215,7 @@ fn detected_profile(
         name: id.into(),
         uses_connectors: false,
         location_removable: false,
+        location_kept_by_t3_code: false,
         discovery: crate::clients::DiscoveryCapabilities {
             auto_mode: "full",
             native_tool_search: None,
@@ -4233,6 +4234,7 @@ fn detected_profile(
         entry_state: crate::clients::GatewayEntryState::Absent,
         error: None,
         claude_profile: None,
+        t3_code: Vec::new(),
     }
 }
 

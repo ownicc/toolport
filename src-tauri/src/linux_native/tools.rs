@@ -23,9 +23,14 @@ pub(super) struct ServerToolsPanel {
 
 #[derive(Clone)]
 struct ToolPolicy {
+    /// The server's name, for "Starting {server}…" without a registry read on
+    /// the UI thread.
+    name: String,
     disabled: std::collections::HashSet<String>,
     pinned: std::collections::HashSet<String>,
     overrides: std::collections::HashMap<String, crate::registry::ToolOverride>,
+    /// The global switch that hides destructive tools, as React reads it.
+    deny_destructive: bool,
 }
 
 impl ServerToolsPanel {
@@ -151,6 +156,11 @@ impl ServerToolsPanel {
             let result = gtk::gio::spawn_blocking(move || {
                 let capabilities = crate::playground::capabilities(&server_id)?;
                 let registry = crate::registry::load()?;
+                let name = registry
+                    .servers
+                    .iter()
+                    .find(|server| server.id == server_id)
+                    .map_or_else(|| server_id.clone(), |server| server.name.clone());
                 let disabled = registry
                     .servers
                     .iter()
@@ -170,9 +180,11 @@ impl ServerToolsPanel {
                 Ok::<_, String>((
                     capabilities,
                     ToolPolicy {
+                        name,
                         disabled,
                         pinned,
                         overrides,
+                        deny_destructive: registry.deny_destructive,
                     },
                 ))
             })
@@ -288,6 +300,7 @@ impl ServerToolsPanel {
                 !policy.disabled.contains(&name),
                 policy.pinned.contains(&name),
                 policy.overrides.get(&name).cloned(),
+                policy.deny_destructive && hints_destructive(tool),
                 self.clone(),
             ));
         }
@@ -406,11 +419,24 @@ fn insert_state_badge(badges: &gtk::FlowBox, badge: &gtk::Label) {
     });
 }
 
+/// A tool that says it is destructive, by the rule React's tool list uses.
+fn hints_destructive(tool: &serde_json::Value) -> bool {
+    [
+        tool.pointer("/annotations/destructiveHint"),
+        tool.get("destructiveHint"),
+    ]
+    .into_iter()
+    .any(|hint| hint.and_then(serde_json::Value::as_bool) == Some(true))
+}
+
+/// `blocked`: the global switch hides this destructive tool whatever its own
+/// switch says.
 fn tool_row(
     tool: serde_json::Value,
     enabled: bool,
     pinned: bool,
     exposure_override: Option<crate::registry::ToolOverride>,
+    blocked: bool,
     page: ServerToolsPanel,
 ) -> gtk::Box {
     let name = tool
@@ -537,7 +563,7 @@ fn tool_row(
         .valign(gtk::Align::Center)
         .build();
     visibility.update_property(&[gtk::accessible::Property::Label(&name)]);
-    set_visibility_look(&visibility, enabled);
+    set_visibility_look(&visibility, enabled, blocked);
     // Reverting a failed write re-enters this handler, so the guard keeps the
     // revert from being treated as a fresh toggle.
     let reverting = Rc::new(Cell::new(false));
@@ -572,7 +598,7 @@ fn tool_row(
             match result {
                 Ok(Ok(_)) => {
                     page.remember_tool_enabled(&name, enabled);
-                    set_visibility_look(&button, enabled);
+                    set_visibility_look(&button, enabled, blocked);
                     badge.remove_css_class(if enabled { "off" } else { "success" });
                     badge.add_css_class(if enabled { "success" } else { "off" });
                     run.set_sensitive(enabled);
@@ -622,6 +648,7 @@ fn tool_row(
         .valign(gtk::Align::Center)
         .css_classes(["flat"])
         .build();
+    super::quiet_tooltips::guard_menu(&menu);
 
     let is_pinned = Rc::new(Cell::new(pinned));
     let page_for_pin = page.clone();
@@ -683,9 +710,24 @@ fn tool_row(
         let name = name_for_run.clone();
         let title = crate::i18n::trf("Run {value0}", &[("value0", &name.to_string())]);
         let tool_name = name.clone();
-        open_json_action(&page, &title, &schema, move |server_id, arguments| {
-            crate::playground::call_tool(&server_id, &tool_name, arguments)
-        });
+        // A Run the dialog can cancel, and watch while the server starts.
+        let tool_run = crate::playground::ToolRun::new();
+        let run_for_call = tool_run.clone();
+        open_json_action(
+            &page,
+            &title,
+            &schema,
+            Some(tool_run),
+            move |server_id, arguments| {
+                crate::playground::call_tool_run(
+                    &server_id,
+                    &tool_name,
+                    arguments,
+                    &run_for_call,
+                    |_| {},
+                )
+            },
+        );
     });
 
     row.append(&visibility);
@@ -702,8 +744,13 @@ fn pin_label(pinned: bool) -> &'static str {
     }
 }
 
-fn set_visibility_look(button: &gtk::Switch, enabled: bool) {
-    button.set_tooltip_text(Some(&if enabled {
+fn set_visibility_look(button: &gtk::Switch, enabled: bool, blocked: bool) {
+    button.set_tooltip_text(Some(&if blocked {
+        // A click changes only the tool's own setting while the switch hides it.
+        crate::i18n::tr(
+            "Destructive tools are hidden from clients by the global switch even when individually enabled.",
+        )
+    } else if enabled {
         crate::i18n::tr("Exposed to clients. Hide it.")
     } else {
         crate::i18n::tr("Hidden from clients. Expose it.")
@@ -930,6 +977,7 @@ fn prompt_row(prompt: serde_json::Value, page: ServerToolsPanel) -> gtk::Box {
             &page,
             &title,
             &serde_json::json!({"type": "object"}),
+            None,
             move |server_id, arguments| {
                 crate::playground::get_prompt(&server_id, &prompt_name, arguments)
             },
@@ -1163,6 +1211,7 @@ fn build_form_row(field: &FormField) -> (gtk::Box, FormWidget) {
             let mut items = vec!["(unset)"];
             items.extend(options.iter().map(String::as_str));
             let dropdown = gtk::DropDown::from_strings(&items);
+            super::quiet_tooltips::guard_dropdown(&dropdown);
             let default_index = field
                 .default
                 .as_ref()
@@ -1215,6 +1264,7 @@ fn open_json_action(
     page: &ServerToolsPanel,
     title: &str,
     schema: &serde_json::Value,
+    tool_run: Option<crate::playground::ToolRun>,
     execute: impl FnOnce(String, serde_json::Value) -> Result<serde_json::Value, String>
         + Send
         + 'static,
@@ -1367,12 +1417,17 @@ fn open_json_action(
     root.append(&actions);
     shell.append(&root);
     dialog.set_content(Some(&shell));
-    // Cancelling mid-call abandons the wait (the server finishes on its own);
-    // the completion handler checks this before touching the closed dialog.
+    // Cancelling mid-call cancels a tool Run in the gateway, including a wait
+    // for the server to start; other actions only stop waiting. The completion
+    // handler checks this before touching the closed dialog.
     let cancelled = Rc::new(Cell::new(false));
     let cancelled_on_close = cancelled.clone();
+    let run_on_close = tool_run.clone();
     dialog.connect_close_request(move |_| {
         cancelled_on_close.set(true);
+        if let Some(run) = &run_on_close {
+            run.cancel();
+        }
         gtk::glib::Propagation::Proceed
     });
     let dialog_for_cancel = dialog.clone();
@@ -1384,6 +1439,12 @@ fn open_json_action(
     let Some(server_id) = page.selected_server_id() else {
         return;
     };
+    let server_name = tool_run.as_ref().map(|_| {
+        page.last_load
+            .borrow()
+            .as_ref()
+            .map_or_else(|| server_id.clone(), |(_, policy)| policy.name.clone())
+    });
     let execute = Rc::new(RefCell::new(Some(execute)));
     let execute_for_run = execute.clone();
     let dialog_for_run = dialog.clone();
@@ -1440,18 +1501,25 @@ fn open_json_action(
         {
             let feedback = feedback.clone();
             let done = done.clone();
-            gtk::glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+            let tool_run = tool_run.clone();
+            let server_name = server_name.clone();
+            // A quarter second, so "Starting" shows as soon as the gateway says
+            // so; the text changes only once a second.
+            gtk::glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
                 if done.get() {
                     return gtk::glib::ControlFlow::Break;
                 }
-                set_dialog_status(
-                    &feedback,
-                    &crate::i18n::trf(
-                        "Calling… {seconds}s",
-                        &[("seconds", &started.elapsed().as_secs().to_string())],
+                let seconds = started.elapsed().as_secs().to_string();
+                let text = match (&tool_run, &server_name) {
+                    (Some(run), Some(name)) if run.is_starting() => crate::i18n::trf(
+                        "Starting {value0}… {value1}s",
+                        &[("value0", name), ("value1", &seconds)],
                     ),
-                    false,
-                );
+                    _ => crate::i18n::trf("Calling… {seconds}s", &[("seconds", &seconds)]),
+                };
+                if feedback.label() != text {
+                    set_dialog_status(&feedback, &text, false);
+                }
                 gtk::glib::ControlFlow::Continue
             });
         }
@@ -1467,7 +1535,7 @@ fn open_json_action(
             }
             dialog.close();
             match result {
-                Ok(Ok(value)) => show_output(&page, "Tools result", value),
+                Ok(Ok(value)) => show_call_result(&page, value),
                 Ok(Err(error)) => page.show_error(&error),
                 Err(_) => page.show_error(&crate::i18n::tr("the tool call stopped unexpectedly")),
             }
@@ -1492,7 +1560,72 @@ fn run_output(
     });
 }
 
-fn show_output(page: &ServerToolsPanel, title: &str, value: serde_json::Value) {
+/// A Run's result, shown as the React Tools tab shows it: what the tool
+/// returned first, with Toolport's provenance metadata left out of the way.
+fn show_call_result(page: &ServerToolsPanel, value: serde_json::Value) {
+    if value.get("content").is_none() {
+        // Not a tool result (a prompt's messages): show it whole.
+        return show_output(page, &crate::i18n::tr("Result"), value);
+    }
+    let title = if value.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
+        crate::i18n::tr("Tool returned an error")
+    } else {
+        crate::i18n::tr("Result")
+    };
+    show_text(page, &title, render_tool_result(&value));
+}
+
+/// The text of a tool result's content blocks, the same as React's
+/// `renderResult`: text blocks as written, other blocks as JSON, and the whole
+/// result as JSON when it has no content.
+fn render_tool_result(value: &serde_json::Value) -> String {
+    let mut value = value.clone();
+    strip_provenance(&mut value);
+    let value = &value;
+    let blocks = value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .filter(|blocks| !blocks.is_empty());
+    let Some(blocks) = blocks else {
+        return serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    };
+    blocks
+        .iter()
+        .map(
+            |block| match (block["type"].as_str(), block["text"].as_str()) {
+                (Some("text"), Some(text)) => text.to_string(),
+                _ => serde_json::to_string_pretty(block).unwrap_or_else(|_| block.to_string()),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Remove Toolport's provenance label from every `_meta` in a result, keeping
+/// the server's own `_meta` fields. React's `renderResult` does the same.
+fn strip_provenance(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(serde_json::Value::Object(meta)) = object.get_mut("_meta") {
+                meta.remove("app.toolport/provenance");
+                if meta.is_empty() {
+                    object.remove("_meta");
+                }
+            }
+            object.values_mut().for_each(strip_provenance);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_provenance),
+        _ => {}
+    }
+}
+
+fn show_output(page: &ServerToolsPanel, title: &str, mut value: serde_json::Value) {
+    strip_provenance(&mut value);
+    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+    show_text(page, title, text);
+}
+
+fn show_text(page: &ServerToolsPanel, title: &str, text: String) {
     let Some(parent) = page.app.active_window() else {
         return;
     };
@@ -1504,7 +1637,6 @@ fn show_output(page: &ServerToolsPanel, title: &str, value: serde_json::Value) {
         .default_height(560)
         .build();
     super::close_on_escape(&dialog);
-    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = adw::HeaderBar::new();
     let copy = l10n::button("Copy");
@@ -1529,6 +1661,10 @@ fn show_output(page: &ServerToolsPanel, title: &str, value: serde_json::Value) {
     output.set_cursor_visible(false);
     output.set_monospace(true);
     output.set_wrap_mode(gtk::WrapMode::WordChar);
+    output.set_left_margin(12);
+    output.set_right_margin(12);
+    output.set_top_margin(12);
+    output.set_bottom_margin(12);
     output.buffer().set_text(&text);
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -1544,6 +1680,47 @@ fn show_output(page: &ServerToolsPanel, title: &str, value: serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GTK shows a Run's result as React's `renderResult` does: the text the
+    /// tool returned, without Toolport's provenance metadata.
+    #[test]
+    fn a_run_result_shows_what_the_tool_returned() {
+        let meta =
+            serde_json::json!({"app.toolport/provenance": {"server": "s", "trust": "untrusted"}});
+        let result = serde_json::json!({
+            "_meta": meta,
+            "content": [
+                {"type": "text", "text": "hello", "_meta": meta},
+                {"type": "image", "data": "AAA", "mimeType": "image/png"},
+            ],
+            "isError": false,
+        });
+        let text = render_tool_result(&result);
+        assert!(text.starts_with("hello\n{"), "{text}");
+        assert!(!text.contains("provenance"), "{text}");
+        assert!(text.contains("image/png"), "{text}");
+        // No content: the whole result, as React shows it.
+        let empty = serde_json::json!({"content": [], "structuredContent": {"n": 1}});
+        assert!(render_tool_result(&empty).contains("structuredContent"));
+        // Provenance goes from every block and the fallback; the server's own
+        // `_meta` fields stay.
+        let labelled =
+            serde_json::json!({"app.toolport/provenance": {"trust": "untrusted"}, "own": 7});
+        let mixed = serde_json::json!({
+            "content": [
+                {"type": "image", "data": "AAA", "_meta": labelled},
+                {"type": "resource", "resource": {"uri": "a:b", "_meta": meta}},
+            ],
+        });
+        let text = render_tool_result(&mixed);
+        assert!(!text.contains("provenance"), "{text}");
+        assert!(text.contains("\"own\": 7"), "{text}");
+        assert!(!text.contains("\"_meta\": {}"), "{text}");
+        let fallback = serde_json::json!({"_meta": labelled, "content": []});
+        let text = render_tool_result(&fallback);
+        assert!(!text.contains("provenance"), "{text}");
+        assert!(text.contains("\"own\": 7"), "{text}");
+    }
 
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
@@ -1609,6 +1786,7 @@ mod tests {
                 &panel,
                 "B4 pending tool",
                 &serde_json::json!({"type": "object"}),
+                None,
                 move |_, _| {
                     did_start.store(true, Ordering::SeqCst);
                     gate.recv_timeout(std::time::Duration::from_secs(3))
@@ -1649,14 +1827,11 @@ mod tests {
             release.send(()).unwrap();
             wait_until(|| returned.load(Ordering::SeqCst));
             if dismissal == "success" {
-                wait_until(|| window("Tools result").is_some());
-                window("Tools result").unwrap().close();
+                wait_until(|| window("Result").is_some());
+                window("Result").unwrap().close();
             } else {
                 pump(std::time::Duration::from_millis(250));
-                assert!(
-                    window("Tools result").is_none(),
-                    "late result after {dismissal}"
-                );
+                assert!(window("Result").is_none(), "late result after {dismissal}");
             }
         }
         parent.close();
@@ -1752,6 +1927,65 @@ mod tests {
         );
     }
     #[test]
+    fn destructive_tools_are_the_ones_react_marks() {
+        use super::*;
+        let tool = |value: serde_json::Value| hints_destructive(&value);
+        assert!(tool(
+            serde_json::json!({"annotations": {"destructiveHint": true}})
+        ));
+        assert!(tool(serde_json::json!({"destructiveHint": true})));
+        assert!(!tool(
+            serde_json::json!({"annotations": {"destructiveHint": false}})
+        ));
+        assert!(!tool(
+            serde_json::json!({"annotations": {"readOnlyHint": true}})
+        ));
+    }
+
+    /// While the global switch hides a destructive tool, its switch's tooltip
+    /// says so whichever way it is set, as in React.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_tool_hidden_by_the_destructive_switch_says_so() {
+        use super::*;
+        adw::init().unwrap();
+        let _data = crate::registry::DataDirTestEnv::new("tool-blocked-tooltip");
+        crate::i18n::set_language("en").unwrap();
+        let app = adw::Application::builder()
+            .application_id("com.tsout.Toolport.BlockedToolTooltip")
+            .build();
+        app.register(gtk::gio::Cancellable::NONE).unwrap();
+        let panel = ServerToolsPanel::new(&app, "fixture");
+        let tooltip = |enabled: bool, blocked: bool| {
+            let row = tool_row(
+                serde_json::json!({"name":"remove", "toolportQuarantine":"clear", "annotations":{"destructiveHint":true}}),
+                enabled,
+                false,
+                None,
+                blocked,
+                panel.clone(),
+            );
+            let mut stack = vec![row.upcast::<gtk::Widget>()];
+            while let Some(widget) = stack.pop() {
+                if let Some(switch) = widget.downcast_ref::<gtk::Switch>() {
+                    return switch.tooltip_text().unwrap().to_string();
+                }
+                let mut child = widget.first_child();
+                while let Some(node) = child {
+                    child = node.next_sibling();
+                    stack.push(node);
+                }
+            }
+            panic!("no switch");
+        };
+        let blocked = "Destructive tools are hidden from clients by the global switch even when individually enabled.";
+        assert_eq!(tooltip(true, true), blocked);
+        assert_eq!(tooltip(false, true), blocked);
+        assert_eq!(tooltip(true, false), "Exposed to clients. Hide it.");
+        assert_eq!(tooltip(false, false), "Hidden from clients. Expose it.");
+    }
+
+    #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn b5_static_tool_badges_retranslate_live_without_touching_user_names() {
         use super::*;
@@ -1770,6 +2004,7 @@ mod tests {
                 true,
                 true,
                 None,
+                false,
                 panel.clone(),
             )
         };
@@ -1891,7 +2126,7 @@ mod tests {
         app.register(gtk::gio::Cancellable::NONE).unwrap();
         let panel = ServerToolsPanel::new(&app, "selected");
         let tool = serde_json::json!({"name":"read", "description":"Read a record", "toolportQuarantine":"clear"});
-        let row = tool_row(tool.clone(), true, false, None, panel.clone());
+        let row = tool_row(tool.clone(), true, false, None, false, panel.clone());
         fn find_switch(root: &gtk::Widget) -> Option<gtk::Switch> {
             if let Some(switch) = root.downcast_ref::<gtk::Switch>() {
                 return Some(switch.clone());
@@ -1924,7 +2159,7 @@ mod tests {
         let registry = crate::registry::load().unwrap();
         assert_eq!(registry.servers[0].disabled_tools, vec!["read"]);
         let failed_panel = ServerToolsPanel::new(&app, "missing");
-        let failed_row = tool_row(tool, true, false, None, failed_panel.clone());
+        let failed_row = tool_row(tool, true, false, None, false, failed_panel.clone());
         let failed_switch = find_switch(failed_row.upcast_ref()).unwrap();
         failed_switch.set_active(false);
         settle(&failed_switch);

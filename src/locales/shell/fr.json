@@ -34,7 +34,6 @@
   "Add MCP servers from the registry": "Ajouter des serveurs MCP depuis le registre",
   "Add server": "Ajouter un serveur",
   "Add server (⌘N)": "Ajouter un serveur (⌘N)",
-  "Add server (CtrlN)": "Ajouter un serveur (CtrlN)",
   "Agents search for the tools they need instead of loading the full list. This is the default for connections without saved client settings. Choose a different behavior in Clients.": "Les agents recherchent les outils dont ils ont besoin au lieu de charger la liste complète. Il s'agit de la valeur par défaut pour les connexions sans paramètres client enregistrés. Choisissez un comportement différent dans Clients.",
   "All enabled servers": "Tous les serveurs activés",
   "all tools": "tous les outils",
@@ -195,7 +194,7 @@
   "Registry recovered from backup": "Registre récupéré à partir d'une sauvegarde",
   "Reload": "Recharger",
   "Reload servers, clients, and health (⌘R)": "Recharger les serveurs, les clients et leur état (⌘R)",
-  "Reload servers, clients, and health (CtrlR)": "Recharger les serveurs, les clients et leur état (CtrlR)",
+  "Reload servers, clients, and health (Ctrl+R)": "Recharger les serveurs, les clients et leur état (Ctrl+R)",
   "Remove from all clients": "Supprimer de tous les clients",
   "Remove routing for {value1}": "Supprimer le routage pour {value1}",
   "Remove Toolport data": "Supprimer les données Toolport",
@@ -281,5 +280,8 @@
   "Keep English": "Garder l’anglais",
   "Skills and rules each agent loads, and where they live": "Les compétences et règles chargées par chaque agent et leur emplacement",
   "Back to servers": "Retour aux serveurs",
-  "Add a config folder for a client Toolport did not find on its own": "Ajouter un dossier de configuration pour un client que Toolport n’a pas détecté automatiquement"
+  "Add a config folder for a client Toolport did not find on its own": "Ajouter un dossier de configuration pour un client que Toolport n’a pas détecté automatiquement",
+  "Check servers again": "Vérifier à nouveau les serveurs",
+  "Connect a local command or a remote endpoint once; every client gets it.": "Connectez une commande locale ou un point de terminaison distant une seule fois ; chaque client en profite.",
+  "Per-server breakdown": "Détail par serveur"
 }

@@ -1,7 +1,10 @@
 name: CI
 
 on:
+  # Drafts run the Linux checks only (see ci-policy.mjs fullRun). Marking a PR
+  # ready for review starts the full run; so does every later push to it.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main, next/2.0]
   workflow_dispatch:
@@ -18,8 +21,14 @@ permissions:
 jobs:
   windows-installer:
     name: Windows NSIS bundle validation
-    needs: changes
-    if: needs.changes.outputs.installers == 'true'
+    # macOS and Windows runners are the scarce ones: start only after the cheap
+    # Linux gates pass, and never for a draft PR.
+    needs: [changes, frontend, clippy, rustfmt]
+    if: >-
+      ${{ !cancelled() && needs.changes.outputs.full == 'true' &&
+      needs.changes.outputs.installers == 'true' && needs.frontend.result == 'success' &&
+      (needs.changes.outputs.rust == 'false' ||
+      (needs.clippy.result == 'success' && needs.rustfmt.result == 'success')) }}
     runs-on: windows-latest
     timeout-minutes: 90
     # CI-only release-profile overrides reach both Tauri and prepare-sidecar.
@@ -74,8 +83,14 @@ jobs:
 
   macos-payload:
     name: macOS app payload validation
-    needs: changes
-    if: needs.changes.outputs.installers == 'true'
+    # macOS and Windows runners are the scarce ones: start only after the cheap
+    # Linux gates pass, and never for a draft PR.
+    needs: [changes, frontend, clippy, rustfmt]
+    if: >-
+      ${{ !cancelled() && needs.changes.outputs.full == 'true' &&
+      needs.changes.outputs.installers == 'true' && needs.frontend.result == 'success' &&
+      (needs.changes.outputs.rust == 'false' ||
+      (needs.clippy.result == 'success' && needs.rustfmt.result == 'success')) }}
     runs-on: macos-latest
     timeout-minutes: 90
     # CI-only release-profile overrides reach both Tauri and prepare-sidecar.
@@ -90,6 +105,14 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+      # Real Homebrew against packaging/homebrew/toolport.rb with a stub app:
+      # reinstall and upgrade must not touch clients, uninstall and zap must.
+      # Runs on the newest Homebrew each build, since the cask tells an upgrade
+      # from an uninstall by Homebrew's own call stack and command line.
+      - name: Homebrew cask lifecycle (reinstall, upgrade, uninstall, zap)
+        run: |
+          brew update --quiet
+          bash scripts/test-homebrew-cask-lifecycle.sh
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
@@ -106,17 +129,34 @@ jobs:
         run: npx tauri build --config src-tauri/tauri.bundle.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --bundles app -- --bin conduit
       - name: Check every app bundle file
         run: node .github/scripts/package-contents.mjs src-tauri/target/release/bundle/macos/*.app
+      # The release dmg builder, unsigned: Toolport.app beside an Applications
+      # shortcut over the drag-to-install background.
+      - name: Build the drag-to-install dmg
+        run: |
+          bash scripts/macos-build-dmg.sh src-tauri/target/release/bundle/macos/Toolport.app "$RUNNER_TEMP/Toolport.dmg"
+          mount="$(mktemp -d)"
+          hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$mount" "$RUNNER_TEMP/Toolport.dmg"
+          ls -la "$mount"
+          test -f "$mount/.background/background.tiff"
+          test -f "$mount/.DS_Store" || echo "::warning::Finder layout was not written; the dmg still has its Applications shortcut"
+          hdiutil detach "$mount" || { sleep 5; hdiutil detach "$mount" -force; }
+      # The same manifest check the release runs on the shipped dmg, so volume
+      # metadata or a stray file fails here instead of on a tag.
+      - name: Check every dmg file
+        run: node .github/scripts/package-contents.mjs "$RUNNER_TEMP/Toolport.dmg"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-payload
-          path: src-tauri/target/release/bundle/macos/*.app
+          path: |
+            src-tauri/target/release/bundle/macos/*.app
+            ${{ runner.temp }}/Toolport.dmg
           if-no-files-found: error
           retention-days: 7
 
   linux-appimage:
     name: Linux AppImage validation
     needs: changes
-    if: needs.changes.outputs.installers == 'true'
+    if: needs.changes.outputs.installers == 'true' && needs.changes.outputs.full == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     # Same CI-only overrides as the Windows and macOS installer jobs. The patch
@@ -138,7 +178,9 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - name: Install Linux build dependencies
-        run: scripts/ci-apt-install.sh libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev squashfs-tools
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev squashfs-tools
       - name: Give the runner headroom (the app crate links WebKitGTK)
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/share/swift 2>/dev/null || true
@@ -179,6 +221,8 @@ jobs:
       rust: ${{ steps.select.outputs.rust }}
       linux_packages: ${{ steps.select.outputs.linux_packages }}
       installers: ${{ steps.select.outputs.installers }}
+      full: ${{ steps.select.outputs.full }}
+      headless_matrix: ${{ steps.select.outputs.headless_matrix }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -188,13 +232,22 @@ jobs:
         with:
           node-version: 24
       - name: Test check selection and required gate
-        run: node --test .github/scripts/ci-policy.test.mjs .github/scripts/gateway-build-features.test.mjs
+        run: node --test .github/scripts/ci-policy.test.mjs .github/scripts/gateway-build-features.test.mjs .github/scripts/check-guard.test.mjs
+      - name: Test macOS acceptance helpers
+        run: |
+          python3 -B scripts/macos-acceptance/test_render_summary.py
+          python3 -B scripts/macos-acceptance/test_clients.py
+          python3 -B scripts/macos-acceptance/test_finder_targets.py
+          python3 -B scripts/macos-acceptance/test_windows_query.py
+          python3 -B scripts/macos-acceptance/test_layout_check.py
+          node --test scripts/macos-acceptance/mcp-call.test.mjs
       - name: Select changed native checks
         id: select
         env:
           CI_EVENT: ${{ github.event_name }}
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           CI_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          CI_DRAFT: ${{ github.event.pull_request.draft }}
         run: node .github/scripts/ci-policy.mjs select
 
   frontend:
@@ -278,7 +331,9 @@ jobs:
       # The native shell deliberately skips WebKit/Tauri. Ubuntu 24.04 provides
       # GTK >= 4.10 and libadwaita >= 1.4, the floor for adaptive navigation.
       - name: Install GTK build dependencies
-        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev libgtk-4-dev libadwaita-1-dev xvfb xauth dbus-daemon
+        uses: ./.github/actions/apt-install
+        with:
+          packages: build-essential libssl-dev pkg-config libdbus-1-dev libgtk-4-dev libadwaita-1-dev xvfb xauth dbus-daemon xdotool
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -295,20 +350,56 @@ jobs:
           cargo test --manifest-path src-tauri/Cargo.toml --no-default-features
           --features gtk-desktop --lib linux_native::
 
-      - name: Test Teams dialogs in isolated processes
+      - name: Test GTK dialogs and menus in isolated processes
         env:
           GSK_RENDERER: cairo
           GTK_A11Y: none
         run: |
+          # The credential reprobe test starts this mock; it looks for it in the
+          # Cargo target folder above its own test binary.
+          cargo build --manifest-path src-tauri/Cargo.toml --no-default-features \
+            --features gtk-desktop,test-support --bin mock-mcp-server
           for case in \
-            member_review_native_shows_diff_labels_and_both_decisions \
-            member_review_native_keeps_remaining_decisions_open \
-            share_preview_explains_each_selection_and_its_route \
-            share_preview_widgets_show_allowlisted_definitions
+            catalog::tests::escape_closes_the_suggestions_and_then_clears_the_search \
+            teams::tests::member_review_native_shows_diff_labels_and_both_decisions \
+            teams::tests::member_review_native_keeps_remaining_decisions_open \
+            teams::tests::share_preview_explains_each_selection_and_its_route \
+            tests::editor_validation_clears_feedback_and_keeps_test_result_outside_scroll \
+            tests::a_refused_paste_leaves_the_form_and_shows_only_the_refusal \
+            tests::closed_server_editors_are_freed \
+            teams::tests::share_preview_widgets_show_allowlisted_definitions \
+            quiet_tooltips::tests::a_guarded_menu_silences_tooltips_before_it_is_presented \
+            quiet_tooltips::tests::dropdowns_split_buttons_and_popovers_silence_tooltips_while_open \
+            tests::pasted_rows_are_freed_when_the_dialog_closes \
+            tests::pasted_arguments_survive_the_gtk_box \
+            tests::server_rows_keep_their_name_and_status_text_in_a_narrow_window \
+            tests::server_status_chips_keep_whole_words_on_one_line_in_narrow_windows \
+            settings::tests::endpoint_action_style_tracks_status_and_live_language \
+            tests::client_access_menu_stays_on_one_line_in_every_language \
+            tests::a_connected_row_with_a_migration_fits_a_narrow_window_in_every_language \
+            tests::pasted_rows_offer_the_react_choices \
+            credential_dialog_tests::credentials_dialog_waits_for_values_and_stays_open_after_each_write \
+            credential_dialog_tests::authentication_dialog_confirms_removals_and_keeps_focus_and_caption \
+            credential_dialog_tests::a_locked_keyring_asks_once_per_click_and_unknown_is_not_absent \
+            credential_dialog_tests::a_reference_saved_from_add_updates_a_launch_input_row \
+            credential_dialog_tests::remove_client_credentials_shows_when_the_secret_is_unknown \
+            tests::connect_shows_reacts_restart_reminder \
+            details::tests::b5_credential_save_reprobes_unchanged_detail_without_refresh \
+            setup::tests::review_list_caps_at_parent_height_and_keeps_footer_visible \
+            setup::tests::import_review_shows_saved_names_and_marks_unsupported_for_review \
+            setup::tests::review_rows_show_markup_characters_as_text \
+            setup_import_share_tests::import_selection_count_tracks_zero_one_and_many \
+            setup_import_share_tests::setup_import_review_names_checks_follows_toggles_and_clears_progress \
+            setup_import_share_tests::client_import_review_clears_the_scan_line \
+            setup_import_share_tests::paste_import_starts_in_the_editor_and_needs_text \
+            setup_import_share_tests::share_actions_stay_pinned_and_need_a_server \
+            setup_import_share_tests::setup_file_dialogs_start_in_downloads_and_list_setups_first \
+            setup::tests::successful_review_shows_restart_and_only_done \
+            setup::tests::a_review_closed_while_connecting_only_refreshes
           do
             xvfb-run -a dbus-run-session -- cargo test \
               --manifest-path src-tauri/Cargo.toml --no-default-features \
-              --features gtk-desktop --lib "linux_native::teams::tests::$case" \
+              --features gtk-desktop --lib "linux_native::$case" \
               -- --exact --ignored
           done
 
@@ -377,7 +468,9 @@ jobs:
 
       # Each shell is linted with its test fixtures and all targets.
       - name: Install Linux build dependencies
-        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev ${{ matrix.packages }}
+        uses: ./.github/actions/apt-install
+        with:
+          packages: build-essential libssl-dev pkg-config libdbus-1-dev ${{ matrix.packages }}
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -426,7 +519,9 @@ jobs:
       - name: Install Linux build dependencies
         # Same set as the release workflow: WebKitGTK + the Secret Service
         # (libdbus) deps the Tauri lib needs to compile on Linux.
-        run: scripts/ci-apt-install.sh libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev dbus-daemon
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev dbus-daemon
 
       - name: Give the runner headroom (a cold build links WebKitGTK)
         run: |
@@ -478,7 +573,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Install Linux build dependencies
-        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: build-essential libssl-dev pkg-config libdbus-1-dev
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -496,26 +593,30 @@ jobs:
           done
 
   cross-platform-rust:
-    needs: changes
+    # Waits for the cheap Linux gates so a push that fails them never takes a
+    # macOS or Windows runner. The matrix comes from ci-policy.mjs headlessMatrix:
+    # drafts get the two Linux entries only.
+    needs: [changes, frontend, clippy, rustfmt]
     if: needs.changes.outputs.rust == 'true'
     name: Headless Rust tests (${{ matrix.os }}, ${{ matrix.group }})
-    # 30 minutes covered macOS runs of 27:11 (626c17d6) and 27:25 (644a8199),
-    # but a35863c7 hit the cap at 30:10 as test compilation rose to 4:58.
-    # The test-only idle timer saves about five minutes, leaving about 25 minutes
-    # on that slower runner. Keep cold compilation margin on all three OSes.
-    timeout-minutes: 35
+    # Hang backstops, not targets. Linux and Windows run core and integration
+    # as separate jobs; 35 minutes keeps cold compilation margin for each.
+    # macOS runs both groups in one job to need one runner and one compile of
+    # the shared library. Over 25 recent green runs the split macOS jobs took
+    # 6 to 14 minutes (core) and 9 to 23 (integration), summing to 20 to 35
+    # (median 24) including two setups. Dropping one setup and one compile of
+    # the shared library, the combined job should take about 22, and about 32
+    # on the slowest run seen (integration compile 7.8 minutes). Before
+    # nextest, the single macOS job ran 27 minutes and once hit 30:10 (a35863c7).
+    # 45 keeps that cold-compile margin on the one job doing both groups.
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && 45 || 35 }}
     env:
       TOOLPORT_TEST_FAILURE_LOG_DIR: ${{ github.workspace }}/.verify/one-gateway-failures
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-latest, windows-latest]
-        group: [core, integration]
-        include:
-          - group: core
-            targets: --lib --bins
-          - group: integration
-            targets: --test '*'
+        # Groups: core is --lib --bins, integration is --test '*', all is both.
+        include: ${{ fromJSON(needs.changes.outputs.headless_matrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -525,9 +626,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: matrix.os != 'ubuntu-22.04'
         with:
           node-version: 24
+
+      # The signature tests compile their output with the repository's tsc and
+      # fail in CI when it is missing.
+      - name: Install frontend dependencies for the signature compile checks
+        if: matrix.group != 'integration'
+        run: npm ci
 
       # BGE uses Candle CPU on all release targets. No ONNX Runtime shared
       # library or execution-provider package is needed for search-static.
@@ -535,7 +641,9 @@ jobs:
       # needs libdbus headers and pkg-config at compile time.
       - name: Install Linux build dependencies
         if: matrix.os == 'ubuntu-22.04'
-        run: scripts/ci-apt-install.sh build-essential libssl-dev pkg-config libdbus-1-dev
+        uses: ./.github/actions/apt-install
+        with:
+          packages: build-essential libssl-dev pkg-config libdbus-1-dev
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
@@ -548,8 +656,8 @@ jobs:
           workspaces: src-tauri
           key: ci-headless
           cache-bin: "false"
-          # Only one group saves the shared dependency cache, after desktop checks.
-          save-if: ${{ matrix.group == 'integration' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next/2.0') }}
+          # Only one group per OS saves the shared dependency cache, after desktop checks.
+          save-if: ${{ matrix.group != 'core' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next/2.0') }}
       - name: Compile Rust tests and record build timings
         if: matrix.os != 'windows-latest'
         run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features test-support,search-static ${{ matrix.targets }} --no-run --timings
@@ -569,12 +677,20 @@ jobs:
         run: powershell -ExecutionPolicy Bypass -File scripts/test-rust-windows.ps1 -NoDefaultFeatures -TestGroup ${{ matrix.group }} -Nextest
 
       - name: Build headless gateway for cross-platform smoke
-        if: matrix.os != 'ubuntu-22.04' && matrix.group == 'integration'
+        if: matrix.os != 'ubuntu-22.04' && matrix.group != 'core'
         run: cargo build --manifest-path src-tauri/Cargo.toml --bin toolport-gateway --bin mock-mcp-server --no-default-features --features test-support,search-static
 
       - name: Headless gateway security smoke (macOS)
-        if: matrix.os == 'macos-latest' && matrix.group == 'integration'
+        if: matrix.os == 'macos-latest' && matrix.group != 'core'
         run: node scripts/smoke-headless.mjs
+
+      # Report only: what starting the daemon on demand costs the first call.
+      - name: First tool call with and without a running daemon (macOS, debug build)
+        if: matrix.os == 'macos-latest' && matrix.group != 'core'
+        continue-on-error: true
+        env:
+          TOOLPORT_BENCH_PROFILE: debug
+        run: node benchmark/cold-start.mjs 20
 
       - name: Headless gateway security smoke (Windows)
         if: matrix.os == 'windows-latest' && matrix.group == 'integration'
@@ -582,16 +698,17 @@ jobs:
 
       # Approval OS toasts use desktop-only APIs. Headless checks cannot compile
       # the Windows/macOS notification branches.
+      # macOS (group all) already installed them for the signature checks.
       - name: Install frontend dependencies for desktop approval checks
-        if: matrix.os != 'ubuntu-22.04' && matrix.group == 'integration'
+        if: matrix.os == 'windows-latest' && matrix.group == 'integration'
         run: npm ci
 
       - name: Build frontend assets for desktop approval checks
-        if: matrix.os != 'ubuntu-22.04' && matrix.group == 'integration'
+        if: matrix.os != 'ubuntu-22.04' && matrix.group != 'core'
         run: npm run build
 
       - name: Compile desktop approval notifications (Windows and macOS)
-        if: matrix.os != 'ubuntu-22.04' && matrix.group == 'integration'
+        if: matrix.os != 'ubuntu-22.04' && matrix.group != 'core'
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --lib
 
       # scripts/install.ps1 is piped into `iex` from a pinned commit, so a
@@ -623,6 +740,14 @@ jobs:
 
   installer-script:
     name: Installer script tests
+    needs: [changes, frontend, clippy, rustfmt]
+    # A Windows runner: same rule as the bundle validations above, minus the
+    # installer selection (this job always ran).
+    if: >-
+      ${{ !cancelled() && needs.changes.outputs.full == 'true' &&
+      needs.frontend.result == 'success' &&
+      (needs.changes.outputs.rust == 'false' ||
+      (needs.clippy.result == 'success' && needs.rustfmt.result == 'success')) }}
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -712,7 +837,10 @@ jobs:
   # install.ps1 Pester job could not block merge. This job keeps the required
   # name and requires all selected checks. Only unchanged native jobs on a
   # frontend-only PR may skip; failures, cancellations and unexpected skips
-  # block the gate. Clippy and changed-line Rust formatting are also required. Adding job names as
+  # block the gate. Clippy and changed-line Rust formatting are also required.
+  # A draft PR skips the macOS, Windows and installer jobs, so its gate always
+  # fails with a message saying so: a skipped or green gate would satisfy branch
+  # protection on that SHA until the ready-for-review run replaced it. Adding job names as
   # separate required contexts still needs a GitHub settings click; this file
   # cannot do that.
   merge-gate:

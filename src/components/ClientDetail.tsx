@@ -1,5 +1,5 @@
 import { msg, Trans, translate, useI18n, type SourceMessage } from "@/lib/i18n";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
   Check,
@@ -11,17 +11,16 @@ import {
   Puzzle,
   RefreshCw,
   TriangleAlert,
-  X,
 } from "lucide-react";
-import { toast } from "sonner";
-import { toastError } from "@/lib/toast";
 import {
   importServers,
   previewImportServers,
   installGateway,
+  previewGatewaySettings,
   setClientDiscovery,
   uninstallGateway,
   removeClientLocation,
+  listClientRecoveries,
 } from "@/lib/api";
 import {
   importableServers,
@@ -34,7 +33,8 @@ import {
   type Registry,
 } from "@/lib/types";
 import { Button } from "@/components/ui/button";
-import { ErrorCallout } from "@/components/ui/status-card";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { ErrorCallout, StatusCard } from "@/components/ui/status-card";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 
@@ -47,9 +47,20 @@ import {
 } from "@/components/ui/select";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ConnectReviewDialog } from "@/components/ConnectReviewDialog";
-import { ImportReviewDialog } from "@/components/ImportReviewDialog";
+import { GatewaySettingsNotice } from "@/components/GatewaySettingsNotice";
+import { DisclosureSummary, ImportReviewDialog } from "@/components/ImportReviewDialog";
 import { clientRestartHint, clientRestartHintAfterRemoval } from "@/lib/clientConnect";
+import { ClientRecoveryBanners } from "@/components/ClientRecoveryBanners";
 import { clientDiscovery } from "@/lib/clientDiscovery";
+import {
+  clearListNotice,
+  dismissClientNotice,
+  noticeFor,
+  releaseDetailNotice,
+  setConnectNotice,
+  setDetailNotice,
+  useClientNotices,
+} from "@/lib/clientNotice";
 
 interface Props {
   client: DetectedClient;
@@ -69,14 +80,51 @@ const DISCOVERY_HINT: Record<string, SourceMessage> = {
 
 export function ClientDetail({ client, registry, onChanged, onRegistryChange }: Props) {
   const { t } = useI18n();
+  const keptReasonId = useId();
+  const keptReason = t(
+    "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.",
+  );
   const [busy, setBusy] = useState(false);
+  // Bumped after Disconnect so the recovery card it may leave shows at once,
+  // as in GTK, without waiting for a rescan.
+  const [recoveryEpoch, setRecoveryEpoch] = useState(0);
+  const recoveryKey = useMemo(() => ({ client, recoveryEpoch }), [client, recoveryEpoch]);
   // Snapshotted at dialog-open time so a registry-changed event mid-review can't
   // reshuffle `toImport` out from under the indices the user already confirmed.
   const [bulkImportServers, setBulkImportServers] = useState<ImportItem[] | null>(null);
+  // A refused import shows in the review that is still open, not behind it.
+  const [bulkImportError, setBulkImportError] = useState<string>();
   // Empty uses the default access; named access sets narrow enabled servers.
   const [profile, setProfile] = useState("");
   const [migrateOpen, setMigrateOpen] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
+  // Each opening of the reset confirmation reads the settings it would add, so the
+  // confirmation lists them as the connect review does.
+  const [resetRequest, setResetRequest] = useState(0);
+  const [resetSettings, setResetSettings] = useState<{
+    request: number;
+    lines: string[];
+  } | null>(null);
+  const resetSettingsReady = resetSettings?.request === resetRequest;
+  function changeResetOpen(open: boolean) {
+    if (open && !resetOpen) setResetRequest((request) => request + 1);
+    setResetOpen(open);
+  }
+  useEffect(() => {
+    if (!resetRequest) return;
+    let active = true;
+    previewGatewaySettings(client.id)
+      .then((lines) => {
+        if (active) setResetSettings({ request: resetRequest, lines });
+      })
+      .catch(() => {
+        // Never block the reset on the list; the reset itself reports errors.
+        if (active) setResetSettings({ request: resetRequest, lines: [] });
+      });
+    return () => {
+      active = false;
+    };
+  }, [resetRequest, client.id]);
   const installed = client.gatewayInstalled;
   const customized = client.entryState === "customized";
   const legacyBearer = client.servers.some(hasLegacyBearerArgv);
@@ -104,28 +152,52 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   // Keyed by client id rather than cleared in an effect: selecting another client must
   // not carry the previous one's advice across, and deriving that from the key avoids a
   // cascading-render setState-in-effect.
-  const [restartNotice, setRestartNotice] = useState<{
+  // The notice lives in a small store: the connect reminder also shows on the Clients
+  // list, and dismissing it in either place clears both (as GTK does).
+  const showRestartNotice = noticeFor(useClientNotices(), client.id);
+  const setRestartNotice = setDetailNotice;
+  // Feedback that arrives after this page closed is dropped: it would replace another
+  // client's notice, or this client's list reminder, in the shared store.
+  const pageOpen = useRef(true);
+  useEffect(() => {
+    pageOpen.current = true;
+    return () => {
+      pageOpen.current = false;
+      releaseDetailNotice();
+    };
+  }, []);
+  const [actionError, setActionError] = useState<{
     clientId: string;
-    title: string;
     text: string;
   } | null>(null);
-  const showRestartNotice = restartNotice?.clientId === client.id ? restartNotice : null;
+  const shownActionError = actionError?.clientId === client.id ? actionError.text : null;
 
   /** `applied` = Toolport was written into the config; `removed` = taken out of it.
    *
    * Both need a restart, for opposite reasons, and the connect wording ("so it loads
    * Toolport") reads as a failed disconnect on the removal path. */
-  function noteRestartNeeded(kind: "applied" | "removed") {
-    setRestartNotice({
+  function showFeedback(title: string, text = "") {
+    if (!pageOpen.current) return;
+    setRestartNotice({ clientId: client.id, title, text });
+  }
+
+  function noteRestartNeeded(
+    kind: "applied" | "removed",
+    warnings: string[] = [],
+    connected = false,
+  ) {
+    (connected ? setConnectNotice : setRestartNotice)({
       clientId: client.id,
       title:
         kind === "applied"
           ? translate("Not live yet")
           : translate("Still connected until restart"),
-      text:
+      text: [
         kind === "applied"
           ? clientRestartHint(client.name)
           : clientRestartHintAfterRemoval(client.name),
+        ...warnings,
+      ].join(" "),
     });
   }
 
@@ -143,7 +215,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     try {
       const next = await setClientDiscovery(client.id, mode || null);
       onRegistryChange(next);
-      toast.success(
+      showFeedback(
         mode
           ? translate('{value0} discovery set to "{value1}".', {
               value0: client.name,
@@ -152,7 +224,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           : translate("{value0} now uses Auto discovery.", { value0: client.name }),
       );
     } catch (e) {
-      toastError(`${e}`);
+      showFeedback(String(e));
     } finally {
       setBusy(false);
     }
@@ -182,10 +254,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         registry?.defaultAccessProfileId ||
         (registry?.defaultAccessLegacyPolicy ? registry.defaultAccessContextId : null);
       const name = profiles.find((p) => p.id === defaultId)?.name;
-      // A set that is itself named "Default" would read "Default access (Default)".
+      // A set that is itself named "Default" would read "Default access (Default)",
+      // and plain "Default access" next to it reads as the same choice.
       return name && name.trim().toLowerCase() !== "default"
         ? translate("Default access ({name})", { name })
-        : translate("Default access");
+        : translate("Default access (from Settings)");
     }
     return scopeRef === "@all-enabled"
       ? translate("All enabled servers")
@@ -198,7 +271,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   async function applyScope() {
     if (customized) {
       // Must not silently overwrite a hand-edited entry (SOU-406).
-      setResetOpen(true);
+      changeResetOpen(true);
       return;
     }
     setBusy(true);
@@ -206,23 +279,18 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       const outcome = await installGateway(client.id, profile || undefined, false);
       // Rescope rewrites the client's MCP config the same way Connect does; without a
       // restart hint the change is invisible until the next cold start (SOU-317).
-      toast.success(
+      noteRestartNeeded("applied", [
         profile
           ? translate('{value0} access set to "{value1}".', {
               value0: client.name,
               value1: accessLabel(profile),
             })
           : translate("{value0} now uses the default access.", { value0: client.name }),
-        {
-          description: [clientRestartHint(client.name), ...(outcome.warnings ?? [])].join(
-            " ",
-          ),
-        },
-      );
-      noteRestartNeeded("applied");
+        ...(outcome.warnings ?? []),
+      ]);
       onChanged();
     } catch (e) {
-      toastError(`${e}`);
+      showFeedback(String(e));
     } finally {
       setBusy(false);
     }
@@ -233,23 +301,18 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     setBusy(true);
     try {
       const outcome = await installGateway(client.id, profile || undefined, true);
-      toast.success(
+      noteRestartNeeded("applied", [
         legacyBearer
           ? translate("Migrated {value0} to stdio", { value0: client.name })
           : translate("Reset {value0} to the default Toolport gateway", {
               value0: client.name,
             }),
-        {
-          description: [clientRestartHint(client.name), ...(outcome.warnings ?? [])].join(
-            " ",
-          ),
-        },
-      );
-      noteRestartNeeded("applied");
+        ...(outcome.warnings ?? []),
+      ]);
       setResetOpen(false);
       onChanged();
     } catch (e) {
-      toastError(`${e}`);
+      showFeedback(String(e));
       // Rethrow so ConfirmDialog stays open for retry (SOU-406 / CodeRabbit).
       throw e;
     } finally {
@@ -261,9 +324,19 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
 
   const movable = client.servers.filter((s) => !isGatewayDetected(s));
   const importedNames = new Set(
-    (registry?.servers ?? []).map((s) => s.name.toLowerCase()),
+    client.managedServerNames ??
+      (registry?.servers ?? []).map((s) => s.name.toLowerCase()),
   );
-  const pluginNames = new Set(client.pluginServers.map((s) => s.name.toLowerCase()));
+  // Import candidates can carry a saved name (`github (2)`), so a plugin is
+  // recognized by its connection, as the GTK shell does.
+  const sameConnection = (a: McpServer, b: McpServer) =>
+    a.transport === b.transport &&
+    a.command === b.command &&
+    a.url === b.url &&
+    JSON.stringify(a.args) === JSON.stringify(b.args);
+  const isPluginServer = (server: McpServer) =>
+    !client.servers.some((s) => sameConnection(s, server)) &&
+    client.pluginServers.some((s) => sameConnection(s, server));
 
   // Every client-side server worth showing, deduped by name, minus Toolport's
   // own gateway entry. These exist here only as import candidates.
@@ -272,29 +345,58 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     if (isGatewayDetected(s)) continue;
     if (!byName.has(s.name.toLowerCase())) byName.set(s.name.toLowerCase(), s);
   }
-  const allServers = [...byName.values()];
   const toImport = importableServers(client, registry);
+  // Only review can check these: listed, never imported blind or called in Toolport.
+  const unconfirmed = client.unconfirmedServers ?? [];
+  // What Import would add, what review must check, then what is already in Toolport.
+  const allServers = client.importableServers
+    ? [
+        ...toImport,
+        ...unconfirmed,
+        ...[...byName.values()].filter((s) => importedNames.has(s.name.toLowerCase())),
+      ]
+    : [...byName.values()];
   const bulkImportPreview = bulkImportServers;
 
   async function reviewServers(servers: McpServer[]) {
     try {
       const preview = await previewImportServers(client.id);
-      const items = servers.map((server) =>
-        preview.find(
-          (item) =>
-            item.name === server.name &&
-            item.command === server.command &&
-            item.url === server.url &&
-            JSON.stringify(item.args) === JSON.stringify(server.args),
-        ),
+      const items = servers.map((server) => {
+        // By the backend's connection id: the saved name can differ between the list
+        // and the review, and two servers whose secrets differ can look alike here.
+        const connection = unconfirmed.includes(server)
+          ? client.unconfirmedKeys?.[unconfirmed.indexOf(server)]
+          : client.importableKeys?.[toImport.indexOf(server)];
+        return preview.find((item) =>
+          connection
+            ? item.connection === connection
+            : item.name === server.name &&
+              item.command === server.command &&
+              item.url === server.url &&
+              JSON.stringify(item.args) === JSON.stringify(server.args),
+        );
+      });
+      // Review lists only what Import would change; an unconfirmed server it leaves
+      // out is already in Toolport.
+      const inToolport = servers.filter(
+        (server, index) => !items[index] && unconfirmed.includes(server),
       );
+      if (inToolport.length && inToolport.length === servers.length) {
+        showFeedback(
+          translate("{value0} is already in Toolport.", {
+            value0: inToolport.map((server) => server.name).join(", "),
+          }),
+        );
+        return;
+      }
       if (items.some((item) => !item?.key))
         throw new Error(
           translate("Server changed. Refresh the client and review again."),
         );
+      setBulkImportError(undefined);
       setBulkImportServers(items as ImportItem[]);
     } catch (error) {
-      toastError(String(error));
+      showFeedback(String(error));
     }
   }
 
@@ -315,12 +417,14 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           ? await importServers(selected, choices)
           : await importServers(selected);
       onRegistryChange(next);
-      toast.success(
+      showFeedback(
         translate("Imported selected servers. Check their status under Servers."),
       );
       setBulkImportServers(null);
+      // Detection decides what is in Toolport now; scan again.
+      onChanged();
     } catch (error) {
-      toastError(String(error));
+      setBulkImportError(String(error));
     } finally {
       setBusy(false);
     }
@@ -328,40 +432,75 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
 
   async function toggleInstall() {
     setBusy(true);
+    setActionError(null);
     try {
       if (installed) {
-        const outcome = await uninstallGateway(client.id);
+        let outcome: Awaited<ReturnType<typeof uninstallGateway>>;
+        try {
+          outcome = await uninstallGateway(client.id);
+        } catch (refused) {
+          // Same inline error line and wording as the GTK shell.
+          setActionError({
+            clientId: client.id,
+            text: `${client.name}: ${String(refused)}`,
+          });
+          return;
+        }
+        // The disconnect already committed, even if loading notices later fails.
+        clearListNotice(client.id);
+        onChanged();
+        setRecoveryEpoch((value) => value + 1);
         const restored = outcome.restored?.length ?? 0;
-        toast.success(
-          restored > 0
-            ? translate(
-                restored === 1
-                  ? msg("Disconnected Toolport from {client} and put back {count} server")
-                  : msg(
-                      "Disconnected Toolport from {client} and put back {count} servers",
-                    ),
-                { client: client.name, count: restored },
-              )
-            : translate("Disconnected Toolport from {value0}", { value0: client.name }),
-          {
-            description: [
-              clientRestartHintAfterRemoval(client.name),
-              ...(outcome.warnings ?? []),
-            ].join(" "),
-          },
+        // Recovery owns its own persistent notice. Do not also announce it in
+        // an ordinary success notice or in a transient toast, but keep any
+        // other warning, such as a keychain token that could not be removed.
+        const pending = (await listClientRecoveries()).filter(
+          (row) => row.clientId === client.id,
         );
-        noteRestartNeeded("removed");
+        const warnings = (outcome.warnings ?? []).filter(
+          (warning) => !pending.some((row) => warning.startsWith(row.message)),
+        );
+        if (pending.length && !warnings.length) {
+          setRestartNotice(null);
+        } else {
+          noteRestartNeeded("removed", [
+            restored > 0
+              ? translate(
+                  restored === 1
+                    ? msg(
+                        "Disconnected Toolport from {client} and put back {count} server.",
+                      )
+                    : msg(
+                        "Disconnected Toolport from {client} and put back {count} servers.",
+                      ),
+                  { client: client.name, count: restored },
+                )
+              : translate("Disconnected Toolport from {value0}.", {
+                  value0: client.name,
+                }),
+            ...warnings,
+          ]);
+        }
       }
-      onChanged();
+      if (!installed) onChanged();
     } catch (e) {
-      toastError(`${e}`);
+      showFeedback(String(e));
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <div className="flex flex-col gap-5">
+    <div className="flex min-w-0 flex-col gap-5">
+      <ClientRecoveryBanners
+        clientId={client.id}
+        refreshKey={recoveryKey}
+        onRecovered={() => {
+          // The recovery that blocked Disconnect changed: its error is stale.
+          setActionError(null);
+          onChanged();
+        }}
+      />
       {/* Connection: the one thing that actually matters in a client. */}
       {/* The title keeps at least 240px; when the actions don't fit beside it they wrap below. */}
       <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
@@ -441,6 +580,34 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           )}
         </div>
         <div className="flex max-w-full flex-wrap items-center gap-2">
+          {client.locationKeptByT3Code && !client.locationRemovable && (
+            <>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span
+                    // A disabled button gets no pointer or focus events, so the wrapper
+                    // shows why, to keyboard users too.
+                    // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
+                    tabIndex={0}
+                    className="inline-flex rounded-md focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+                  >
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled
+                      aria-describedby={keptReasonId}
+                    >
+                      {translate("Remove location")}
+                    </Button>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-64">{keptReason}</TooltipContent>
+              </Tooltip>
+              <span id={keptReasonId} className="sr-only">
+                {keptReason}
+              </span>
+            </>
+          )}
           {client.locationRemovable && (
             <ConfirmDialog
               trigger={
@@ -503,7 +670,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           {(customized || legacyBearer) && (
             <ConfirmDialog
               open={resetOpen}
-              onOpenChange={setResetOpen}
+              onOpenChange={changeResetOpen}
               trigger={
                 <Button size="sm" variant="default" disabled={busy || !!client.error}>
                   <Check className="size-4" />
@@ -520,14 +687,27 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                     })
               }
               description={
-                legacyBearer
-                  ? translate(
-                      "Toolport backs up the config before replacing the older HTTP connection with its standard stdio command. Other MCP servers stay in place. Any customized Toolport command, arguments and headers will be replaced; review those changes before confirming. Restart the client afterward.",
-                    )
-                  : translate(
-                      "This overwrites the hand-edited toolport entry with the standard stdio gateway command. Your other MCP servers are left alone.",
-                    )
+                <>
+                  <p>
+                    {legacyBearer
+                      ? translate(
+                          "Toolport backs up the config before replacing the older HTTP connection with its standard stdio command. Other MCP servers stay in place. Any customized Toolport command, arguments and headers will be replaced; review those changes before confirming. Restart the client afterward.",
+                        )
+                      : translate(
+                          "This overwrites the hand-edited toolport entry with the standard stdio gateway command. Your other MCP servers are left alone.",
+                        )}
+                  </p>
+                  {resetSettingsReady && (
+                    <div className="mt-3 text-popover-foreground">
+                      <GatewaySettingsNotice
+                        clientName={client.name}
+                        lines={resetSettings.lines}
+                      />
+                    </div>
+                  )}
+                </>
               }
+              confirmDisabled={!resetSettingsReady}
               confirmLabel={
                 legacyBearer
                   ? translate(msg("Migrate to stdio"))
@@ -539,7 +719,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           {installed ? (
             <ConfirmDialog
               trigger={
-                <Button size="sm" variant="outline" disabled={busy || !!client.error}>
+                <Button size="sm" variant="destructive" disabled={busy || !!client.error}>
                   <Trans
                     message={msg("{value1}Disconnect")}
                     values={{ value1: <Plug className="size-4" /> }}
@@ -584,30 +764,39 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         />
       )}
 
-      {showRestartNotice && (
-        <div
-          role="status"
-          className="flex items-start gap-2 toolport-alert border-info bg-info/8 px-3 py-2 text-sm text-info"
+      {shownActionError && (
+        <p
+          role="alert"
+          className="select-text break-words toolport-alert border-destructive bg-destructive/8 px-3 py-2 text-sm text-destructive"
         >
-          <RefreshCw className="mt-0.5 size-4 shrink-0" />
-          <div className="min-w-0 flex-1">
-            <p className="font-semibold">{showRestartNotice.title}</p>
-            <p className="mt-0.5 break-words text-meta">{showRestartNotice.text}</p>
-          </div>
-          <button
-            type="button"
-            onClick={() => setRestartNotice(null)}
-            aria-label={t("Dismiss restart reminder")}
-            className="rounded p-0.5 text-info transition-colors hover:bg-info/10 hover:text-info focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-info"
-          >
-            <X className="size-3.5" />
-          </button>
-        </div>
+          {shownActionError}
+        </p>
+      )}
+
+      {showRestartNotice && (
+        <StatusCard
+          role="status"
+          variant="info"
+          className="select-text"
+          icon={<RefreshCw />}
+          title={showRestartNotice.title}
+          detail={showRestartNotice.text}
+          actions={
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => dismissClientNotice(showRestartNotice)}
+            >
+              {t("Dismiss")}
+            </Button>
+          }
+        />
       )}
 
       {!customized && (
-        <div className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
-          <div className="min-w-0">
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
+          <div className="min-w-[min(15rem,100%)] flex-1">
             <div className="text-meta font-medium text-foreground">
               {translate("Discovery mode")}
               {!clientMode && (
@@ -627,7 +816,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             <SelectTrigger
               size="sm"
               aria-label={translate("Discovery mode")}
-              className="w-44 shrink-0"
+              className="w-auto max-w-full"
               disabled={busy || !!client.error}
             >
               <SelectValue />
@@ -771,9 +960,9 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             </div>
           </div>
           <details className="mb-2">
-            <summary className="cursor-pointer text-meta font-medium text-muted-foreground hover:text-foreground">
+            <DisclosureSummary className="text-meta font-medium text-muted-foreground hover:text-foreground">
               {t("How importing works")}
-            </summary>
+            </DisclosureSummary>
             <ul className="mt-1.5 mb-1 space-y-0.5 text-meta text-muted-foreground">
               <li>
                 <Trans
@@ -823,12 +1012,17 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           )}
 
           <div className="grid gap-2 sm:grid-cols-2">
-            {allServers.map((server) => (
+            {allServers.map((server, index) => (
               <ServerMiniCard
-                key={server.name}
+                key={`${index}-${server.name}`}
                 server={server}
-                isPlugin={pluginNames.has(server.name.toLowerCase())}
-                imported={importedNames.has(server.name.toLowerCase())}
+                isPlugin={isPluginServer(server)}
+                imported={
+                  client.importableServers
+                    ? index >= toImport.length + unconfirmed.length
+                    : importedNames.has(server.name.toLowerCase())
+                }
+                unconfirmed={unconfirmed.includes(server)}
                 busy={busy || !!client.error}
                 // Same review dialog as "Import all": a per-row import must show the
                 // same shell/private-host warnings before anything is added.
@@ -837,7 +1031,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             ))}
           </div>
 
-          {toImport.length === 0 && (
+          {toImport.length === 0 && unconfirmed.length === 0 && (
             <p className="mt-3 inline-flex items-center gap-1.5 text-meta text-success">
               <Trans
                 message={msg(
@@ -870,7 +1064,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           onClose={() => setMigrateOpen(false)}
           onConnected={(next) => {
             onRegistryChange(next);
-            noteRestartNeeded("applied");
+            noteRestartNeeded("applied", [], true);
             onChanged();
           }}
         />
@@ -879,6 +1073,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         open={bulkImportPreview !== null}
         items={bulkImportPreview ?? []}
         busy={busy}
+        error={bulkImportError}
         title={t("Review {value1} servers", { value1: client.name })}
         onOpenChange={(open) => {
           if (!open && !busy) setBulkImportServers(null);
@@ -956,12 +1151,14 @@ function ServerMiniCard({
   server,
   isPlugin,
   imported,
+  unconfirmed,
   busy,
   onImport,
 }: {
   server: McpServer;
   isPlugin: boolean;
   imported: boolean;
+  unconfirmed: boolean;
   busy: boolean;
   onImport: () => void;
 }) {
@@ -984,6 +1181,11 @@ function ServerMiniCard({
             ? [server.command, ...server.args].join(" ")
             : (server.url ?? "")}
         </code>
+        {unconfirmed && (
+          <p className="text-meta text-muted-foreground">
+            {t("Open the review to check whether this is already in Toolport.")}
+          </p>
+        )}
         <div className="flex justify-end">
           {imported ? (
             <span className="inline-flex items-center gap-1 text-meta text-success">
@@ -1000,10 +1202,14 @@ function ServerMiniCard({
               onClick={onImport}
               disabled={busy}
             >
-              <Trans
-                message={msg("{value1}Import")}
-                values={{ value1: <Download className="size-3" /> }}
-              />
+              {unconfirmed ? (
+                t("Review")
+              ) : (
+                <Trans
+                  message={msg("{value1}Import")}
+                  values={{ value1: <Download className="size-3" /> }}
+                />
+              )}
             </Button>
           )}
         </div>

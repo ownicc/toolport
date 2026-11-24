@@ -21,9 +21,16 @@ pub struct Leftover {
 pub struct Report {
     pub clients: Vec<crate::clients::DisconnectResult>,
     pub removed: Vec<String>,
+    /// Owned credentials that were already gone when removal reached them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub absent: Vec<String>,
     pub leftovers: Vec<Leftover>,
     pub preserved: Vec<String>,
     pub notes: Vec<String>,
+    /// Data removal ran to the end and only credential leftovers (and the
+    /// registry kept to retry them) remain, so app resources can go too.
+    #[serde(skip)]
+    pub(crate) only_credentials_left: bool,
 }
 
 // Unit tests always use scratch roots. test-support subprocesses opt in with
@@ -365,6 +372,9 @@ fn credential_scope(
             ids.remove(&id);
         }
     }
+    // Every backup generation uses one namespace bound to this data directory.
+    // Inventory it even after backup files were removed or a write was interrupted.
+    ids.insert(crate::clients::backup_storage::install_account(dir));
     Ok(crate::secrets::purge::Scope {
         all_installs,
         server_ids: ids,
@@ -374,6 +384,9 @@ fn credential_scope(
 fn app_resources(home: &Path) -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     return [
+        // Tauri's app data folder (the bundle-id twin of Linux's data_local_dir
+        // and Windows' AppData/Local entries below).
+        "Library/Application Support/com.tsout.conduit",
         "Library/Caches/com.tsout.conduit",
         "Library/HTTPStorages/com.tsout.conduit",
         "Library/Preferences/com.tsout.conduit.plist",
@@ -479,7 +492,6 @@ pub fn plan_with_scope(all_installs: bool) -> Result<Plan, String> {
     })
 }
 
-#[cfg(any(feature = "desktop", feature = "gtk-desktop", test))]
 fn open_removal_report(report_path: &Path) -> Result<std::fs::File, String> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -559,6 +571,18 @@ pub fn launch_after_exit(report_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub fn write_report(path: &Path, report: &Report) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = open_removal_report(path)?;
+    file.write_all(
+        serde_json::to_string_pretty(report)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())
+}
+
 pub fn run() -> Result<Report, String> {
     run_with_scope(false)
 }
@@ -585,7 +609,7 @@ pub fn run_with_scope(all_installs: bool) -> Result<Report, String> {
         |report| startup_entries(false, report),
         remove_autostart,
     )?;
-    if report.leftovers.is_empty() {
+    if report.leftovers.is_empty() || report.only_credentials_left {
         remove_app_resources(
             &mut report,
             !others.is_empty()
@@ -696,6 +720,7 @@ fn run_with(
                 report.notes.push(format!("Preserved credentials may belong to another Toolport install. Toolport's own shared master key, internal keys, HTTP bridge/client keys and Team tokens remain too. {}", credential_removal_guidance(custom_data_dir(&dir))));
             }
             report.preserved.extend(removal.preserved);
+            report.absent.extend(removal.absent);
             report.notes.extend(removal.notes);
             report.leftovers.extend(removal.leftovers);
         }
@@ -704,9 +729,20 @@ fn run_with(
             error,
         }),
     }
-    if !report.leftovers.is_empty() {
-        report.notes.push("Credential cleanup failed. Successfully removed items are listed under removed; failed items remain. Data and the registry were retained so retry uses the same ownership inventory.".into());
-        return Ok(report);
+    if !report.absent.is_empty() {
+        report.notes.push(format!(
+            "{} credential item(s) were already gone when removal reached them; they are listed under absent and nothing of them remains.",
+            report.absent.len()
+        ));
+    }
+    // A credential that could not be removed does not stop the rest of the
+    // removal. Everything else goes; registry.json and client-locations.json
+    // stay (reported below) so a retry has the same ownership inventory.
+    let credential_leftovers = report.leftovers.len();
+    if credential_leftovers > 0 {
+        report.notes.push(format!(
+            "{credential_leftovers} credential item(s) could not be removed and are listed under leftovers with the reason. Everything else that could be removed was removed; registry.json was retained so a retry finds the same credentials."
+        ));
     }
     let registry_path = dir.join("registry.json");
     let locations_path = dir.join("client-locations.json");
@@ -726,6 +762,8 @@ fn run_with(
     {
         report.notes.push("Team tokens deleted from this machine were removed locally only; no server-side revoke endpoint is available in the Teams client.".into());
     }
+    report.only_credentials_left =
+        credential_leftovers > 0 && report.leftovers.len() == credential_leftovers;
     // Bounded long-ID backup names need the location inventory on the next pass.
     if report.leftovers.is_empty() {
         match std::fs::symlink_metadata(&locations_path) {
@@ -818,6 +856,8 @@ fn remove_path(path: &Path, report: &mut Report) {
 // Names come from registry/profile stores, clients, telemetry, daemon/broker,
 // secrets, Teams, native-shell state and the gateway's persisted caches.
 const DATA_FILES: &[&str] = &[
+    "ui-settings.json",
+    "ui-settings.lock",
     "client-locations.json",
     "registry.json",
     "registry-recovery.json",
@@ -850,6 +890,7 @@ const DATA_FILES: &[&str] = &[
     "http-bridge-update-resume.json",
     "gtk-security-dismissed.json",
     "gtk-window-state.json",
+    "gtk-skills-project.json",
     ".secrets-file-migrated",
     ".keychain-dpk-migrated",
     ".tray-hint-shown",
@@ -858,6 +899,9 @@ const DATA_FILES: &[&str] = &[
     "agent-activity-removed",
     "agent-guard-removed",
     "legacy-topology-retired.notice",
+    // Startup secret scrub of old logs (secret_redact).
+    "secret-scrub-v1.json",
+    "secret-scrub-pending",
 ];
 
 fn hex_name(value: &str, length: usize) -> bool {
@@ -873,18 +917,23 @@ fn decimal(value: &str) -> bool {
 // registry::atomic_write and lock_at generate siblings of a known file, never
 // siblings of a directory. Apply the same rule at every selected depth.
 fn generated_file_name(name: &str, owned: impl Fn(&str) -> bool) -> bool {
-    if owned(name) {
+    let temp_of_owned = |name: &str| {
+        name.strip_suffix(".conduit-tmp").is_some_and(|base| {
+            base.rsplit_once('.').is_some_and(|(base, seq)| {
+                decimal(seq)
+                    && base.rsplit_once('.').is_some_and(|(base, pid)| {
+                        decimal(pid) && pid.parse::<u32>().is_ok() && owned(base)
+                    })
+            })
+        })
+    };
+    if owned(name) || temp_of_owned(name) {
         return true;
     }
-    if let Some(base) = name.strip_suffix(".conduit-tmp") {
-        return base.rsplit_once('.').is_some_and(|(base, seq)| {
-            decimal(seq)
-                && base.rsplit_once('.').is_some_and(|(base, pid)| {
-                    decimal(pid) && pid.parse::<u32>().is_ok() && owned(base)
-                })
-        });
-    }
-    name.strip_suffix(".lock").is_some_and(owned)
+    // A lock beside an owned file, or beside a temp copy of one (a scrub of a
+    // write in flight locked `<file>.<pid>.<seq>.conduit-tmp`).
+    name.strip_suffix(".lock")
+        .is_some_and(|base| owned(base) || temp_of_owned(base))
 }
 
 fn owned_data_name(name: &str, legacy: &std::collections::HashSet<String>) -> bool {
@@ -901,7 +950,10 @@ fn owned_data_name(name: &str, legacy: &std::collections::HashSet<String>) -> bo
             })
         || matches!(
             name,
-            "secret-service.lock" | "task-handle-key.lock" | "client-config-mutation.lock"
+            "secret-service.lock"
+                | "task-handle-key.lock"
+                | "client-config-mutation.lock"
+                | "secret-scrub.lock"
         )
         || name
             .strip_prefix("daemon-")
@@ -914,6 +966,21 @@ fn owned_data_name(name: &str, legacy: &std::collections::HashSet<String>) -> bo
 }
 
 fn owned_data_file(name: &str) -> bool {
+    if name.strip_suffix(".bak").is_some_and(|base| {
+        base == "tool-pins.json"
+            || base
+                .strip_prefix("tool-pins-v2-")
+                .and_then(|s| s.strip_suffix(".json"))
+                .is_some_and(|s| hex_name(s, 64))
+    }) || name
+        .strip_prefix("ui-settings.json.corrupt-")
+        .is_some_and(|suffix| {
+            let parts: Vec<_> = suffix.split('-').collect();
+            parts.len() == 3 && parts.iter().all(|part| decimal(part))
+        })
+    {
+        return true;
+    }
     if DATA_FILES.contains(&name)
         || matches!(
             name,
@@ -1024,10 +1091,15 @@ fn bin_file(name: &str) -> bool {
         .is_some_and(|(base, id)| hex_name(id, 32) && gateway_file(base))
 }
 
+pub(crate) fn owned_backup_file(client: &crate::clients::PurgeBackupClient, name: &str) -> bool {
+    generated_file_name(name, |name| backup_file(client, name))
+}
+
 fn backup_file(client: &crate::clients::PurgeBackupClient, name: &str) -> bool {
     name == "moved-servers.json"
         || name
             .strip_prefix("original-")
+            .or_else(|| name.strip_prefix("released-"))
             .and_then(|s| s.strip_suffix(".json"))
             .is_some_and(|s| hex_name(s, 64))
         || name.split_once('-').is_some_and(|(stamp, basename)| {
@@ -1144,8 +1216,9 @@ fn owned_data_entry_with_backups(
         ["backups", client] if backup_client(client).is_some() => {
             return Some(DataEntry::Directory)
         }
-        ["backups", client, name] => backup_client(client)
-            .is_some_and(|client| generated_file_name(name, |name| backup_file(&client, name))),
+        ["backups", client, name] => {
+            backup_client(client).is_some_and(|client| owned_backup_file(&client, name))
+        }
         ["exports", name] => generated_file_name(name, export_file),
         ["children" | "daemon-runs", name] => generated_file_name(name, pid_json),
         ["oauth-locks", name] => oauth_file(name),
@@ -1311,11 +1384,187 @@ fn remove_empty_dirs(dir: &Path, report: &mut Report) {
     }
 }
 
+/// A LaunchAgent in the shape tauri-plugin-autostart writes for Toolport: its
+/// Label is `name` and it starts the app with `--hidden`.
+#[cfg(any(target_os = "macos", test))]
+fn owned_launch_agent(contents: &str, name: &str) -> bool {
+    contents.contains(&format!("<string>{name}</string>"))
+        && contents.contains("<string>--hidden</string>")
+}
+
+/// The program a LaunchAgent starts: the first `ProgramArguments` string.
+#[cfg(any(target_os = "macos", test))]
+fn launch_agent_program(contents: &str) -> Option<PathBuf> {
+    let (_, after) = contents.split_once("<key>ProgramArguments</key>")?;
+    let array = after.trim_start().strip_prefix("<array>")?;
+    let first = array.trim_start().strip_prefix("<string>")?;
+    let (value, _) = first.split_once("</string>")?;
+    let value = value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&");
+    (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
+/// The installed app an executable belongs to: its outermost `.app` bundle, or
+/// its folder when it is not in one.
+#[cfg(any(target_os = "macos", test))]
+fn install_root(exe: &Path) -> &Path {
+    exe.ancestors()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "app"))
+        .last()
+        .unwrap_or_else(|| exe.parent().unwrap_or(exe))
+}
+
+/// Whether `path` is inside this user's Trash: `~/.Trash` on the startup volume,
+/// or `/Volumes/<volume>/.Trashes/<uid>` on another mounted volume. A `.Trashes`
+/// folder anywhere else (a copied backup) is not a Trash.
+#[cfg(any(target_os = "macos", test))]
+fn in_trash(path: &Path, home: &Path, uid: u32) -> bool {
+    if path.starts_with(home.join(".Trash")) {
+        return true;
+    }
+    let uid = uid.to_string();
+    let mut parts = path.components();
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()),
+        (
+            Some(std::path::Component::RootDir),
+            Some(volumes),
+            Some(std::path::Component::Normal(_)),
+            Some(trashes),
+            Some(owner),
+        ) if volumes.as_os_str() == "Volumes"
+            && trashes.as_os_str() == ".Trashes"
+            && owner.as_os_str() == uid.as_str()
+    )
+}
+
+/// Whether a daemon whose executable `removed_exe` is gone may remove this
+/// launch-at-login plist. It must be Toolport's own (the uninstaller's
+/// ownership check), start a program inside the same app as that executable,
+/// that program must no longer exist, and there must be positive evidence the
+/// app was removed rather than replaced: `now_at`, where the running image is
+/// now (it follows a rename), is inside a Trash folder. An updater or Homebrew
+/// moving the bundle aside, an app that is just missing, or an unknown location
+/// all keep the plist. `exists` should answer true when it cannot tell.
+#[cfg(any(target_os = "macos", test))]
+fn stale_launch_agent(
+    contents: &str,
+    name: &str,
+    removed_exe: &Path,
+    now_at: Option<&Path>,
+    home: &Path,
+    uid: u32,
+    exists: impl Fn(&Path) -> bool,
+) -> bool {
+    if !owned_launch_agent(contents, name) {
+        return false;
+    }
+    let Some(program) = launch_agent_program(contents) else {
+        return false;
+    };
+    install_root(&program) == install_root(removed_exe)
+        && !exists(&program)
+        && now_at.is_some_and(|path| in_trash(path, home, uid))
+}
+
+/// Where this process's executable is now. macOS resolves `proc_pidpath` from the
+/// open image's vnode, so it follows a rename (into the Trash, or aside by an
+/// updater); `current_exe` would keep the launch path. `None` once the file is
+/// deleted or the path cannot be read.
+#[cfg(target_os = "macos")]
+fn running_image_path() -> Option<PathBuf> {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: buf is valid for writes of buf.len() bytes for the call.
+    let len = unsafe {
+        libc::proc_pidpath(
+            std::process::id() as libc::c_int,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+        )
+    };
+    if len <= 0 {
+        return None;
+    }
+    buf.truncate(len as usize);
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(buf)))
+}
+
+/// The daemon confirmed its own app is gone: if the app is in the Trash, remove
+/// Toolport's launch-at-login LaunchAgent that would start it, and unload it, so a
+/// drag to the Trash with Launch at login on leaves nothing behind. Only plists
+/// [`stale_launch_agent`] accepts are touched; a bundle moved anywhere else (an
+/// update in progress) keeps its plist.
+#[cfg(target_os = "macos")]
+pub fn remove_stale_launch_agents(removed_exe: &Path) -> Report {
+    let mut report = Report::default();
+    let Some(home) = home_dir() else {
+        return report;
+    };
+    let now_at = running_image_path();
+    // SAFETY: getuid has no failure mode.
+    let uid = unsafe { libc::getuid() };
+    for (path, name) in autostart_files(&home).iter().zip(AUTOSTART_NAMES) {
+        match std::fs::read_to_string(path) {
+            Ok(contents)
+                if stale_launch_agent(
+                    &contents,
+                    name,
+                    removed_exe,
+                    now_at.as_deref(),
+                    &home,
+                    uid,
+                    |program| program.try_exists().unwrap_or(true),
+                ) =>
+            {
+                remove_path(path, &mut report);
+                unload_launch_agent(name);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => report.leftovers.push(Leftover {
+                path: path.display().to_string(),
+                error: error.to_string(),
+            }),
+        }
+    }
+    report
+}
+
+/// Best effort `launchctl bootout gui/<uid>/<label>`. A plist that was never
+/// loaded (the usual case before the next login) just makes it fail.
+#[cfg(target_os = "macos")]
+fn unload_launch_agent(label: &str) {
+    let uid = unsafe { libc::getuid() };
+    let Ok(mut child) = std::process::Command::new("/bin/launchctl")
+        .arg("bootout")
+        .arg(format!("gui/{uid}/{label}"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn owned_autostart(contents: &str, name: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
-        contents.contains(&format!("<string>{name}</string>"))
-            && contents.contains("<string>--hidden</string>")
+        owned_launch_agent(contents, name)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1324,6 +1573,14 @@ fn owned_autostart(contents: &str, name: &str) -> bool {
                 .lines()
                 .any(|line| line == format!("Comment={name}startup script"))
     }
+}
+
+/// Remove only Toolport's own launch-at-login entries, for an uninstaller
+/// that keeps data. Changed or foreign entries are preserved and listed.
+pub fn remove_startup_entries() -> Result<Report, String> {
+    let mut report = Report::default();
+    remove_autostart(&mut report)?;
+    Ok(report)
 }
 
 fn remove_autostart(report: &mut Report) -> Result<(), String> {
@@ -1371,6 +1628,28 @@ fn startup_files(files: Vec<PathBuf>, remove: bool, report: &mut Report) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn recognizes_ui_settings_and_pin_recovery_files() {
+        let legacy = Default::default();
+        for name in [
+            "ui-settings.json",
+            "ui-settings.lock",
+            "gtk-skills-project.json",
+            "ui-settings.json.123.1.conduit-tmp",
+            "ui-settings.json.corrupt-123-12-0",
+            "tool-pins.json.bak",
+            &format!("tool-pins-v2-{}.json.bak", "a".repeat(64)),
+        ] {
+            assert!(owned_data_name(name, &legacy), "{name}");
+        }
+        for name in [
+            "ui-settings-notes.json",
+            "tool-pins-custom.json.bak",
+            "ui-settings.json.corrupt-notes",
+        ] {
+            assert!(!owned_data_name(name, &legacy), "{name}");
+        }
+    }
     #[test]
     fn review_r4_purge_removes_only_exact_unreadable_pin_copies() {
         let env = crate::registry::DataDirTestEnv::new("purge-unreadable-pins");
@@ -1732,6 +2011,48 @@ mod tests {
         );
         drop(env);
     }
+    /// macOS acceptance after "Remove Toolport data": the secret scrub's marker
+    /// and lock, and a lock the scrub took on a tool cache write in flight, were
+    /// left in the data folder as entries Toolport did not create.
+    #[test]
+    fn purge_removes_the_secret_scrub_files_and_locks_on_temp_writes() {
+        let env = crate::registry::DataDirTestEnv::new("purge_scrub_leftovers");
+        let dir = env.dir.join("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = format!("tool-cache-v2-{}.json", "c".repeat(64));
+        let created = [
+            "secret-scrub-v1.json".to_string(),
+            "secret-scrub.lock".to_string(),
+            "secret-scrub-pending".to_string(),
+            format!("{cache}.7842.4.conduit-tmp.lock"),
+            format!("{cache}.7842.4.conduit-tmp"),
+            "registry.json.123.1.conduit-tmp.lock".to_string(),
+        ];
+        for name in &created {
+            std::fs::write(dir.join(name), "fixture").unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), "user bytes").unwrap();
+        let mut report = Report::default();
+        remove_data_contents(&dir, &[], &mut report);
+        assert!(report.leftovers.is_empty(), "{:?}", report.leftovers);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["notes.txt"]);
+        // Only a lock on a temp copy of an owned file, not any doubled suffix.
+        let legacy = Default::default();
+        for name in [
+            "secret-scrub.json",
+            "registry.json.lock.lock",
+            "notes.txt.123.1.conduit-tmp.lock",
+            "registry.json.notes.conduit-tmp.lock",
+        ] {
+            assert!(!owned_data_name(name, &legacy), "{name}");
+        }
+        drop(env);
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn purge_autostart_requires_toolports_marker() {
@@ -1780,17 +2101,21 @@ mod tests {
     }
 
     #[test]
-    fn fake_keyring_failure_reports_exact_leftovers_and_keeps_data_for_retry() {
+    fn fake_keyring_failure_removes_everything_else_and_keeps_the_registry_for_retry() {
         let _env = crate::registry::DataDirTestEnv::new("purge_keyring_failure");
         let dir = crate::registry::conduit_dir().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("secrets.enc"), "recovery bytes").unwrap();
+        std::fs::write(dir.join("secrets.enc"), "secret bytes").unwrap();
+        std::fs::write(dir.join("registry.json"), r#"{"servers":[]}"#).unwrap();
+        std::fs::write(dir.join("tool-cache.json"), "{}").unwrap();
         let report = run_with(
             |_| Vec::new(),
             || Ok(Vec::new()),
             |_| Vec::new(),
             || {
                 Ok(crate::secrets::purge::Removal {
+                    removed: vec!["secret-service:/fixture/removed-item".into()],
+                    absent: vec!["keychain:conduit-mcp/legacy/mock::TOKEN".into()],
                     leftovers: vec![Leftover {
                         path: "secret-service:/fixture/locked-item".into(),
                         error: "locked".into(),
@@ -1802,11 +2127,26 @@ mod tests {
             |_| Ok(()),
         )
         .unwrap();
+        // The failed item is reported exactly, the absent one apart from it.
         assert_eq!(
             report.leftovers[0].path,
             "secret-service:/fixture/locked-item"
         );
-        assert!(dir.join("secrets.enc").exists());
+        assert_eq!(report.absent, ["keychain:conduit-mcp/legacy/mock::TOKEN"]);
+        assert!(report
+            .removed
+            .contains(&"secret-service:/fixture/removed-item".to_string()));
+        // Everything else was removed; only the registry stays, and says why.
+        assert!(!dir.join("secrets.enc").exists());
+        assert!(!dir.join("tool-cache.json").exists());
+        assert!(dir.join("registry.json").exists());
+        assert!(report
+            .leftovers
+            .iter()
+            .any(|left| left.path.ends_with("registry.json") && left.error.contains("retry")));
+        assert!(report.only_credentials_left);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["absent"][0], "keychain:conduit-mcp/legacy/mock::TOKEN");
         let report = run_with(
             |_| Vec::new(),
             || Ok(Vec::new()),
@@ -1818,6 +2158,35 @@ mod tests {
         .unwrap();
         assert!(report.leftovers.is_empty(), "{:?}", report.leftovers);
         assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn absent_credentials_alone_complete_the_removal() {
+        let _env = crate::registry::DataDirTestEnv::new("purge_keyring_absent");
+        let dir = crate::registry::conduit_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("registry.json"), r#"{"servers":[]}"#).unwrap();
+        let report = run_with(
+            |_| Vec::new(),
+            || Ok(Vec::new()),
+            |_| Vec::new(),
+            || {
+                Ok(crate::secrets::purge::Removal {
+                    removed: vec!["keychain:conduit-mcp/data-protection/mock::TOKEN".into()],
+                    absent: vec!["keychain:conduit-mcp/legacy/mock::TOKEN".into()],
+                    ..Default::default()
+                })
+            },
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(report.leftovers.is_empty(), "{:?}", report.leftovers);
+        assert!(!dir.join("registry.json").exists());
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("already gone")));
     }
 
     #[test]
@@ -1856,6 +2225,118 @@ mod tests {
             .any(|file| file.to_string_lossy().contains("Claude")));
     }
     #[test]
+    fn a_daemon_removes_only_its_own_launch_agent_once_its_app_is_gone() {
+        fn plist(label: &str, program: &str, hidden: bool) -> String {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n  <dict>\n  \
+                 <key>Label</key>\n  <string>{label}</string>\n  <key>ProgramArguments</key>\n  \
+                 <array><string>{program}</string>{}</array>\n  <key>RunAtLoad</key>\n  <true/>\n  \
+                 </dict>\n</plist>",
+                if hidden {
+                    "<string>--hidden</string>"
+                } else {
+                    ""
+                }
+            )
+        }
+        let trashed = Path::new("/Applications/Toolport.app/Contents/MacOS/toolport-gateway");
+        let app = "/Applications/Toolport.app/Contents/MacOS/Toolport";
+        let second = "/Users/me/Applications/Toolport.app/Contents/MacOS/Toolport";
+        let gone = |_: &Path| false;
+        let present = |_: &Path| true;
+        let only_app_gone = |path: &Path| path != Path::new(app);
+        let other = "/Applications/Other.app/Contents/MacOS/Other";
+        let no_program =
+            "<plist><dict><key>Label</key><string>Toolport</string><string>--hidden</string></dict></plist>";
+        type Exists<'a> = &'a dyn Fn(&Path) -> bool;
+        // (case, plist, does its program exist, remove it)
+        let cases: [(&str, String, Exists, bool); 7] = [
+            ("its app is gone", plist("Toolport", app, true), &gone, true),
+            ("reinstalled", plist("Toolport", app, true), &present, false),
+            ("second copy", plist("Toolport", second, true), &gone, false),
+            ("another app", plist("Other", other, true), &gone, false),
+            ("not hidden", plist("Toolport", app, false), &gone, false),
+            (
+                "only it is gone",
+                plist("Toolport", app, true),
+                &only_app_gone,
+                true,
+            ),
+            ("no program", no_program.into(), &gone, false),
+        ];
+        let home = Path::new("/Users/me");
+        let in_trash = Path::new("/Users/me/.Trash/Toolport.app/Contents/MacOS/toolport-gateway");
+        for (case, contents, exists, remove) in cases {
+            assert_eq!(
+                stale_launch_agent(
+                    &contents,
+                    "Toolport",
+                    trashed,
+                    Some(in_trash),
+                    home,
+                    501,
+                    exists
+                ),
+                remove,
+                "{case}"
+            );
+        }
+        // R2-2: only a running image now inside a Trash folder is evidence of
+        // removal. An updater's or Homebrew's move aside, a missing file and an
+        // unknown location keep the plist.
+        let ours = plist("Toolport", app, true);
+        for (now_at, remove) in [
+            (Some("/Volumes/Data/.Trashes/501/Toolport.app/Contents/MacOS/toolport-gateway"), true),
+            (Some("/Volumes/Data/.Trashes/502/Toolport.app/Contents/MacOS/toolport-gateway"), false),
+            // R3-4: a `.Trashes` folder outside a mounted volume's root is not a Trash.
+            (Some("/Users/me/backup/.Trashes/501/Toolport.app/Contents/MacOS/toolport-gateway"), false),
+            (Some("/Volumes/Data/backup/.Trashes/501/Toolport.app/Contents/MacOS/toolport-gateway"), false),
+            (Some("/Applications/Toolport.app.old/Contents/MacOS/toolport-gateway"), false),
+            (Some("/private/var/folders/xy/T/tauri_updated_app/Toolport.app/Contents/MacOS/toolport-gateway"), false),
+            (Some("/opt/homebrew/Caskroom/toolport/2.3.5/Toolport.app/Contents/MacOS/toolport-gateway"), false),
+            (Some("/Users/me/Downloads/Toolport.app/Contents/MacOS/toolport-gateway"), false),
+            (None, false),
+        ] {
+            assert_eq!(
+                stale_launch_agent(&ours, "Toolport", trashed, now_at.map(Path::new), home, 501, gone),
+                remove,
+                "{now_at:?}"
+            );
+        }
+        // A gateway outside any bundle owns only plists in its own folder.
+        let loose = Path::new("/opt/toolport/toolport-gateway");
+        let loose_trash = Path::new("/Users/me/.Trash/toolport/toolport-gateway");
+        assert!(stale_launch_agent(
+            &plist("Toolport", "/opt/toolport/Toolport", true),
+            "Toolport",
+            loose,
+            Some(loose_trash),
+            home,
+            501,
+            gone
+        ));
+        assert!(!stale_launch_agent(
+            &plist("Toolport", app, true),
+            "Toolport",
+            loose,
+            Some(loose_trash),
+            home,
+            501,
+            gone
+        ));
+        assert_eq!(
+            launch_agent_program(&plist(
+                "Toolport",
+                "/Applications/A &amp; B.app/Contents/MacOS/Toolport",
+                true
+            )),
+            Some(PathBuf::from(
+                "/Applications/A & B.app/Contents/MacOS/Toolport"
+            ))
+        );
+    }
+
+    #[test]
     fn custom_native_directory_is_not_a_toolport_data_directory() {
         let env = crate::registry::DataDirTestEnv::new("purge_ownership");
         std::fs::write(
@@ -1878,7 +2359,9 @@ mod tests {
                     path: "/fixture/edited-client.json".into(),
                     dry_run: false,
                     error: None,
-                    warnings: vec!["kept your edited toolport entry".into()],
+                    warnings: vec![
+                        "Toolport kept the toolport entry you edited. Remove it by hand if you uninstall Toolport.".into(),
+                    ],
                 }])
             },
             |_| panic!("connection remains"),
@@ -2034,14 +2517,21 @@ mod tests {
         let scope = credential_scope(&dev, &others, false).unwrap();
         assert_eq!(
             scope.server_ids,
-            std::collections::HashSet::from(["dev-only".into()])
+            std::collections::HashSet::from([
+                "dev-only".into(),
+                crate::clients::backup_storage::install_account(&dev)
+            ])
         );
         assert!(!scope.all_installs);
         let scope = credential_scope(&dev, &[], false).unwrap();
         assert!(!scope.all_installs);
         assert_eq!(
             scope.server_ids,
-            std::collections::HashSet::from(["shared".into(), "dev-only".into()])
+            std::collections::HashSet::from([
+                "shared".into(),
+                "dev-only".into(),
+                crate::clients::backup_storage::install_account(&dev)
+            ])
         );
         assert!(credential_scope(&dev, &others, true).unwrap().all_installs);
         std::fs::remove_file(main.join("registry.json")).unwrap();
@@ -2057,7 +2547,7 @@ mod tests {
             .iter()
             .all(|path| path.to_string_lossy().contains("com.tsout.conduit")));
         #[cfg(target_os = "macos")]
-        assert_eq!(paths.len(), 5);
+        assert_eq!(paths.len(), 6);
     }
 
     #[test]
@@ -2091,6 +2581,7 @@ mod tests {
         std::fs::create_dir_all(env.dir.join("documents/broker")).unwrap();
         std::fs::write(env.dir.join("documents/broker/notes"), "keep nested").unwrap();
         for name in [
+            "gtk-skills-project.json",
             "registry.json.bak",
             "registry.json.bak.123",
             "registry.json.v2-123.bak",
@@ -2225,7 +2716,10 @@ mod tests {
         assert!(!scope.all_installs, "discovery cannot prove sole ownership");
         assert_eq!(
             scope.server_ids,
-            std::collections::HashSet::from(["mine".into()])
+            std::collections::HashSet::from([
+                "mine".into(),
+                crate::clients::backup_storage::install_account(&selected)
+            ])
         );
     }
 
@@ -2827,7 +3321,10 @@ mod tests {
             "select the settings copy, not the original recovery snapshot"
         );
         let backup = &backups[0];
-        assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+        assert_eq!(
+            crate::clients::read_client_backup(backup, &config).unwrap(),
+            original
+        );
         assert!(
             owned_data_entry(backup.strip_prefix(&env.dir).unwrap()).is_some(),
             "{}",

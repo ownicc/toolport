@@ -129,7 +129,7 @@ fn find_class(root: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
     None
 }
 
-fn find_named(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+pub(super) fn find_named(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
     if root.widget_name() == name {
         return Some(root.clone());
     }
@@ -333,6 +333,10 @@ pub(super) fn update_server_log(page: &ServerPage, server_id: &str, error: Optio
     }
 }
 
+/// Room on a dropdown's button before its label ends in "…": enough for the
+/// longest translation of "Default access (from Settings)".
+const DROPDOWN_LABEL_CHARS: i32 = 40;
+
 fn bound_dropdown(control: &gtk::DropDown) {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
@@ -340,7 +344,7 @@ fn bound_dropdown(control: &gtk::DropDown) {
         item.set_child(Some(
             &gtk::Label::builder()
                 .ellipsize(gtk::pango::EllipsizeMode::End)
-                .max_width_chars(24)
+                .max_width_chars(DROPDOWN_LABEL_CHARS)
                 .xalign(0.0)
                 .build(),
         ));
@@ -353,6 +357,50 @@ fn bound_dropdown(control: &gtk::DropDown) {
         label.set_tooltip_text(Some(&value.string()));
     });
     control.set_factory(Some(&factory));
+    control.set_list_factory(Some(&checked_list_factory()));
+}
+
+/// A choice in an open dropdown list: one line that never breaks inside a word,
+/// so the list grows to fit it ("Default access (from Setting-s)" broke there
+/// when it wrapped in a narrow list).
+pub(super) fn checked_list_label() -> gtk::Label {
+    gtk::Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .single_line_mode(true)
+        .build()
+}
+
+/// The open list of a dropdown with its own button factory: each choice in full,
+/// with a check mark on the current one, as GTK's default list and the Language
+/// dropdown show.
+pub(super) fn checked_list_factory() -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let label = checked_list_label();
+        let check = gtk::Image::from_icon_name("object-select-symbolic");
+        row.append(&label);
+        row.append(&check);
+        item.set_child(Some(&row));
+        let shown = check.downgrade();
+        item.connect_selected_notify(move |item| {
+            if let Some(check) = shown.upgrade() {
+                check.set_opacity(if item.is_selected() { 1.0 } else { 0.0 });
+            }
+        });
+    });
+    factory.connect_bind(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+        let row = item.child().unwrap();
+        let label = row.first_child().and_downcast::<gtk::Label>().unwrap();
+        let check = row.last_child().unwrap();
+        let value = item.item().and_downcast::<gtk::StringObject>().unwrap();
+        label.set_label(&value.string());
+        check.set_opacity(if item.is_selected() { 1.0 } else { 0.0 });
+    });
+    factory
 }
 
 pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
@@ -361,8 +409,9 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
     header.add_leading(&branding::client_logo(&client.id));
     let refresh = header_icon_button("view-refresh-symbolic");
     l10n::bind_tooltip(&refresh, "Scan clients again");
+    refresh.set_widget_name("client-detail-refresh");
     let p = page.clone();
-    refresh.connect_clicked(move |_| p.refresh());
+    refresh.connect_clicked(move |_| p.scan());
     header.add_action(&refresh);
     root.append(&header.root);
     let body = page_body(24);
@@ -373,7 +422,9 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
     } else if let Some(profile) = &client.claude_profile {
         info.append(&text(&profile.folder, true));
     }
-    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    // Flows onto more lines in a narrow window, so the access menu keeps its
+    // label instead of being squeezed to "Default access (from Sett…".
+    let actions = page_header::ActionFlow::new();
     actions.set_valign(gtk::Align::Center);
     let connected = client.gateway_state == state::ClientGatewayState::Connected;
     let customized = client.gateway_state == state::ClientGatewayState::Customized;
@@ -381,6 +432,7 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
     let profiles = page.profiles.borrow().clone();
     let names = profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>();
     let scope = gtk::DropDown::from_strings(&names);
+    super::quiet_tooltips::guard_dropdown(&scope);
     scope.set_selected(
         profiles
             .iter()
@@ -474,9 +526,11 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
         });
         actions.append(&disconnect);
     }
-    if client.location_removable {
+    if client_rows::shows_remove_location(client) {
         let remove = client_rows::remove_location_button(client, page.clone());
-        remove.set_sensitive(!client.config_error && !connected && !customized);
+        remove.set_sensitive(
+            !client.config_error && !connected && !customized && !client.location_kept_by_t3_code,
+        );
         actions.append(&remove);
     }
     body.append(&page_header::HeaderWrap::new(&info, &actions));
@@ -490,23 +544,14 @@ pub(super) fn client(client: &state::ClientView, page: &ClientPage) {
             move || p.refresh(),
         ));
     }
-    if let Some((id, notice)) = page.detail_notice.borrow().as_ref() {
-        if id == &client.id {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            let label = text(notice, false);
-            label.set_hexpand(true);
-            row.append(&label);
-            let dismiss = header_icon_button("window-close-symbolic");
-            l10n::bind_tooltip(&dismiss, "Dismiss restart reminder");
-            let p = page.clone();
-            let row_for_dismiss = row.clone();
-            dismiss.connect_clicked(move |_| {
-                p.detail_notice.borrow_mut().take();
-                row_for_dismiss.set_visible(false);
-            });
-            row.append(&dismiss);
-            body.append(&row);
-        }
+    page.append_recoveries(&body, Some(&client.id));
+    if let Some(shown) = page.notice_for(&client.id) {
+        let p = page.clone();
+        let (_, title, text) = &shown;
+        body.append(&super::restart_notice(title, text, {
+            let shown = shown.clone();
+            move || p.dismiss_notice(&shown)
+        }));
     }
     if customized {
         body.append(&message("Toolport is leaving your hand-edited gateway entry as-is. Reset it only if you want Toolport to manage the entry."));
@@ -593,6 +638,7 @@ fn discovery_picker(
         &crate::i18n::tr("Grouped · per-server"),
         &crate::i18n::tr("Full · every tool"),
     ]);
+    super::quiet_tooltips::guard_dropdown(&mode);
     bound_dropdown(&mode);
     l10n::bind_dropdown_choices(
         &mode,
@@ -634,30 +680,40 @@ fn discovery_picker(
         let updating = updating.clone();
         let persisted = persisted.clone();
         gtk::glib::spawn_future_local(async move {
+            let client_id = id.clone();
             let result = gtk::gio::spawn_blocking(move || write(&id, mode)).await;
+            // Feedback for a page that closed meanwhile is dropped: it would land on
+            // whichever client is open now and replace that client's notice.
+            let still_open = p.details.selected.borrow().as_deref() == Some(client_id.as_str());
             match result {
                 Ok(Ok(_)) => {
                     persisted.set(control.selected());
                     updating.set(false);
-                    p.show_confirmation(&crate::i18n::trf(
-                        "Updated discovery for {value0}.",
-                        &[("value0", &name)],
-                    ));
+                    if still_open {
+                        p.show_confirmation(&crate::i18n::trf(
+                            "Updated discovery for {value0}.",
+                            &[("value0", &name)],
+                        ));
+                    }
                     p.refresh();
                 }
                 Ok(Err(e)) => {
                     control.set_selected(persisted.get());
                     updating.set(false);
                     control.set_sensitive(true);
-                    p.show_error(&e);
+                    if still_open {
+                        p.show_error(&e);
+                    }
                 }
                 Err(_) => {
                     control.set_selected(persisted.get());
                     updating.set(false);
                     control.set_sensitive(true);
-                    p.show_error(&crate::i18n::tr(
-                        "the discovery update stopped unexpectedly",
-                    ));
+                    if still_open {
+                        p.show_error(&crate::i18n::tr(
+                            "the discovery update stopped unexpectedly",
+                        ));
+                    }
                 }
             }
         });
@@ -812,22 +868,74 @@ fn render_reachable(root: &gtk::Box, client: &state::ClientView, names: &[String
     root.append(&frame);
 }
 
+/// One row of a client's import list.
+struct ImportRow<'a> {
+    server: &'a crate::clients::McpServer,
+    /// The review's id for a server Import would add; `None` when already imported.
+    connection: Option<&'a str>,
+    plugin: bool,
+    imported: bool,
+    /// Only the keychain could tell whether it is in Toolport; review checks.
+    unconfirmed: bool,
+}
+
+/// What Import would add (named as it would be saved), then what only review can
+/// check, then the client's servers already in Toolport, as React's ClientDetail
+/// lists them. All come from the backend identity rule.
+fn import_rows<'a>(
+    detected: &'a state::ClientDetailData,
+    imported_names: &[String],
+) -> Vec<ImportRow<'a>> {
+    let mut seen = std::collections::HashSet::new();
+    let imported = detected
+        .servers
+        .iter()
+        .map(|server| (server, false))
+        .chain(detected.plugin_servers.iter().map(|server| (server, true)))
+        .filter(|(server, _)| {
+            !crate::clients::detected_is_gateway(server)
+                && imported_names.contains(&server.name.to_lowercase())
+                && seen.insert(server.name.to_lowercase())
+        })
+        .map(|(server, plugin)| ImportRow {
+            server,
+            connection: None,
+            plugin,
+            imported: true,
+            unconfirmed: false,
+        });
+    let listed = |rows: &'a Vec<_>, unconfirmed| {
+        rows.iter().map(
+            move |(server, plugin, connection): &'a (_, bool, String)| ImportRow {
+                server,
+                connection: Some(connection.as_str()),
+                plugin: *plugin,
+                imported: false,
+                unconfirmed,
+            },
+        )
+    };
+    listed(&detected.1, false)
+        .chain(listed(&detected.2, true))
+        .chain(imported)
+        .collect()
+}
+
+/// Whether the list may say everything here is already in Toolport: not while review
+/// still has to check a server.
+fn everything_in_toolport(rows: &[ImportRow]) -> bool {
+    rows.iter().all(|row| row.imported)
+}
+
 fn client_imports(
     body: &gtk::Box,
-    detected: &crate::clients::DetectedClient,
+    detected: &state::ClientDetailData,
     page: &ClientPage,
     writable: bool,
     imported_names: &[String],
     selected_scope: Rc<RefCell<Option<String>>>,
 ) {
-    let mut seen = std::collections::HashSet::new();
-    let servers = detected
-        .servers
-        .iter()
-        .filter(|s| !crate::clients::detected_is_gateway(s))
-        .chain(detected.plugin_servers.iter())
-        .filter(|server| seen.insert(server.name.to_lowercase()))
-        .collect::<Vec<_>>();
+    let servers = import_rows(detected, imported_names);
     if servers.is_empty() {
         return;
     }
@@ -843,11 +951,7 @@ fn client_imports(
     how.set_label_widget(Some(&message("How importing works")));
     how.set_child(Some(&explanation));
     body.append(&how);
-    if detected.gateway_installed
-        && servers
-            .iter()
-            .any(|s| !imported_names.contains(&s.name.to_lowercase()))
-    {
+    if detected.gateway_installed && servers.iter().any(|row| !row.imported && !row.unconfirmed) {
         let warning = formatted_message("{client} is already connected to Toolport. Import on its own leaves a copy here too, so these tools load twice, once directly and once through the gateway. Use {review} to avoid that.", &[("client", &detected.name)], &[("review", "Review and connect")]);
         warning.add_css_class("toolport-feedback");
         warning.add_css_class("warning");
@@ -860,8 +964,14 @@ fn client_imports(
     import.set_sensitive(writable);
     let keys = servers
         .iter()
-        .filter(|s| !imported_names.contains(&s.name.to_lowercase()))
-        .map(|s| ImportSelection::new(&detected.id, s))
+        .filter(|row| !row.unconfirmed)
+        .filter_map(|row| {
+            Some(ImportSelection::new(
+                &detected.id,
+                row.server,
+                row.connection?,
+            ))
+        })
         .collect::<Vec<_>>();
     import.set_sensitive(writable && !keys.is_empty());
     import.set_visible(!keys.is_empty());
@@ -872,13 +982,14 @@ fn client_imports(
             &[("value1", ""), ("value2", &count.to_string())],
         )
     });
-    let all_imported = keys.is_empty();
+    let all_imported = everything_in_toolport(&servers);
     let p = page.clone();
     import.connect_clicked(move |_| review_imports(&p, keys.clone()));
     all.append(&import);
-    if servers
+    if detected
+        .servers
         .iter()
-        .any(|s| detected.servers.iter().any(|local| std::ptr::eq(*s, local)))
+        .any(|s| !crate::clients::detected_is_gateway(s))
     {
         let review = l10n::button("Review and connect");
         review.add_css_class("toolport-secondary-action");
@@ -901,7 +1012,14 @@ fn client_imports(
     }
     body.append(&all);
     let group = row_group();
-    for server in servers {
+    for ImportRow {
+        server,
+        connection,
+        plugin,
+        imported,
+        unconfirmed,
+    } in servers
+    {
         let row = gtk::Box::new(gtk::Orientation::Vertical, 8);
         row.add_css_class("toolport-card");
         let copy = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -909,7 +1027,7 @@ fn client_imports(
         name.remove_css_class("toolport-muted");
         name.add_css_class("heading");
         copy.append(&name);
-        let shown = ImportSelection::new(&detected.id, server);
+        let shown = ImportSelection::new(&detected.id, server, "");
         let target = shown
             .command
             .map(|command| {
@@ -920,23 +1038,32 @@ fn client_imports(
             })
             .unwrap_or_else(|| shown.url.unwrap_or_default());
         copy.append(&text(&target, true));
-        if detected
-            .plugin_servers
-            .iter()
-            .any(|plugin| std::ptr::eq(plugin, server))
-        {
+        if plugin {
             let badge = message("plugin");
             badge.add_css_class("toolport-badge");
             badge.add_css_class("off");
             badge.set_halign(gtk::Align::Start);
             copy.append(&badge);
         }
-        let imported = imported_names.contains(&server.name.to_lowercase());
-        let import = l10n::button(if imported { "in Toolport" } else { "Import" });
+        if unconfirmed {
+            copy.append(&message(
+                "Open the review to check whether this is already in Toolport.",
+            ));
+        }
+        let import = l10n::button(if imported {
+            "in Toolport"
+        } else if unconfirmed {
+            "Review"
+        } else {
+            "Import"
+        });
         import.add_css_class("toolport-secondary-action");
         import.set_halign(gtk::Align::End);
         import.set_sensitive(writable && !imported);
-        let key = ImportSelection::new(&detected.id, server);
+        let mut key = ImportSelection::new(&detected.id, server, connection.unwrap_or_default());
+        if unconfirmed {
+            key.unconfirmed = Some(server.name.clone());
+        }
         let p = page.clone();
         import.connect_clicked(move |_| review_imports(&p, vec![key.clone()]));
         row.append(&page_header::HeaderWrap::new(&copy, &import));
@@ -966,19 +1093,20 @@ fn client_imports(
 #[derive(Clone)]
 struct ImportSelection {
     client_id: String,
-    name: String,
-    transport: String,
+    connection: String,
+    /// The shown name of a server only review can check.
+    unconfirmed: Option<String>,
     command: Option<String>,
     args: Vec<String>,
     url: Option<String>,
 }
 
 impl ImportSelection {
-    fn new(client_id: &str, server: &crate::clients::McpServer) -> Self {
+    fn new(client_id: &str, server: &crate::clients::McpServer, connection: &str) -> Self {
         Self {
             client_id: client_id.into(),
-            name: server.name.clone(),
-            transport: server.transport.clone(),
+            connection: connection.into(),
+            unconfirmed: None,
             command: server.command.as_ref().map(|c| {
                 if crate::registry::arg_looks_secret(c) {
                     "<command>".into()
@@ -994,30 +1122,41 @@ impl ImportSelection {
         }
     }
     fn matches(&self, item: &crate::registry_controller::ClientImportCandidate) -> bool {
-        self.client_id == item.client_id
-            && self.name == item.name
-            && self.transport == item.transport
-            && self.command == item.command
-            && self.args == item.args
-            && self.url == item.url
+        // By connection id: the saved name can differ between the list and the review,
+        // and two servers whose secrets differ can show the same redacted definition.
+        self.client_id == item.client_id && self.connection == item.connection
     }
 }
 
+/// The review items for `keys`, and the names of unconfirmed servers review found
+/// already in Toolport (it lists only what Import would change).
 fn selected_imports(
     keys: &[ImportSelection],
     items: Vec<crate::registry_controller::ClientImportCandidate>,
-) -> Result<Vec<crate::registry_controller::ClientImportCandidate>, String> {
-    keys.iter()
-        .map(|key| {
-            items
-                .iter()
-                .find(|item| key.matches(item))
-                .cloned()
-                .ok_or_else(|| {
-                    crate::i18n::tr("Server changed. Refresh the client and review again.")
-                })
-        })
-        .collect()
+) -> Result<
+    (
+        Vec<crate::registry_controller::ClientImportCandidate>,
+        Vec<String>,
+    ),
+    String,
+> {
+    let mut picked = Vec::new();
+    let mut in_toolport = Vec::new();
+    for key in keys {
+        match (
+            items.iter().find(|item| key.matches(item)),
+            &key.unconfirmed,
+        ) {
+            (Some(item), _) => picked.push(item.clone()),
+            (None, Some(name)) => in_toolport.push(name.clone()),
+            (None, None) => {
+                return Err(crate::i18n::tr(
+                    "Server changed. Refresh the client and review again.",
+                ))
+            }
+        }
+    }
+    Ok((picked, in_toolport))
 }
 
 fn review_imports(page: &ClientPage, keys: Vec<ImportSelection>) {
@@ -1033,7 +1172,13 @@ fn review_imports(page: &ClientPage, keys: Vec<ImportSelection>) {
         })
         .await
         {
-            Ok(Ok(items)) if !items.is_empty() => page.show_import_review(items),
+            Ok(Ok((items, _))) if !items.is_empty() => page.show_import_review(items),
+            Ok(Ok((_, in_toolport))) if !in_toolport.is_empty() => {
+                page.show_confirmation(&crate::i18n::trf(
+                    "{value0} is already in Toolport.",
+                    &[("value0", &in_toolport.join(", "))],
+                ))
+            }
             Ok(Ok(_)) => page.show_confirmation(&crate::i18n::tr("Nothing new to import")),
             Ok(Err(e)) => page.show_error(&e),
             Err(_) => page.show_error(&crate::i18n::tr("The import scan stopped unexpectedly.")),
@@ -1043,7 +1188,80 @@ fn review_imports(page: &ClientPage, keys: Vec<ImportSelection>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dropdown_buttons_fit_every_translation_of_the_default_access_choice() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/locales/connections");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let strings: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let label = strings["Default access (from Settings)"].as_str().unwrap();
+            let chars = i32::try_from(label.chars().count()).unwrap();
+            assert!(
+                chars <= super::DROPDOWN_LABEL_CHARS,
+                "{}: \"{label}\" is cut to \"…\"",
+                path.display()
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 9);
+    }
+
     use super::*;
+    /// GTK opens a dropdown's list at the button's width. A short choice on the button
+    /// ("Auto") must not squeeze the longer choices into broken words in the open list.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn open_list_keeps_whole_words_under_a_short_button() {
+        let _app = app();
+        let choices = [
+            "Auto",
+            "Lazy · search",
+            "Grouped · per-server",
+            "Full · every tool",
+        ];
+        let control = gtk::DropDown::from_strings(&choices);
+        bound_dropdown(&control);
+        control.set_halign(gtk::Align::Start);
+        let window = gtk::Window::builder()
+            .default_width(480)
+            .default_height(600)
+            .child(&control)
+            .build();
+        window.present();
+        let context = gtk::glib::MainContext::default();
+        let settle = || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                while context.pending() {
+                    context.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        settle();
+        control.activate();
+        settle();
+        let labels = widgets(control.upcast_ref())
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .filter(|l| l.is_mapped() && choices[1..].contains(&l.text().as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), 3, "the open list shows the longer choices");
+        for label in labels {
+            let (one_line, _) = label.create_pango_layout(Some(&label.text())).pixel_size();
+            assert!(
+                label.width() >= one_line,
+                "{} is {}px wide, needs {one_line}px on one line",
+                label.text(),
+                label.width()
+            );
+        }
+        window.close();
+    }
+
     #[test]
     fn b5_import_selection_rejects_other_profiles_and_changed_definitions() {
         let server = crate::clients::McpServer {
@@ -1054,7 +1272,7 @@ mod tests {
             url: None,
             env_keys: vec![],
         };
-        let selection = ImportSelection::new("claude:work", &server);
+        let selection = ImportSelection::new("claude:work", &server, "connection:notes");
         let candidate = crate::registry_controller::ClientImportCandidate {
             client_id: "claude:work".into(),
             key: "notes".into(),
@@ -1065,6 +1283,8 @@ mod tests {
             url: None,
             credentials: vec![],
             unsupported: None,
+            source_name: None,
+            connection: "connection:notes".into(),
         };
         assert!(
             selected_imports(std::slice::from_ref(&selection), vec![candidate.clone()]).is_ok()
@@ -1077,17 +1297,138 @@ mod tests {
             url: Some("https://example.test/?token=private-value".into()),
             ..server
         };
-        let shown = ImportSelection::new("claude:work", &secret);
+        let shown = ImportSelection::new("claude:work", &secret, "");
         assert!(!shown.args.join(" ").contains("private-value"));
         assert!(!shown.url.unwrap().contains("private-value"));
+        // A changed definition is another connection.
         let mut changed = candidate.clone();
         changed.args.push("--changed".into());
+        changed.connection = "connection:changed".into();
         assert!(selected_imports(
             std::slice::from_ref(&selection),
             vec![candidate, changed.clone()]
         )
         .is_ok());
-        assert!(selected_imports(&[selection], vec![changed]).is_err());
+        assert!(selected_imports(std::slice::from_ref(&selection), vec![changed.clone()]).is_err());
+        // An unconfirmed server review leaves out is already in Toolport, not changed.
+        let mut unconfirmed = selection;
+        unconfirmed.unconfirmed = Some("Notes".into());
+        assert_eq!(
+            selected_imports(&[unconfirmed], vec![changed]).unwrap(),
+            (Vec::new(), vec!["Notes".to_string()])
+        );
+    }
+    #[test]
+    fn rows_whose_secrets_redact_alike_review_their_own_server() {
+        let twin = |name: &str, token: &str| crate::clients::McpServer {
+            name: name.into(),
+            transport: "http".into(),
+            command: None,
+            args: vec![],
+            url: Some(format!("https://example.test/mcp?token={token}")),
+            env_keys: vec![],
+        };
+        let item =
+            |name: &str, connection: &str| crate::registry_controller::ClientImportCandidate {
+                client_id: "claude-code".into(),
+                key: format!("key-{name}"),
+                name: name.into(),
+                transport: "http".into(),
+                command: None,
+                args: vec![],
+                url: Some("https://example.test/mcp".into()),
+                credentials: vec![],
+                unsupported: None,
+                source_name: None,
+                connection: connection.into(),
+            };
+        let items = vec![
+            item("personal", "connection:a"),
+            item("work", "connection:b"),
+        ];
+        let work = ImportSelection::new("claude-code", &twin("work", "B"), "connection:b");
+        let personal = ImportSelection::new("claude-code", &twin("personal", "A"), "connection:a");
+        let picked = selected_imports(std::slice::from_ref(&work), items.clone())
+            .unwrap()
+            .0;
+        assert_eq!(picked[0].name, "work");
+        let picked = selected_imports(&[personal, work], items).unwrap().0;
+        let keys = picked.iter().map(|i| i.key.as_str()).collect::<Vec<_>>();
+        assert_eq!(keys, ["key-personal", "key-work"]);
+    }
+
+    #[test]
+    fn import_list_uses_backend_candidates_then_servers_already_in_toolport() {
+        let server = |name: &str, command: &str| crate::clients::McpServer {
+            name: name.into(),
+            transport: "stdio".into(),
+            command: Some(command.into()),
+            args: vec![],
+            url: None,
+            env_keys: vec![],
+        };
+        let remote = crate::clients::McpServer {
+            transport: "http".into(),
+            command: None,
+            url: Some("https://api.githubcopilot.com/mcp/".into()),
+            ..server("github", "")
+        };
+        let detected = state::ClientDetailData(
+            state::tests::detected_fixture(
+                vec![
+                    remote.clone(),
+                    server("notes", "notes-mcp"),
+                    server("unconfirmed", "vaulted"),
+                ],
+                vec![server("notes", "notes-mcp"), server("linear", "linear-mcp")],
+            ),
+            vec![
+                (
+                    crate::clients::McpServer {
+                        name: "github (2)".into(),
+                        ..remote
+                    },
+                    false,
+                    "connection:remote".into(),
+                ),
+                (
+                    server("linear", "linear-mcp"),
+                    true,
+                    "connection:linear".into(),
+                ),
+            ],
+            vec![(
+                server("unconfirmed", "vaulted"),
+                false,
+                "connection:unconfirmed".into(),
+            )],
+        );
+        let rows = import_rows(&detected, &["notes".into()]);
+        let shown = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.server.name.as_str(),
+                    row.plugin,
+                    row.imported,
+                    row.unconfirmed,
+                )
+            })
+            .collect::<Vec<_>>();
+        // The remote github is offered despite the name, the plugin keeps its badge,
+        // a server only review can check is listed as such, and notes is listed once
+        // as in Toolport.
+        assert_eq!(
+            shown,
+            [
+                ("github (2)", false, false, false),
+                ("linear", true, false, false),
+                ("unconfirmed", false, false, true),
+                ("notes", false, true, false)
+            ]
+        );
+        assert!(!everything_in_toolport(&rows[2..]));
+        assert!(everything_in_toolport(&rows[3..]));
     }
     fn widgets(root: &gtk::Widget) -> Vec<gtk::Widget> {
         let mut all = vec![root.clone()];
@@ -1119,7 +1460,9 @@ mod tests {
             inherited_discovery: None,
             config_error: false,
             location_removable: true,
+            location_kept_by_t3_code: false,
             claude_profile: None,
+            t3_code: Vec::new(),
         }
     }
     fn snapshot(clients: Vec<state::ClientView>) -> state::ClientSnapshot {
@@ -1137,6 +1480,7 @@ mod tests {
             ],
             sessions: vec![],
             sessions_error: false,
+            t3_others: Vec::new(),
         }
     }
     fn app() -> adw::Application {
@@ -1148,6 +1492,86 @@ mod tests {
         app.register(gtk::gio::Cancellable::NONE).unwrap();
         app
     }
+    /// A T3 Code home T3 Code still lists shows Remove location disabled with why, in its
+    /// row and in its details, instead of hiding it or failing after a click.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_t3_home_t3_code_still_lists_shows_remove_location_disabled_with_why() {
+        let _data = crate::registry::DataDirTestEnv::new("t3-kept-remove");
+        let app = app();
+        let (_, servers, _) = build_content(&app, crate::approval_broker::start_native());
+        let page = ClientPage::new(&app, servers);
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .content(&page.root)
+            .default_width(1024)
+            .default_height(700)
+            .build();
+        let mut kept = fixture_client("codex@t3-0123456789abcdef");
+        kept.location_removable = false;
+        kept.location_kept_by_t3_code = true;
+        page.render(snapshot(vec![kept]));
+        window.present();
+        let reason = crate::i18n::tr(
+            "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.",
+        );
+        let removes = |root: &gtk::Widget| -> Vec<gtk::Button> {
+            widgets(root)
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .filter(|b| b.icon_name().as_deref() == Some("user-trash-symbolic"))
+                .collect()
+        };
+        let row = removes(page.root.upcast_ref());
+        assert_eq!(row.len(), 1, "the row shows Remove location");
+        assert!(!row[0].is_sensitive());
+        assert_eq!(row[0].tooltip_text().as_deref(), Some(reason.as_str()));
+        let open = find_named(
+            page.root.upcast_ref(),
+            "detail-open:codex@t3-0123456789abcdef",
+        )
+        .unwrap()
+        .downcast::<gtk::Button>()
+        .unwrap();
+        open.emit_clicked();
+        let active = page.details.stack.child_by_name("detail").unwrap();
+        let detail = removes(&active);
+        assert_eq!(detail.len(), 1, "the details show Remove location");
+        assert!(!detail[0].is_sensitive());
+        assert_eq!(detail[0].tooltip_text().as_deref(), Some(reason.as_str()));
+        // Screen readers get the name and the reason, and both follow a language change
+        // in the list row and in the details, like the tooltip.
+        let source =
+            "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.";
+        let spoken = |button: &gtk::Button| l10n::accessible_text(button).unwrap();
+        for button in [&row[0], &detail[0]] {
+            assert_eq!(
+                spoken(button),
+                (
+                    "Remove location Claude Code".to_string(),
+                    Some(source.to_string())
+                )
+            );
+        }
+        crate::i18n::set_language("fr").unwrap();
+        l10n::refresh_bindings();
+        let french = crate::i18n::tr(
+            "T3 Code still uses this folder. Remove it from T3 Code's provider settings first.",
+        );
+        assert_ne!(french, source, "the reason has a French translation");
+        for button in [&row[0], &detail[0]] {
+            assert_eq!(button.tooltip_text().as_deref(), Some(french.as_str()));
+            assert_eq!(spoken(button).1.as_deref(), Some(french.as_str()));
+            assert_eq!(
+                spoken(button).0,
+                crate::i18n::trf("Remove location {value0}", &[("value0", "Claude Code")])
+            );
+        }
+        crate::i18n::set_language("en").unwrap();
+        l10n::refresh_bindings();
+        window.close();
+    }
+
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn b5_clients_keep_exact_instance_refresh_and_safe_error_states() {
@@ -1199,11 +1623,21 @@ mod tests {
         );
         let active = page.details.stack.child_by_name("detail").unwrap();
         let controls = widgets(&active);
-        assert!(controls
+        let connect = controls
             .iter()
             .filter_map(|w| w.downcast_ref::<gtk::Button>())
             .find(|b| b.label().as_deref() == Some("Connect to Toolport"))
-            .is_some_and(|b| !b.is_sensitive()));
+            .unwrap();
+        assert!(!connect.is_sensitive());
+        // The access controls wrap rather than needing all of their width on one line.
+        let row = connect.parent().unwrap();
+        let mut needed = 0;
+        let mut child = row.first_child();
+        while let Some(widget) = child {
+            needed += widget.measure(gtk::Orientation::Horizontal, -1).0;
+            child = widget.next_sibling();
+        }
+        assert!(row.measure(gtk::Orientation::Horizontal, -1).0 < needed);
         assert!(controls
             .iter()
             .filter_map(|w| w.downcast_ref::<gtk::DropDown>())
@@ -1282,6 +1716,7 @@ mod tests {
             url: None,
             cwd: Some("/fixture/work".into()),
             inherit_env: false,
+            hide_prompts: false,
             secret_keys: vec!["API_KEY".into()],
             plain_env: vec![],
             secret_references: Default::default(),
@@ -1366,15 +1801,41 @@ mod tests {
         assert!(page.details.selected.borrow().is_none());
         window.close();
     }
+    /// The mock MCP server this test probes: `TOOLPORT_MOCK_BIN`, else the one Cargo
+    /// built in a folder above this test binary (`--features test-support --bin
+    /// mock-mcp-server`), else `~/bin/mock-mcp-server` as an omabox copy has it.
+    fn mock_mcp_server() -> String {
+        let built = std::env::current_exe()
+            .ok()
+            .map(|exe| {
+                exe.ancestors()
+                    .skip(1)
+                    .map(|dir| dir.join("mock-mcp-server"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let home = std::env::var_os("HOME")
+            .map(|home| std::path::Path::new(&home).join("bin/mock-mcp-server"));
+        std::env::var_os("TOOLPORT_MOCK_BIN")
+            .map(std::path::PathBuf::from)
+            .into_iter()
+            .chain(built)
+            .chain(home)
+            .find(|path| path.is_file())
+            .expect("build mock-mcp-server with --features test-support or set TOOLPORT_MOCK_BIN")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
-    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    #[ignore = "requires an isolated GTK desktop and mock-mcp-server"]
     fn b5_credential_save_reprobes_unchanged_detail_without_refresh() {
         let _data = crate::registry::DataDirTestEnv::new("b5-credential-refresh");
         let app = app();
         let registry = crate::registry::update(|registry| {
             registry.servers = vec![serde_json::from_value(serde_json::json!({
                 "id": "b5-credential", "name": "Credential fixture", "transport": "stdio",
-                "command": "/home/sbx/bin/mock-mcp-server", "args": [], "env": [], "enabled": true
+                "command": mock_mcp_server(), "args": [], "env": [], "enabled": true
             }))
             .unwrap()];
             Ok(())
@@ -1395,6 +1856,7 @@ mod tests {
             auth_required: false,
             failure: None,
             auth_target: None,
+            keyring_locked: false,
         };
         let now = std::time::Instant::now();
         let ticket = page
@@ -1416,16 +1878,7 @@ mod tests {
                 .filter_map(|w| w.downcast_ref::<gtk::Label>())
                 .any(|l| l.text() == "Old credential failure")
         );
-        let editor = adw::Window::new();
-        finish_credential_update(
-            Ok(Ok(registry)),
-            "b5-credential",
-            &page,
-            &editor,
-            &gtk::Label::new(None),
-            &gtk::Button::new(),
-            "Updated",
-        );
+        finish_credential_update(Ok(Ok(registry)), "b5-credential", &page).unwrap();
         assert!(
             page.health.borrow().is_checking("b5-credential"),
             "credential completion schedules a probe even with an identical registry"
@@ -1578,6 +2031,97 @@ mod tests {
 
     #[test]
     #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn a_t3_code_home_row_keeps_its_label_and_recovery_cards() {
+        let _data = crate::registry::DataDirTestEnv::new("t3-home-recovery");
+        let app = app();
+        let (_, servers, _) = build_content(&app, crate::approval_broker::start_native());
+        let page = ClientPage::new(&app, servers);
+        let window = adw::ApplicationWindow::builder()
+            .application(&app)
+            .content(&page.root)
+            .default_width(1024)
+            .default_height(700)
+            .build();
+        let id = "codex@t3-0123456789abcdef";
+        let mut home = fixture_client(id);
+        home.name = "Codex (~/.t3/cx/codex)".into();
+        home.t3_code = vec![crate::clients::T3CodeUse {
+            instance_id: "cx".into(),
+            display_name: "Codex Extra".into(),
+            enabled: false,
+        }];
+        let record = |rid: &str, message: &str, error: Option<&str>| {
+            crate::clients::recovery::ClientRecovery {
+                id: rid.into(),
+                client_id: id.into(),
+                client_name: home.name.clone(),
+                path: "/fixture/.t3/cx/codex/config.toml".into(),
+                backup_path: "/fixture/original.toml".into(),
+                missing: Vec::new(),
+                dismissed: false,
+                message: message.into(),
+                description: message.into(),
+                value_lines: vec!["API_KEY for server-a".into()],
+                discard_values: vec!["• API_KEY for server-a".into()],
+                error: error.map(Into::into),
+                can_discard: error.is_none(),
+                can_discard_file: error.is_some(),
+                can_retry: error.is_none(),
+                discard_started: false,
+                discard_action: "Discard these saved values".into(),
+                cleanup: false,
+                instructions: "Unlock your keyring, then choose Retry.".into(),
+                retention: "The recovery backup does not expire automatically.".into(),
+                details: "fixture".into(),
+            }
+        };
+        page.render(snapshot(vec![home.clone()]));
+        // Set after render, which reloads the (empty) recoveries from the data folder.
+        page.recoveries.borrow_mut().extend([
+            record("owed", "Codex (~/.t3/cx/codex) is disconnected.", None),
+            record(
+                "receipt",
+                "Toolport can't read the recovery receipt for Codex (~/.t3/cx/codex).",
+                Some("The receipt cannot be parsed."),
+            ),
+        ]);
+        page.append_recoveries(&page.recovery_box, None);
+        window.present();
+        let labels = |root: &gtk::Widget| -> Vec<String> {
+            widgets(root)
+                .iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Label>().map(|l| l.text().to_string()))
+                .collect()
+        };
+        let list = page.details.stack.child_by_name("list").unwrap();
+        assert!(
+            labels(&list)
+                .iter()
+                .any(|text| text == "Used by T3 Code: Codex Extra (off)"),
+            "the T3 Code home row keeps its label"
+        );
+        for rid in ["owed", "receipt"] {
+            assert!(
+                widgets(page.recovery_box.upcast_ref())
+                    .iter()
+                    .any(|w| w.widget_name() == format!("client-recovery:{rid}")),
+                "the page shows the {rid} card"
+            );
+        }
+        client(&home, &page);
+        let detail = page.details.stack.child_by_name("detail").unwrap();
+        for rid in ["owed", "receipt"] {
+            assert!(
+                widgets(&detail)
+                    .iter()
+                    .any(|w| w.widget_name() == format!("client-recovery:{rid}")),
+                "the T3 Code home's detail shows the {rid} card"
+            );
+        }
+        window.close();
+    }
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
     fn b5_same_detail_refresh_preserves_external_focus() {
         let _data = crate::registry::DataDirTestEnv::new("b5-external-focus");
         let app = app();
@@ -1647,18 +2191,27 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(dropdowns.len(), 2);
         dropdowns[1].set_selected(3);
+        // Poll the saved file without `registry::load()`. A full load takes the
+        // exclusive registry lock, and while the fixture registry is still absent it
+        // holds that lock through the rename-window read retries (about 225 ms).
+        // Polling it back to back starved the handler's write of the lock for
+        // seconds, which is what made this test flaky.
+        let saved_mode = || {
+            let path = crate::registry::registry_path()?;
+            let contents = std::fs::read_to_string(path).ok()?;
+            crate::registry::parse_registry_contents(&contents)
+                .ok()?
+                .client_discovery
+                .get("codex@work")
+                .cloned()
+        };
         let context = gtk::glib::MainContext::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             while context.pending() {
                 context.iteration(false);
             }
-            if crate::registry::load()
-                .unwrap()
-                .client_discovery
-                .get("codex@work")
-                .is_some_and(|mode| mode == "full")
-            {
+            if saved_mode().as_deref() == Some("full") {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1697,6 +2250,7 @@ mod tests {
         let app = app();
         let (_, servers, _) = build_content(&app, crate::approval_broker::start_native());
         let page = ClientPage::new(&app, servers);
+        *page.details.selected.borrow_mut() = Some("codex@work".into());
         let mut selected = fixture_client("codex@work");
         selected.discovery_mode = Some("lazy".into());
         let mode = discovery_picker(&selected, &page, reject);
@@ -1744,6 +2298,44 @@ mod tests {
             std::fs::read(crate::registry::registry_path().unwrap()).unwrap(),
             before
         );
+    }
+
+    /// A discovery result that arrives after its client's page closed shows nothing: it
+    /// would otherwise replace the open client's notice and its list reminder.
+    #[test]
+    #[ignore = "requires an isolated GTK desktop; run in omabox"]
+    fn late_discovery_feedback_leaves_another_clients_notice() {
+        fn reject(_: &str, _: Option<&str>) -> Result<crate::registry::Registry, String> {
+            Err("Synthetic late discovery error".into())
+        }
+        let _data = crate::registry::DataDirTestEnv::new("late-discovery-feedback");
+        let app = app();
+        let (_, servers, _) = build_content(&app, crate::approval_broker::start_native());
+        let page = ClientPage::new(&app, servers);
+        let mode = discovery_picker(&fixture_client("codex@work"), &page, reject);
+        // The user has gone on to Cursor, which has a restart reminder.
+        *page.details.selected.borrow_mut() = Some("cursor".into());
+        let reminder = (
+            "cursor".to_string(),
+            "Not live yet".to_string(),
+            "Restart Cursor so it loads Toolport.".to_string(),
+        );
+        page.set_detail_notice(reminder.clone());
+        page.show_list_notice(&reminder.0, &reminder.1, &reminder.2);
+        mode.set_selected(3);
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !mode.is_sensitive() && std::time::Instant::now() < deadline {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(mode.is_sensitive());
+        assert_eq!(page.detail_notice.borrow().clone(), Some(reminder.clone()));
+        assert_eq!(page.list_notice_of.borrow().clone(), Some(reminder));
+        assert!(page.list_notice.is_visible());
+        assert_ne!(page.feedback.text(), "Synthetic late discovery error");
     }
 
     #[test]
@@ -1979,38 +2571,50 @@ mod tests {
             selected.location_removable = false;
             selected.scope_id = Some("scope-work".into());
             selected.scope_name = Some("Work projects with a deliberately long access name".into());
-            selected.detected = Some(state::ClientDetailData(crate::clients::DetectedClient {
-                id: id.into(),
-                name: name.into(),
-                config_path: format!("/home/sbx/{id}/config.json"),
-                app_present: selected.app_present,
-                config_exists: selected.config_exists,
-                uses_connectors: false,
-                location_removable: false,
-                discovery: crate::clients::discovery_capabilities(id),
-                servers: vec![crate::clients::McpServer {
-                    name: "Local notes".into(),
-                    transport: "stdio".into(),
-                    command: Some("notes-mcp".into()),
-                    args: vec![],
-                    env_keys: vec![],
-                    url: None,
-                }],
-                plugin_servers: vec![],
-                gateway_installed: selected.gateway_state
-                    != state::ClientGatewayState::Disconnected,
-                entry_state: if view == "client-customized" {
-                    crate::clients::GatewayEntryState::Customized
-                } else if selected.gateway_state == state::ClientGatewayState::Connected {
-                    crate::clients::GatewayEntryState::Managed
-                } else {
-                    crate::clients::GatewayEntryState::Absent
+            selected.detected = Some(state::ClientDetailData::new(
+                crate::clients::DetectedClient {
+                    id: id.into(),
+                    name: name.into(),
+                    config_path: format!("/home/sbx/{id}/config.json"),
+                    app_present: selected.app_present,
+                    config_exists: selected.config_exists,
+                    uses_connectors: false,
+                    location_removable: false,
+                    location_kept_by_t3_code: false,
+                    discovery: crate::clients::discovery_capabilities(id),
+                    servers: vec![crate::clients::McpServer {
+                        name: "Local notes".into(),
+                        transport: "stdio".into(),
+                        command: Some("notes-mcp".into()),
+                        args: vec![],
+                        env_keys: vec![],
+                        url: None,
+                    }],
+                    plugin_servers: vec![],
+                    gateway_installed: selected.gateway_state
+                        != state::ClientGatewayState::Disconnected,
+                    entry_state: if view == "client-customized" {
+                        crate::clients::GatewayEntryState::Customized
+                    } else if selected.gateway_state == state::ClientGatewayState::Connected {
+                        crate::clients::GatewayEntryState::Managed
+                    } else {
+                        crate::clients::GatewayEntryState::Absent
+                    },
+                    error: selected
+                        .config_error
+                        .then(|| "Synthetic unreadable config".into()),
+                    claude_profile: None,
+                    t3_code: Vec::new(),
                 },
-                error: selected
-                    .config_error
-                    .then(|| "Synthetic unreadable config".into()),
-                claude_profile: None,
-            }));
+            ));
+            if let Some(detected) = selected.detected.as_mut() {
+                detected.1 = detected
+                    .0
+                    .servers
+                    .iter()
+                    .map(|s| (s.clone(), false, String::new()))
+                    .collect();
+            }
             clients.render(snapshot(vec![selected.clone()]));
             stack.set_visible_child_name("clients");
             for widget in widgets(sidebar.upcast_ref()) {

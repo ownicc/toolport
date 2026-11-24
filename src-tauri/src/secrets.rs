@@ -338,11 +338,32 @@ mod platform {
     }
 
     pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
-        dpk::get(&account(server_id, key))
+        #[cfg(test)]
+        crate::secrets::tests::record_vault_read(server_id, key);
+        read_secret(server_id, key).map_err(super::ReadFailure::into_message)
+    }
+
+    /// [`get_secret_result`] with the kind of failure: an item whose data is
+    /// not text is damaged; every keychain status is the store's.
+    pub fn read_secret(server_id: &str, key: &str) -> Result<Option<String>, super::ReadFailure> {
+        dpk::get_kinded(&account(server_id, key))
     }
 
     pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
         dpk::delete(&account(server_id, key))
+    }
+
+    pub fn get_backup_secret_status(
+        server_id: &str,
+        key: &str,
+    ) -> Result<Option<String>, super::BackupSecretError> {
+        dpk::get_backup(&account(server_id, key))
+    }
+    pub fn delete_backup_secret_status(
+        server_id: &str,
+        key: &str,
+    ) -> Result<(), super::BackupSecretError> {
+        dpk::delete_backup(&account(server_id, key))
     }
 
     /// Raw `SecItem*` FFI bound to the **data-protection keychain** with the
@@ -384,6 +405,8 @@ mod platform {
             static kSecAttrAccessible: CFTypeRef;
             static kSecAttrAccessibleAfterFirstUnlock: CFTypeRef;
             static kSecUseDataProtectionKeychain: CFTypeRef;
+            static kSecUseAuthenticationUI: CFTypeRef;
+            static kSecUseAuthenticationUIFail: CFTypeRef;
             static kSecReturnData: CFTypeRef;
             static kSecMatchLimit: CFTypeRef;
             static kSecMatchLimitOne: CFTypeRef;
@@ -468,7 +491,34 @@ mod platform {
         /// `kSecMatchLimit=kSecMatchLimitOne`. `errSecItemNotFound` (-25300) maps
         /// to `Ok(None)`; the returned CFData is decoded to a `String`.
         pub fn get(account_str: &str) -> Result<Option<String>, String> {
+            get_inner(account_str, false).map_err(|e| e.to_string())
+        }
+        pub fn get_kinded(
+            account_str: &str,
+        ) -> Result<Option<String>, crate::secrets::ReadFailure> {
+            get_inner(account_str, false).map_err(|e| match e {
+                crate::secrets::BackupSecretError::Corrupt => {
+                    crate::secrets::ReadFailure::Damaged(e.to_string())
+                }
+                _ => crate::secrets::ReadFailure::Unavailable(e.to_string()),
+            })
+        }
+        pub fn get_backup(
+            account_str: &str,
+        ) -> Result<Option<String>, crate::secrets::BackupSecretError> {
+            get_inner(account_str, true)
+        }
+        fn get_inner(
+            account_str: &str,
+            noninteractive: bool,
+        ) -> Result<Option<String>, crate::secrets::BackupSecretError> {
             let mut pairs = base_query(account_str);
+            if noninteractive {
+                pairs.push((
+                    k(unsafe { kSecUseAuthenticationUI }),
+                    k(unsafe { kSecUseAuthenticationUIFail }),
+                ));
+            }
             pairs.push((
                 k(unsafe { kSecReturnData }),
                 CFBoolean::true_value().as_CFType(),
@@ -487,9 +537,7 @@ mod platform {
                 return Ok(None);
             }
             if st != 0 {
-                return Err(format!(
-                    "SecItemCopyMatching (data-protection keychain) failed: {st}"
-                ));
+                return Err(crate::secrets::BackupSecretError::macos(st));
             }
             if result.is_null() {
                 return Ok(None);
@@ -500,20 +548,34 @@ mod platform {
             let data = unsafe { CFData::wrap_under_create_rule(result as _) };
             String::from_utf8(data.bytes().to_vec())
                 .map(Some)
-                .map_err(|e| e.to_string())
+                .map_err(|_| crate::secrets::BackupSecretError::Corrupt)
         }
 
         /// `SecItemDelete` against the data-protection keychain.
         /// `errSecItemNotFound` maps to `Ok(())`.
         pub fn delete(account_str: &str) -> Result<(), String> {
-            let query = CFDictionary::from_CFType_pairs(&base_query(account_str));
+            delete_inner(account_str, false).map_err(|e| e.to_string())
+        }
+        pub fn delete_backup(account_str: &str) -> Result<(), crate::secrets::BackupSecretError> {
+            delete_inner(account_str, true)
+        }
+        fn delete_inner(
+            account_str: &str,
+            noninteractive: bool,
+        ) -> Result<(), crate::secrets::BackupSecretError> {
+            let mut pairs = base_query(account_str);
+            if noninteractive {
+                pairs.push((
+                    k(unsafe { kSecUseAuthenticationUI }),
+                    k(unsafe { kSecUseAuthenticationUIFail }),
+                ));
+            }
+            let query = CFDictionary::from_CFType_pairs(&pairs);
             let st = unsafe { SecItemDelete(query.as_concrete_TypeRef() as *const c_void) };
             if st == 0 || st == ERR_SEC_ITEM_NOT_FOUND {
                 Ok(())
             } else {
-                Err(format!(
-                    "SecItemDelete (data-protection keychain) failed: {st}"
-                ))
+                Err(crate::secrets::BackupSecretError::macos(st))
             }
         }
     }
@@ -727,6 +789,121 @@ mod platform {
     /// so the serialization has to be explicit now.
     static SERVICE_LOCK: Mutex<()> = Mutex::new(());
 
+    const BACKUP_BATCH_TIMEOUT: Duration = Duration::from_secs(15);
+    struct BackupBatch {
+        deadline: std::time::Instant,
+        service: Option<std::rc::Rc<dbus_secret_service::SecretService>>,
+        failure: Option<super::BackupSecretError>,
+        reads: std::collections::HashMap<String, Result<Option<String>, super::BackupSecretError>>,
+        #[cfg(test)]
+        connection_attempts: usize,
+    }
+    thread_local! {
+        static BACKUP_BATCH: std::cell::RefCell<Option<BackupBatch>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn with_backup_batch<T>(f: impl FnOnce() -> T) -> T {
+        if BACKUP_BATCH.with(|slot| slot.borrow().is_some()) {
+            return f();
+        }
+        BACKUP_BATCH.with(|slot| {
+            *slot.borrow_mut() = Some(BackupBatch {
+                deadline: std::time::Instant::now() + BACKUP_BATCH_TIMEOUT,
+                service: None,
+                failure: None,
+                reads: Default::default(),
+                #[cfg(test)]
+                connection_attempts: 0,
+            })
+        });
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                BACKUP_BATCH.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let _clear = Clear;
+        f()
+    }
+
+    fn invalidate_backup_read(server_id: &str, key: &str) {
+        BACKUP_BATCH.with(|slot| {
+            if let Some(batch) = slot.borrow_mut().as_mut() {
+                batch.reads.remove(&account(server_id, key));
+            }
+        });
+    }
+
+    fn backup_deadline() -> Result<std::time::Instant, super::BackupSecretError> {
+        let deadline = BACKUP_BATCH
+            .with(|slot| slot.borrow().as_ref().map(|batch| batch.deadline))
+            .ok_or(super::BackupSecretError::Unavailable)?;
+        if std::time::Instant::now() >= deadline {
+            return Err(super::BackupSecretError::Unavailable);
+        }
+        Ok(deadline)
+    }
+
+    /// Reuse one encrypted session for a bounded recovery operation. Retain the
+    /// existing process/file serialization, but never queue behind an unrelated
+    /// unlock prompt indefinitely. No operation in this path invokes Unlock.
+    fn with_backup_service<T>(
+        op: impl FnOnce(&dbus_secret_service::SecretService) -> Result<T, super::BackupSecretError>,
+    ) -> Result<T, super::BackupSecretError> {
+        use super::BackupSecretError as State;
+        let deadline = backup_deadline()?;
+        let _serialized = loop {
+            match SERVICE_LOCK.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    backup_deadline()?;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        };
+        let dir = crate::registry::conduit_dir().ok_or(State::Unavailable)?;
+        let _across_processes = crate::registry::lock_at_for(
+            &dir.join("secret-service"),
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(LOCK_TIMEOUT),
+        )
+        .map_err(|_| State::Unavailable)?;
+        backup_deadline()?;
+        let service = BACKUP_BATCH.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let batch = slot.as_mut().ok_or(State::Unavailable)?;
+            if let Some(failure) = batch.failure {
+                return Err(failure);
+            }
+            if let Some(service) = &batch.service {
+                return Ok(service.clone());
+            }
+            #[cfg(test)]
+            {
+                batch.connection_attempts += 1;
+            }
+            match dbus_secret_service::SecretService::connect_with_max_prompt_timeout(
+                dbus_secret_service::EncryptionType::Dh,
+                0,
+            ) {
+                Ok(service) => {
+                    let service = std::rc::Rc::new(service);
+                    batch.service = Some(service.clone());
+                    Ok(service)
+                }
+                Err(error) => {
+                    let state = classify(&error);
+                    batch.failure = Some(state);
+                    Err(state)
+                }
+            }
+        })?;
+        backup_deadline()?;
+        op(&service)
+    }
+
     /// Base wait before the single retry in `with_service`. systemd brings the
     /// daemon back within ~1s of an abort, so one pause slightly longer than that
     /// turns a crash into a recovered operation.
@@ -755,8 +932,32 @@ mod platform {
     /// after the crash this module guards against, so treating it as transient
     /// would tax every later vault read with a pointless sleep and could raise a
     /// second unlock prompt. `NoEntry` is likewise an answer, not a failure.
+    ///
+    /// One `PlatformFailure` is an answer too: a write to a collection that is
+    /// still locked, see [`is_locked_collection`].
     fn is_transient(err: &keyring::Error) -> bool {
-        matches!(err, keyring::Error::PlatformFailure(_))
+        matches!(err, keyring::Error::PlatformFailure(_)) && !is_locked_collection(err)
+    }
+
+    /// The Secret Service's own error for a call on a locked collection or item.
+    const IS_LOCKED: &str = "org.freedesktop.Secret.Error.IsLocked";
+
+    /// True when a write failed because the collection is still locked.
+    ///
+    /// keyring 3.6.3's `set_password` asks to unlock the collection; when that ask
+    /// is dismissed it falls back to `create_collection` and then `create_item`,
+    /// which the service refuses with `IsLocked`. keyring passes that on as a
+    /// `PlatformFailure` wrapping `dbus_secret_service::Error::Dbus`, not as
+    /// `NoStorageAccess`. Matched by the D-Bus error name, never by its text.
+    /// Retrying it asks to unlock a second time and cannot succeed.
+    fn is_locked_collection(err: &keyring::Error) -> bool {
+        let keyring::Error::PlatformFailure(inner) = err else {
+            return false;
+        };
+        matches!(
+            inner.downcast_ref::<dbus_secret_service::Error>(),
+            Some(dbus_secret_service::Error::Dbus(error)) if error.name() == Some(IS_LOCKED)
+        )
     }
 
     /// Cross-process serialization for Secret Service access.
@@ -846,7 +1047,7 @@ mod platform {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _across_processes = cross_process_guard();
-        match op() {
+        let result = match op() {
             Err(e) if is_transient(&e) => {
                 // Say so. Otherwise the only evidence that SBS-815 recovery ran
                 // is a 1.2-1.7s stall, and a vault failure that persists past the
@@ -861,23 +1062,342 @@ mod platform {
                 retried
             }
             other => other,
+        };
+        // Locked, or its unlock dialog dismissed: this call asked and was refused.
+        if matches!(result, Err(keyring::Error::NoStorageAccess(_)))
+            || result.as_ref().err().is_some_and(is_locked_collection)
+        {
+            super::note_refused_ask();
         }
+        result
     }
 
     pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+        invalidate_backup_read(server_id, key);
         with_service(|| Entry::new(SERVICE, &account(server_id, key))?.set_password(value))
             .map_err(|e| e.to_string())
     }
 
     pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
-        match with_service(|| Entry::new(SERVICE, &account(server_id, key))?.get_password()) {
+        #[cfg(test)]
+        crate::secrets::tests::record_vault_read(server_id, key);
+        read_secret(server_id, key).map_err(super::ReadFailure::into_message)
+    }
+
+    /// [`get_secret_result`] with the kind of failure.
+    pub fn read_secret(server_id: &str, key: &str) -> Result<Option<String>, super::ReadFailure> {
+        read_kinded(with_service(|| {
+            Entry::new(SERVICE, &account(server_id, key))?.get_password()
+        }))
+    }
+
+    /// An item whose secret is not text is damaged; a locked, missing or
+    /// failing service, or more than one match, is the store's state.
+    pub(super) fn read_kinded(
+        read: Result<String, keyring::Error>,
+    ) -> Result<Option<String>, super::ReadFailure> {
+        match read {
             Ok(v) => Ok(Some(v)),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(e.to_string()),
+            Err(e @ keyring::Error::BadEncoding(_)) => {
+                Err(super::ReadFailure::Damaged(e.to_string()))
+            }
+            Err(e) => Err(super::ReadFailure::Unavailable(e.to_string())),
         }
     }
 
+    /// How long a check of its own waits for another keyring operation before
+    /// it answers "unknown".
+    const STORE_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Whether a read could ask to unlock, by one search that never unlocks.
+    /// Only a search that finds no locked Toolport item, or no Secret Service
+    /// to connect to (a read cannot prompt either), says no. Unknown (another
+    /// keyring operation holds the store, a timeout, a failed search) says
+    /// yes: background work waits rather than risk a prompt.
+    pub fn store_would_prompt() -> bool {
+        would_prompt(false)
+    }
+
+    /// [`store_would_prompt`] for a write: a new item goes into the default
+    /// collection, and writing to a locked (or missing) one asks too, even
+    /// with no Toolport item in the store.
+    pub fn write_would_prompt() -> bool {
+        would_prompt(true)
+    }
+
+    fn would_prompt(write: bool) -> bool {
+        let search = || {
+            let found = with_backup_service(|service| {
+                super::would_prompt_by(
+                    write,
+                    || match service.get_default_collection() {
+                        Ok(collection) => collection
+                            .is_locked()
+                            .map(Some)
+                            .map_err(|error| classify(&error)),
+                        Err(dbus_secret_service::Error::NoResult) => Ok(None),
+                        Err(error) => Err(classify(&error)),
+                    },
+                    || {
+                        service
+                            .search_items(std::collections::HashMap::from([("service", SERVICE)]))
+                            .map(|found| !found.locked.is_empty())
+                            .map_err(|error| classify(&error))
+                    },
+                )
+            });
+            let no_service = || {
+                BACKUP_BATCH.with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .is_some_and(|batch| batch.service.is_none() && batch.failure.is_some())
+                })
+            };
+            match found {
+                Ok(locked) => locked,
+                Err(_) if no_service() => false,
+                Err(_) => true,
+            }
+        };
+        if BACKUP_BATCH.with(|slot| slot.borrow().is_some()) {
+            search()
+        } else {
+            with_backup_batch(|| {
+                BACKUP_BATCH.with(|slot| {
+                    if let Some(batch) = slot.borrow_mut().as_mut() {
+                        batch.deadline = batch
+                            .deadline
+                            .min(std::time::Instant::now() + STORE_CHECK_TIMEOUT);
+                    }
+                });
+                search()
+            })
+        }
+    }
+
+    /// Owners with a locked Toolport value in any collection, never asking.
+    /// The default collection open: the one search, as before. Locked (where
+    /// KeePassXC answers a search with its dialog): property reads of the
+    /// locked collections' items only. `None`: unknown (busy, timed out, a
+    /// failed read); the next probe round checks again.
+    pub fn owners_with_locked_values() -> Option<std::collections::HashSet<String>> {
+        let read = || {
+            let found = with_backup_service(|service| {
+                let failed = |error: dbus_secret_service::Error| classify(&error);
+                let owner_of = |item: &dbus_secret_service::Item| {
+                    item.get_attributes().map_err(failed).map(|attributes| {
+                        (attributes.get("service").map(String::as_str) == Some(SERVICE))
+                            .then(|| attributes.get("username").cloned())
+                            .flatten()
+                    })
+                };
+                super::owners_with_locked_by(
+                    || match service.get_default_collection() {
+                        Ok(collection) => collection.is_locked().map(Some).map_err(failed),
+                        Err(dbus_secret_service::Error::NoResult) => Ok(None),
+                        Err(error) => Err(failed(error)),
+                    },
+                    || {
+                        let found = service
+                            .search_items(std::collections::HashMap::from([("service", SERVICE)]))
+                            .map_err(failed)?;
+                        found.locked.iter().map(owner_of).collect()
+                    },
+                    || {
+                        let collections = service.get_all_collections().map_err(failed)?;
+                        super::accounts_in_locked(
+                            &collections,
+                            |collection| collection.is_locked().map_err(failed),
+                            |collection| {
+                                collection
+                                    .get_all_items()
+                                    .map_err(failed)?
+                                    .iter()
+                                    .map(owner_of)
+                                    .collect()
+                            },
+                        )
+                    },
+                )
+            });
+            let no_service = BACKUP_BATCH.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .is_some_and(|batch| batch.service.is_none() && batch.failure.is_some())
+            });
+            match found {
+                Ok(owners) => Some(owners),
+                // Nothing to read from, so nothing to ask for either.
+                Err(_) if no_service => Some(Default::default()),
+                Err(_) => None,
+            }
+        };
+        if BACKUP_BATCH.with(|slot| slot.borrow().is_some()) {
+            read()
+        } else {
+            with_backup_batch(|| {
+                BACKUP_BATCH.with(|slot| {
+                    if let Some(batch) = slot.borrow_mut().as_mut() {
+                        batch.deadline = batch
+                            .deadline
+                            .min(std::time::Instant::now() + STORE_CHECK_TIMEOUT);
+                    }
+                });
+                read()
+            })
+        }
+    }
+
+    fn read_backup_item<T>(
+        unlocked: usize,
+        locked: usize,
+        read: impl FnOnce() -> Result<T, keyring::Error>,
+    ) -> Result<Option<T>, keyring::Error> {
+        if locked > 0 || unlocked > 1 {
+            return Err(keyring::Error::NoStorageAccess(Box::new(
+                if locked + unlocked > 1 {
+                    super::BackupSecretError::Ambiguous
+                } else {
+                    super::BackupSecretError::Locked
+                },
+            )));
+        }
+        if unlocked == 0 {
+            return Ok(None);
+        }
+        read().map(Some)
+    }
+
+    /// Recovery must not wait for a desktop unlock prompt. Search classifies
+    /// locked items without unlocking them; GetSecret also fails if an item is
+    /// locked between the search and read. Neither call requests Unlock.
+    fn classify(error: &dbus_secret_service::Error) -> super::BackupSecretError {
+        use super::BackupSecretError as State;
+        match error {
+            dbus_secret_service::Error::Locked => State::Locked,
+            dbus_secret_service::Error::Prompt => State::Cancelled,
+            dbus_secret_service::Error::Crypto(_)
+            | dbus_secret_service::Error::Parse
+            | dbus_secret_service::Error::UnsupportedSecretFormat => State::Corrupt,
+            dbus_secret_service::Error::Dbus(error) if error.name() == Some(IS_LOCKED) => {
+                State::Locked
+            }
+            dbus_secret_service::Error::Dbus(error)
+                if error.name() == Some("org.freedesktop.DBus.Error.AccessDenied") =>
+            {
+                State::AccessDenied
+            }
+            _ => State::Unavailable,
+        }
+    }
+    fn backup_keyring_error(error: keyring::Error) -> super::BackupSecretError {
+        use super::BackupSecretError as State;
+        match error {
+            keyring::Error::PlatformFailure(e) | keyring::Error::NoStorageAccess(e) => e
+                .downcast_ref::<State>()
+                .copied()
+                .or_else(|| e.downcast_ref::<dbus_secret_service::Error>().map(classify))
+                .unwrap_or(State::Unavailable),
+            keyring::Error::BadEncoding(_) => State::Corrupt,
+            _ => State::Unavailable,
+        }
+    }
+    pub fn get_backup_secret_status(
+        server_id: &str,
+        key: &str,
+    ) -> Result<Option<String>, super::BackupSecretError> {
+        use super::BackupSecretError as State;
+        if !BACKUP_BATCH.with(|slot| slot.borrow().is_some()) {
+            return with_backup_batch(|| get_backup_secret_status(server_id, key));
+        }
+        let account = account(server_id, key);
+        if let Some(cached) = BACKUP_BATCH.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|batch| batch.reads.get(&account).cloned())
+        }) {
+            return cached;
+        }
+        let result = with_backup_service(|service| {
+            let entries = service
+                .search_items(std::collections::HashMap::from([
+                    ("service", SERVICE),
+                    ("username", account.as_str()),
+                ]))
+                .map_err(|error| classify(&error))?;
+            if entries.unlocked.len() + entries.locked.len() > 1 {
+                return Err(State::Ambiguous);
+            }
+            if !entries.locked.is_empty() {
+                return Err(State::Locked);
+            }
+            let Some(item) = entries.unlocked.first() else {
+                return Ok(None);
+            };
+            backup_deadline()?;
+            let bytes = item.get_secret().map_err(|error| classify(&error))?;
+            String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| State::Corrupt)
+        });
+        BACKUP_BATCH.with(|slot| {
+            if let Some(batch) = slot.borrow_mut().as_mut() {
+                batch.reads.insert(account, result.clone());
+            }
+        });
+        result
+    }
+
+    /// Never prompt, even if an item locks between SearchItems and Delete.
+    pub fn delete_backup_secret_status(
+        server_id: &str,
+        key: &str,
+        discard_all: bool,
+    ) -> Result<(), super::BackupSecretError> {
+        use super::BackupSecretError as State;
+        if !BACKUP_BATCH.with(|slot| slot.borrow().is_some()) {
+            return with_backup_batch(|| delete_backup_secret_status(server_id, key, discard_all));
+        }
+        let account = account(server_id, key);
+        // A failed partial deletion must not leave a cached credential behind.
+        BACKUP_BATCH.with(|slot| {
+            if let Some(batch) = slot.borrow_mut().as_mut() {
+                batch.reads.remove(&account);
+            }
+        });
+        with_backup_service(|service| {
+            let entries = service
+                .search_items(std::collections::HashMap::from([
+                    ("service", SERVICE),
+                    ("username", account.as_str()),
+                ]))
+                .map_err(|error| classify(&error))?;
+            if discard_all {
+                if !entries.locked.is_empty() {
+                    return Err(State::Locked);
+                }
+                for item in entries.unlocked {
+                    backup_deadline()?;
+                    item.delete().map_err(|error| classify(&error))?;
+                }
+                Ok(())
+            } else {
+                read_backup_item(entries.unlocked.len(), entries.locked.len(), || {
+                    backup_deadline()
+                        .map_err(|state| keyring::Error::NoStorageAccess(Box::new(state)))?;
+                    entries.unlocked[0].delete().map_err(|error| {
+                        keyring::Error::PlatformFailure(Box::new(classify(&error)))
+                    })
+                })
+                .map(|_| ())
+                .map_err(backup_keyring_error)
+            }
+        })
+    }
+
     pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
+        invalidate_backup_read(server_id, key);
         match with_service(|| Entry::new(SERVICE, &account(server_id, key))?.delete_credential()) {
             Ok(()) => Ok(()),
             Err(keyring::Error::NoEntry) => Ok(()),
@@ -888,7 +1408,215 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn backup_batch_cache_is_scoped_and_cleared_even_after_panic() {
+            with_backup_batch(|| {
+                BACKUP_BATCH.with(|slot| {
+                    slot.borrow_mut()
+                        .as_mut()
+                        .unwrap()
+                        .reads
+                        .insert("fixture".into(), Ok(Some("private value".into())))
+                });
+                with_backup_batch(|| {
+                    assert!(BACKUP_BATCH.with(|slot| slot
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .reads
+                        .contains_key("fixture")));
+                });
+            });
+            assert!(BACKUP_BATCH.with(|slot| slot.borrow().is_none()));
+            let result = std::panic::catch_unwind(|| {
+                with_backup_batch(|| {
+                    BACKUP_BATCH.with(|slot| {
+                        slot.borrow_mut()
+                            .as_mut()
+                            .unwrap()
+                            .reads
+                            .insert("fixture".into(), Ok(Some("private value".into())))
+                    });
+                    panic!("test unwind");
+                })
+            });
+            assert!(result.is_err());
+            assert!(BACKUP_BATCH.with(|slot| slot.borrow().is_none()));
+        }
+
+        #[test]
+        fn backup_batch_deadline_cancels_before_opening_the_vault() {
+            with_backup_batch(|| {
+                BACKUP_BATCH.with(|slot| {
+                    slot.borrow_mut().as_mut().unwrap().deadline = std::time::Instant::now()
+                });
+                assert_eq!(
+                    get_backup_secret_status("fixture", "key"),
+                    Err(super::super::BackupSecretError::Unavailable)
+                );
+                assert_eq!(
+                    BACKUP_BATCH.with(|slot| slot.borrow().as_ref().unwrap().connection_attempts),
+                    0
+                );
+            });
+        }
+
+        /// Failure mode: while another keyring operation held the store, the
+        /// check could not search and answered "would not prompt", so
+        /// background work went on to a read that asks to unlock.
+        #[test]
+        fn a_busy_store_counts_as_one_that_would_prompt() {
+            let _held = SERVICE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let started = std::time::Instant::now();
+            assert!(store_would_prompt(), "unknown must wait, not read");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                started.elapsed()
+            );
+        }
+
+        #[test]
+        fn backup_batch_does_not_wait_indefinitely_for_another_keyring_operation() {
+            let _held = SERVICE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            with_backup_batch(|| {
+                BACKUP_BATCH.with(|slot| {
+                    slot.borrow_mut().as_mut().unwrap().deadline =
+                        std::time::Instant::now() + Duration::from_millis(40)
+                });
+                let started = std::time::Instant::now();
+                assert_eq!(
+                    get_backup_secret_status("fixture", "key"),
+                    Err(super::super::BackupSecretError::Unavailable)
+                );
+                assert!(started.elapsed() < Duration::from_secs(2));
+                assert_eq!(
+                    BACKUP_BATCH.with(|slot| slot.borrow().as_ref().unwrap().connection_attempts),
+                    0
+                );
+            });
+        }
+
+        #[test]
+        #[ignore = "requires an isolated unlocked Secret Service"]
+        fn native_backup_batch_reuses_one_encrypted_session_and_invalidates_deleted_values() {
+            let _data = crate::registry::DataDirTestEnv::new("native-backup-batch");
+            let server = "toolport-native-backup-batch-fixture";
+            struct Cleanup(&'static str);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    for i in 0..21 {
+                        let _ = delete_secret(self.0, &format!("KEY_{i}"));
+                    }
+                }
+            }
+            let _cleanup = Cleanup(server);
+            for i in 0..20 {
+                set_secret(
+                    server,
+                    &format!("KEY_{i}"),
+                    &format!("native-private-value-{i}"),
+                )
+                .unwrap();
+            }
+            with_backup_batch(|| {
+                for i in 0..20 {
+                    for _ in 0..2 {
+                        assert_eq!(
+                            get_backup_secret_status(server, &format!("KEY_{i}")).unwrap(),
+                            Some(format!("native-private-value-{i}"))
+                        );
+                    }
+                }
+                set_secret(server, "KEY_0", "updated-native-private-value").unwrap();
+                assert_eq!(
+                    get_backup_secret_status(server, "KEY_0")
+                        .unwrap()
+                        .as_deref(),
+                    Some("updated-native-private-value")
+                );
+                assert_eq!(get_backup_secret_status(server, "KEY_20").unwrap(), None);
+                set_secret(server, "KEY_20", "new-native-private-value").unwrap();
+                assert_eq!(
+                    get_backup_secret_status(server, "KEY_20")
+                        .unwrap()
+                        .as_deref(),
+                    Some("new-native-private-value")
+                );
+                delete_secret(server, "KEY_20").unwrap();
+                assert_eq!(get_backup_secret_status(server, "KEY_20").unwrap(), None);
+                for i in 0..20 {
+                    delete_backup_secret_status(server, &format!("KEY_{i}"), false).unwrap();
+                    assert_eq!(
+                        get_backup_secret_status(server, &format!("KEY_{i}")).unwrap(),
+                        None
+                    );
+                    delete_backup_secret_status(server, &format!("KEY_{i}"), true).unwrap();
+                }
+                assert_eq!(
+                    BACKUP_BATCH.with(|slot| slot.borrow().as_ref().unwrap().connection_attempts),
+                    1
+                );
+            });
+            assert!(BACKUP_BATCH.with(|slot| slot.borrow().is_none()));
+        }
+
+        #[test]
+        fn backup_recovery_never_reads_locked_or_ambiguous_items() {
+            for (unlocked, locked) in [(0, 1), (1, 1), (2, 0)] {
+                let result =
+                    read_backup_item(unlocked, locked, || -> Result<(), keyring::Error> {
+                        panic!("locked recovery must not read or request unlock")
+                    });
+                assert!(matches!(result, Err(keyring::Error::NoStorageAccess(_))));
+            }
+            assert_eq!(read_backup_item(0, 0, || Ok("unexpected")).unwrap(), None);
+            assert_eq!(
+                read_backup_item(1, 0, || Ok("exact payload")).unwrap(),
+                Some("exact payload")
+            );
+        }
+        #[test]
+        fn backup_cleanup_never_deletes_locked_or_ambiguous_items() {
+            for (unlocked, locked) in [(0, 1), (1, 1), (2, 0)] {
+                let result =
+                    read_backup_item(unlocked, locked, || -> Result<(), keyring::Error> {
+                        panic!(
+                            "locked cleanup must retain recovery instead of deleting or prompting"
+                        )
+                    });
+                assert!(matches!(result, Err(keyring::Error::NoStorageAccess(_))));
+            }
+            assert_eq!(read_backup_item(0, 0, || Ok(())).unwrap(), None);
+            assert_eq!(read_backup_item(1, 0, || Ok(())).unwrap(), Some(()));
+        }
+
         use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// A secret that is not text can never be read back, so it is
+        /// damaged; a locked or failing service may give it up later.
+        #[test]
+        fn a_read_that_cannot_decode_is_damaged_and_a_failing_store_is_not() {
+            assert!(matches!(
+                read_kinded(Err(keyring::Error::BadEncoding(vec![0xff, 0xfe]))),
+                Err(crate::secrets::ReadFailure::Damaged(_))
+            ));
+            for error in [
+                keyring::Error::NoStorageAccess("the collection is locked".into()),
+                keyring::Error::PlatformFailure("org.freedesktop.secrets vanished".into()),
+            ] {
+                assert!(matches!(
+                    read_kinded(Err(error)),
+                    Err(crate::secrets::ReadFailure::Unavailable(_))
+                ));
+            }
+            assert_eq!(read_kinded(Err(keyring::Error::NoEntry)), Ok(None));
+        }
 
         fn dead_daemon() -> keyring::Error {
             keyring::Error::PlatformFailure("org.freedesktop.secrets vanished".into())
@@ -955,6 +1683,85 @@ mod platform {
                 1,
                 "a locked collection is an answer, not a dead daemon"
             );
+        }
+
+        fn locked_collection() -> keyring::Error {
+            keyring::Error::PlatformFailure(Box::new(dbus_secret_service::Error::Dbus(
+                dbus::Error::new_custom(IS_LOCKED, "Cannot create an item in a locked collection"),
+            )))
+        }
+
+        /// A write to a locked collection whose unlock prompt was dismissed is an
+        /// answer: it is attempted once, so the user is asked once, and it counts
+        /// as a refused ask so the rest of an `asking_once` run does not ask again.
+        #[test]
+        fn a_write_to_a_locked_collection_is_not_retried_and_counts_as_refused() {
+            let _data = crate::registry::DataDirTestEnv::new(
+                "a_write_to_a_locked_collection_is_not_retried_and_counts_as_refused",
+            );
+            let calls = AtomicUsize::new(0);
+            let (result, refused) = super::super::asking_once(|| {
+                with_service_after(Duration::ZERO, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(locked_collection())
+                })
+            });
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "asked once, not twice");
+            assert!(refused, "a dismissed unlock is a refused ask");
+        }
+
+        /// Only that one D-Bus error is an answer: any other platform failure,
+        /// another D-Bus error included, keeps the single retry.
+        #[test]
+        fn other_platform_failures_keep_their_retry() {
+            let _data =
+                crate::registry::DataDirTestEnv::new("other_platform_failures_keep_their_retry");
+            for error in [
+                || {
+                    keyring::Error::PlatformFailure(Box::new(dbus_secret_service::Error::Dbus(
+                        dbus::Error::new_custom("org.freedesktop.DBus.Error.NoReply", "no reply"),
+                    )))
+                },
+                || {
+                    keyring::Error::PlatformFailure(Box::new(
+                        dbus_secret_service::Error::Unavailable,
+                    ))
+                },
+                dead_daemon,
+            ] {
+                let calls = AtomicUsize::new(0);
+                let (result, refused) = super::super::asking_once(|| {
+                    with_service_after(Duration::ZERO, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Err::<(), _>(error())
+                    })
+                });
+                assert!(result.is_err());
+                assert_eq!(calls.load(Ordering::SeqCst), 2, "one retry");
+                assert!(!refused);
+            }
+        }
+
+        /// The classification above rests on how keyring 3.6.3 and
+        /// dbus-secret-service 4.1 report a refused write: as a platform failure
+        /// carrying the D-Bus error, shown as below (the line a real locked keyring
+        /// logs). A version bump that changes either needs `is_locked_collection`
+        /// checked again against a real locked keyring.
+        #[test]
+        fn the_locked_collection_error_is_the_one_keyring_reports() {
+            assert_eq!(
+                locked_collection().to_string(),
+                "Platform secure storage failure: DBus error: Cannot create an item in a locked collection"
+            );
+            let lock = include_str!("../Cargo.lock");
+            for (name, version) in [("keyring", "3.6.3"), ("dbus-secret-service", "4.1.0")] {
+                assert!(
+                    lock.contains(&format!("name = \"{name}\"\nversion = \"{version}\"\n")),
+                    "{name} is no longer {version}: check how it reports a write to a locked \
+                     collection before keeping is_locked_collection"
+                );
+            }
         }
 
         /// The app and the gateway must not wake from the retry on the same tick,
@@ -1196,6 +2003,8 @@ mod file {
     }
 
     pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
+        #[cfg(test)]
+        crate::secrets::tests::record_vault_read(server_id, key);
         Ok(load()?.get(&account(server_id, key)).cloned())
     }
 
@@ -1211,6 +2020,25 @@ mod file {
 }
 
 fn set_secret_raw(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if tests::write_is_injected_failure(key) {
+        return Err("injected secret persistence failure".into());
+    }
+    // Before the write, so a refreshed OAuth token is covered even if the store fails.
+    crate::secret_redact::register(server_id, key, value);
+    write_stored(server_id, key, value)
+}
+
+/// A write with no registration, for Toolport's own internal keys.
+fn write_stored(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    if write_would_prompt() {
+        return Err("the keyring is locked; this background write waits for it".into());
+    }
+    // A write to a locked Secret Service collection asks to unlock it too.
+    if locked_store::locked() || locked_store::collection_locked() {
+        return Err(locked_store::prompted(server_id, key));
+    }
+    scrub_previous(server_id, key, Some(value))?;
     if file::active() {
         return file::set_secret(server_id, key, value);
     }
@@ -1226,6 +2054,32 @@ pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String>
         return Err("reserved Toolport secret namespace".to_string());
     }
     set_secret_raw(&crate::local_auth::owner(server_id)?, key, value)
+}
+
+/// A client-config backup's vault write. Its key is new for each backup
+/// (it holds the content hash), so there is no old value whose log cleanup
+/// could be lost, and it is never registered: the text is a whole client
+/// config, never sent to a server, and its ordinary lines would otherwise be
+/// redacted from every log.
+pub(crate) fn set_backup_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if tests::write_is_injected_failure(key) {
+        return Err("injected secret persistence failure".into());
+    }
+    if server_id == INTERNAL_SERVER_ID {
+        return Err("reserved Toolport secret namespace".to_string());
+    }
+    if write_would_prompt() {
+        return Err("the keyring is locked; this background write waits for it".into());
+    }
+    if locked_store::locked() || locked_store::collection_locked() {
+        return Err(locked_store::prompted(server_id, key));
+    }
+    let owner = crate::local_auth::owner(server_id)?;
+    if file::active() {
+        return file::set_secret(&owner, key, value);
+    }
+    platform::set_secret(&owner, key, value)
 }
 
 pub fn get_secret(server_id: &str, key: &str) -> Option<String> {
@@ -1295,13 +2149,248 @@ pub(crate) fn task_handle_key() -> Result<[u8; 32], String> {
 ///    `CONDUIT_SECRET_KEY`) is set
 /// 4. OS keychain / platform backend
 fn get_secret_result_raw(server_id: &str, key: &str) -> Result<Option<String>, String> {
+    registered(server_id, key, read_stored(server_id, key))
+}
+
+/// A read with no registration, for Toolport's own internal keys.
+fn read_stored(server_id: &str, key: &str) -> Result<Option<String>, String> {
     if let Some(v) = env_secret_override(key) {
-        return Ok(Some(v));
+        Ok(Some(v))
+    } else if locked_store::locked() {
+        Err(locked_store::prompted(server_id, key))
+    } else if file::active() {
+        file::get_secret_result(server_id, key)
+    } else {
+        platform::get_secret_result(server_id, key)
+    }
+}
+
+/// Whether reading a stored value now could ask the user to unlock the store:
+/// some Toolport item in it is locked. Asks nothing itself. Work nobody asked
+/// for (a health check at start, a cleanup) waits while it is true; the first
+/// real use of a value still asks. The encrypted file, the macOS
+/// data-protection keychain and Windows never prompt.
+pub fn store_would_prompt() -> bool {
+    if locked_store::locked() || locked_store::collection_locked() {
+        return true;
     }
     if file::active() {
-        return file::get_secret_result(server_id, key);
+        return false;
     }
-    platform::get_secret_result(server_id, key)
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        platform::store_would_prompt()
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        false
+    }
+}
+
+/// Which servers (vault owners) keep a locked value in the store, without a
+/// search or an unlock: a health check skips only those, so a server with
+/// nothing stored is checked even while the default collection stays
+/// locked. `None`: unknown; treat every server that may read the store as
+/// locked. The encrypted file, macOS and Windows never ask: none.
+pub fn owners_with_locked_values() -> Option<std::collections::HashSet<String>> {
+    if locked_store::locked() {
+        return None;
+    }
+    if locked_store::collection_locked() {
+        return Some(locked_store::locked_owners());
+    }
+    if file::active() {
+        return Some(Default::default());
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        platform::owners_with_locked_values()
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        Some(Default::default())
+    }
+}
+
+/// [`get_secret_result`] for work nobody asked for: never asks to unlock the
+/// store, and a locked one is an error. Registers what it reads, the same way.
+pub fn get_secret_without_prompt(server_id: &str, key: &str) -> Result<Option<String>, String> {
+    if server_id == INTERNAL_SERVER_ID {
+        return Err("reserved Toolport secret namespace".to_string());
+    }
+    let owner = crate::local_auth::owner(server_id)?;
+    if let Some(value) = env_secret_override(key) {
+        return registered(owner.as_str(), key, Ok(Some(value)));
+    }
+    registered(
+        owner.as_str(),
+        key,
+        backup_secret_status(owner.as_str(), key).map_err(|error| error.to_string()),
+    )
+}
+
+/// [`get_vault_secret_result`] for work nobody asked for, like
+/// [`get_secret_without_prompt`].
+pub fn get_vault_secret_without_prompt(
+    server_id: &str,
+    key: &str,
+) -> Result<Option<String>, String> {
+    if server_id == INTERNAL_SERVER_ID {
+        return Err("reserved Toolport secret namespace".to_string());
+    }
+    let owner = crate::local_auth::owner(server_id)?;
+    registered(
+        owner.as_str(),
+        key,
+        backup_secret_status(owner.as_str(), key).map_err(|error| error.to_string()),
+    )
+}
+
+/// Test support: a store that is locked, so every read that would ask the user
+/// to unlock it is recorded (and fails) instead. Reads that never prompt see a
+/// locked store. Process-wide: hold the data-directory test lock around it.
+pub mod locked_store {
+    #[cfg(any(test, feature = "test-support"))]
+    static LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    #[cfg(any(test, feature = "test-support"))]
+    static PROMPTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    #[cfg(any(test, feature = "test-support"))]
+    static COLLECTION_LOCKED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    #[cfg(any(test, feature = "test-support"))]
+    static LOCKED_OWNERS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Run `f` with the store locked; every `server/key` read that would have
+    /// asked to unlock it, in order.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn prompts_during(f: impl FnOnce()) -> Vec<String> {
+        use std::sync::atomic::Ordering;
+        struct Unlock;
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                LOCKED.store(false, Ordering::SeqCst);
+            }
+        }
+        PROMPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        LOCKED.store(true, Ordering::SeqCst);
+        let unlock = Unlock;
+        f();
+        drop(unlock);
+        std::mem::take(
+            &mut *PROMPTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Run `f` with only the default collection locked and no Toolport item
+    /// in it: reads find nothing to unlock, a new item's write would ask.
+    /// Every write that would have asked, in order.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn write_prompts_during(f: impl FnOnce()) -> Vec<String> {
+        use std::sync::atomic::Ordering;
+        struct Unlock;
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                COLLECTION_LOCKED.store(false, Ordering::SeqCst);
+            }
+        }
+        PROMPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        COLLECTION_LOCKED.store(true, Ordering::SeqCst);
+        let unlock = Unlock;
+        f();
+        drop(unlock);
+        std::mem::take(
+            &mut *PROMPTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// [`write_prompts_during`] with these owners' values in the store,
+    /// locked.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn locked_values_during(owners: &[&str], f: impl FnOnce()) -> Vec<String> {
+        *LOCKED_OWNERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            owners.iter().map(|owner| owner.to_string()).collect();
+        let prompts = write_prompts_during(f);
+        LOCKED_OWNERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        prompts
+    }
+
+    pub(crate) fn locked_owners() -> std::collections::HashSet<String> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            LOCKED_OWNERS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .cloned()
+                .collect()
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            Default::default()
+        }
+    }
+
+    pub(crate) fn collection_locked() -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            COLLECTION_LOCKED.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn locked() -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            LOCKED.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            false
+        }
+    }
+
+    /// Record a read that would have prompted; its error.
+    pub(crate) fn prompted(server_id: &str, key: &str) -> String {
+        super::note_refused_ask();
+        #[cfg(any(test, feature = "test-support"))]
+        PROMPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(format!("{server_id}/{key}"));
+        let _ = (server_id, key);
+        "keyring locked".to_string()
+    }
+}
+
+/// Every value this process reads or stores is registered for redaction at the log
+/// writers ([`crate::secret_redact`]), so no echo of it reaches disk.
+fn registered(
+    server_id: &str,
+    key: &str,
+    value: Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    if let Ok(Some(v)) = &value {
+        crate::secret_redact::register(server_id, key, v);
+    }
+    value
 }
 
 /// Inspect only the managed identity's vault, never environment overrides or aliases.
@@ -1326,7 +2415,9 @@ pub(crate) fn has_own_credentials(server: &crate::registry::ServerEntry) -> Resu
         "__oauth_cc_state__",
     ]);
     for key in keys {
-        let value = if file::active() {
+        let value = if locked_store::locked() {
+            Err(locked_store::prompted(&server.id, key))
+        } else if file::active() {
             file::get_secret_result(&server.id, key)
         } else {
             platform::get_secret_result(&server.id, key)
@@ -1338,13 +2429,188 @@ pub(crate) fn has_own_credentials(server: &crate::registry::ServerEntry) -> Resu
     Ok(false)
 }
 
+thread_local! {
+    static WITHOUT_PROMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run work nobody asked for (background sync, a restore at start) so that no
+/// keyring call in it, on this thread, can ask to unlock: reads use the
+/// non-prompting path, and a write or delete fails while the store would
+/// prompt. A check made before the work cannot cover a keyring that locks
+/// during it; this does.
+pub fn without_prompts<T>(f: impl FnOnce() -> T) -> T {
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            WITHOUT_PROMPTS.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+    WITHOUT_PROMPTS.with(|depth| depth.set(depth.get() + 1));
+    let _leave = Leave;
+    f()
+}
+
+/// Undo any enclosing [`without_prompts`] for `f`: the step it runs is one the
+/// user asked for and may prompt as usual.
+pub fn with_prompts<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(u32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WITHOUT_PROMPTS.with(|depth| depth.set(self.0));
+        }
+    }
+    let _restore = Restore(WITHOUT_PROMPTS.with(|depth| depth.replace(0)));
+    f()
+}
+
+fn prompts_allowed() -> bool {
+    WITHOUT_PROMPTS.with(|depth| depth.get() == 0) && !ask_spent()
+}
+
+thread_local! {
+    static REFUSED_ASKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static ONE_ASK_FROM: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// A call on this thread asked to unlock the store and was refused: the store
+/// was locked and its unlock dialog dismissed (or, in the test store, recorded).
+fn note_refused_ask() {
+    REFUSED_ASKS.with(|asks| asks.set(asks.get().saturating_add(1)));
+}
+
+/// Run `f` so that it asks to unlock the store at most once on this thread: after
+/// one refused ask, the rest of `f` runs as in [`without_prompts`]. Returns whether
+/// an ask in `f` was refused.
+pub fn asking_once<T>(f: impl FnOnce() -> T) -> (T, bool) {
+    struct Restore(Option<u32>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ONE_ASK_FROM.with(|from| from.set(self.0));
+        }
+    }
+    let before = REFUSED_ASKS.with(std::cell::Cell::get);
+    let _restore = Restore(ONE_ASK_FROM.with(|from| from.replace(Some(before))));
+    let result = f();
+    (result, REFUSED_ASKS.with(std::cell::Cell::get) > before)
+}
+
+fn ask_spent() -> bool {
+    ONE_ASK_FROM
+        .with(std::cell::Cell::get)
+        .is_some_and(|from| REFUSED_ASKS.with(std::cell::Cell::get) > from)
+}
+
+/// Inside [`without_prompts`] on this thread, so work it hands to another thread can
+/// carry it there.
+pub(crate) fn prompts_blocked() -> bool {
+    !prompts_allowed()
+}
+
+/// Inside [`without_prompts`], on a store whose ordinary reads can ask to
+/// unlock (Secret Service). macOS, Windows and the file vault never ask, so
+/// their reads keep their usual path.
+fn read_must_not_prompt() -> bool {
+    !prompts_allowed()
+        && (locked_store::locked()
+            || (cfg!(all(not(target_os = "macos"), not(target_os = "windows"))) && !file::active()))
+}
+
+/// The background check: `default_locked` reads the default collection's
+/// `Locked` property (`None`: there is none), which never asks; `search`
+/// looks for locked Toolport items, which KeePassXC answers with its unlock
+/// dialog while its database is locked. So a locked default collection is
+/// the answer without a search, and the polls that repeat this check every
+/// few seconds never raise that dialog. A write also asks with no default
+/// collection to put a new item in.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+fn would_prompt_by<E>(
+    write: bool,
+    default_locked: impl FnOnce() -> Result<Option<bool>, E>,
+    search: impl FnOnce() -> Result<bool, E>,
+) -> Result<bool, E> {
+    match default_locked()? {
+        Some(true) => Ok(true),
+        None if write => Ok(true),
+        _ => search(),
+    }
+}
+
+/// [`owners_with_locked_values`]'s plan: `default_locked` is a property read;
+/// open, `search` returns the accounts of the locked Toolport items it finds
+/// (in other collections), one call however large the store; locked or
+/// missing (no search: KeePassXC opens its dialog for one), `walk` reads the
+/// accounts in the locked collections. An account is `owner::key`.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+fn owners_with_locked_by<E>(
+    default_locked: impl FnOnce() -> Result<Option<bool>, E>,
+    search: impl FnOnce() -> Result<Vec<Option<String>>, E>,
+    walk: impl FnOnce() -> Result<Vec<Option<String>>, E>,
+) -> Result<std::collections::HashSet<String>, E> {
+    let accounts = match default_locked()? {
+        Some(false) => search()?,
+        Some(true) | None => walk()?,
+    };
+    Ok(accounts
+        .into_iter()
+        .flatten()
+        .filter_map(|account| account.split_once("::").map(|(owner, _)| owner.to_string()))
+        .collect())
+}
+
+/// The accounts of the items in the locked `collections`: every item of a
+/// locked collection is locked, and an open one is skipped without listing
+/// its items.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+fn accounts_in_locked<C, E>(
+    collections: &[C],
+    locked: impl Fn(&C) -> Result<bool, E>,
+    accounts: impl Fn(&C) -> Result<Vec<Option<String>>, E>,
+) -> Result<Vec<Option<String>>, E> {
+    let mut found = Vec::new();
+    for collection in collections {
+        if locked(collection)? {
+            found.extend(accounts(collection)?);
+        }
+    }
+    Ok(found)
+}
+
+/// A write or delete inside [`without_prompts`] while the store would ask.
+fn write_would_prompt() -> bool {
+    !prompts_allowed() && write_would_ask()
+}
+
+/// Whether a write now could ask to unlock the store: [`store_would_prompt`],
+/// or a locked default collection a new item would go into.
+pub(crate) fn write_would_ask() -> bool {
+    if locked_store::locked() || locked_store::collection_locked() {
+        return true;
+    }
+    if file::active() {
+        return false;
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        platform::write_would_prompt()
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        false
+    }
+}
+
 pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
+    #[cfg(test)]
+    tests::record_read(server_id, key);
     #[cfg(test)]
     if tests::read_is_injected_failure(key) {
         return Err("injected secret read failure".into());
     }
     if server_id == INTERNAL_SERVER_ID {
         return Err("reserved Toolport secret namespace".to_string());
+    }
+    if read_must_not_prompt() {
+        return get_secret_without_prompt(server_id, key);
     }
     get_secret_result_raw(&crate::local_auth::owner(server_id)?, key)
 }
@@ -1355,12 +2621,162 @@ pub fn get_vault_secret_result(server_id: &str, key: &str) -> Result<Option<Stri
     if server_id == INTERNAL_SERVER_ID {
         return Err("reserved Toolport secret namespace".to_string());
     }
+    if read_must_not_prompt() {
+        return get_vault_secret_without_prompt(server_id, key);
+    }
     let owner = crate::local_auth::owner(server_id)?;
     let server_id = owner.as_str();
-    if file::active() {
-        return file::get_secret_result(server_id, key);
+    let value = if locked_store::locked() {
+        Err(locked_store::prompted(server_id, key))
+    } else if file::active() {
+        file::get_secret_result(server_id, key)
+    } else {
+        platform::get_secret_result(server_id, key)
+    };
+    registered(server_id, key, value)
+}
+
+/// Why a stored value could not be read. [`scrub_previous`] needs the kind:
+/// a damaged value can never be read back, so there is nothing to scrub or
+/// keep, while a locked or unavailable store may give it up later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadFailure {
+    /// The stored data is damaged or incomplete.
+    Damaged(String),
+    /// The store is locked or unavailable right now.
+    Unavailable(String),
+}
+
+impl ReadFailure {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::Damaged(message) | Self::Unavailable(message) => message,
+        }
     }
-    platform::get_secret_result(server_id, key)
+}
+
+/// Stable recovery categories. No backend error text or secret bytes cross this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum BackupSecretError {
+    Locked,
+    Missing,
+    Corrupt,
+    Ambiguous,
+    Unavailable,
+    AuthenticationFailed,
+    Cancelled,
+    AccessDenied,
+    Unchecked,
+}
+
+/// A recovery/cleanup batch never keeps a credential cache after it returns.
+/// Linux shares a noninteractive DH session; other native APIs do not prompt.
+pub(crate) fn with_backup_batch<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        platform::with_backup_batch(f)
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        f()
+    }
+}
+impl std::fmt::Display for BackupSecretError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Saved credential recovery: {self:?}")
+    }
+}
+impl std::error::Error for BackupSecretError {}
+impl BackupSecretError {
+    #[cfg(any(target_os = "macos", test))]
+    fn macos(code: i32) -> Self {
+        match code {
+            -25308 => Self::Locked,
+            -25293 => Self::AuthenticationFailed,
+            -128 => Self::Cancelled,
+            -25300 => Self::Missing,
+            -34018 => Self::AccessDenied,
+            _ => Self::Unavailable,
+        }
+    }
+    #[cfg(any(target_os = "windows", test))]
+    pub(super) fn windows(code: u32) -> Self {
+        match code {
+            5 => Self::AccessDenied,
+            1223 => Self::Cancelled,
+            1326 => Self::AuthenticationFailed,
+            1168 => Self::Missing,
+            13 => Self::Corrupt,
+            _ => Self::Unavailable,
+        }
+    }
+}
+pub(crate) fn backup_secret_status(
+    server_id: &str,
+    key: &str,
+) -> Result<Option<String>, BackupSecretError> {
+    if server_id == INTERNAL_SERVER_ID {
+        return Err(BackupSecretError::AccessDenied);
+    }
+    let owner = crate::local_auth::owner(server_id).map_err(|_| BackupSecretError::AccessDenied)?;
+    // These reads never ask to unlock the store: a locked one says so.
+    if locked_store::locked() {
+        return Err(BackupSecretError::Locked);
+    }
+    if file::active() {
+        return file::get_secret_result(owner.as_str(), key)
+            .map_err(|_| BackupSecretError::Unavailable);
+    }
+    platform::get_backup_secret_status(owner.as_str(), key)
+}
+
+/// Vault-only backup access, with no interactive unlock during Linux recovery.
+pub(crate) fn get_backup_secret_result(
+    server_id: &str,
+    key: &str,
+) -> Result<Option<String>, String> {
+    backup_secret_status(server_id, key).map_err(|error| error.to_string())
+}
+
+/// Backup-only deletion follows the same noninteractive policy as recovery reads.
+#[cfg(test)]
+pub(crate) fn delete_backup_secret_status(
+    server_id: &str,
+    key: &str,
+) -> Result<(), BackupSecretError> {
+    delete_backup_secret_copies_status(server_id, key, false)
+}
+pub(crate) fn delete_backup_secret_copies_status(
+    server_id: &str,
+    key: &str,
+    discard_all: bool,
+) -> Result<(), BackupSecretError> {
+    #[cfg(test)]
+    if tests::write_is_injected_failure(key) {
+        return Err(BackupSecretError::Unavailable);
+    }
+    if server_id == INTERNAL_SERVER_ID {
+        return Err(BackupSecretError::AccessDenied);
+    }
+    let owner = crate::local_auth::owner(server_id).map_err(|_| BackupSecretError::AccessDenied)?;
+    if file::active() {
+        return file::delete_secret(owner.as_str(), key)
+            .map_err(|_| BackupSecretError::Unavailable);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        platform::delete_backup_secret_status(owner.as_str(), key, discard_all)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = discard_all;
+        platform::delete_backup_secret_status(owner.as_str(), key)
+    }
+}
+#[cfg(test)]
+pub(crate) fn delete_backup_secret(server_id: &str, key: &str) -> Result<(), String> {
+    delete_backup_secret_status(server_id, key).map_err(|e| e.to_string())
 }
 
 /// Look up a secret from the process environment for container / env-file deploys.
@@ -1392,7 +2808,192 @@ fn env_var_nonblank(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// Before a stored value is replaced or deleted, scrub the logs for it: once it
+/// is gone from the vault nothing could find a copy an older build (or another
+/// tool) left on disk. Reads the stored value directly, never an environment
+/// override, and skips Toolport's own internal keys. An error when a log may
+/// still hold the old value and it could not be kept for a later cleanup: the
+/// caller then changes nothing, so the stored value is not lost.
+fn scrub_previous(server_id: &str, key: &str, replacement: Option<&str>) -> Result<(), String> {
+    if server_id == INTERNAL_SERVER_ID {
+        return Ok(());
+    }
+    // The whole file vault is loaded for any write too, so its read errors
+    // always stop the change.
+    let stored = if file::active() {
+        file::get_secret_result(server_id, key).map_err(ReadFailure::Unavailable)
+    } else {
+        platform::read_secret(server_id, key)
+    };
+    #[cfg(test)]
+    let stored = if tests::read_is_injected_failure(key) {
+        Err(ReadFailure::Unavailable(
+            "injected secret read failure".to_string(),
+        ))
+    } else if tests::read_is_injected_damage(key) {
+        Err(ReadFailure::Damaged("injected damaged secret".to_string()))
+    } else {
+        stored
+    };
+    let stored = match stored {
+        Ok(stored) => stored,
+        // Damaged data can never be read back: there is no old value to
+        // scrub or keep, and refusing would leave it unfixable.
+        Err(ReadFailure::Damaged(error)) => {
+            eprintln!(
+                "toolport: the old value could not be read ({error}), so its log cleanup was skipped"
+            );
+            None
+        }
+        // A locked or unavailable store may give the value up later: change
+        // nothing, so the chance to scrub it is not lost.
+        Err(ReadFailure::Unavailable(error)) => {
+            eprintln!("toolport: the stored value could not be read for its log cleanup ({error})");
+            return Err(crate::i18n::tr(
+                "The old value could not be kept for its log cleanup, so nothing was changed. Try again.",
+            ));
+        }
+    };
+    if let Some(old) = stored {
+        if Some(old.as_str()) != replacement {
+            if let Err(error) = crate::secret_redact::scrub_value_now(server_id, key, &old) {
+                // A log may still hold it: keep the value in the vault, under
+                // Toolport's own namespace, until a later scrub succeeds.
+                eprintln!("toolport: {error}; keeping the old value for a later cleanup");
+                retire(server_id, key, &old)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Values replaced or deleted while a log may still hold them, as a JSON list of
+/// `{server, key, value}` in the vault (never on disk in the clear).
+const RETIRED_KEY: &str = "retired-secret-values";
+
+fn retired_load() -> Vec<(String, String, String)> {
+    // Unregistered: the values in it are registered on their own, and the
+    // list changes on every save.
+    let Ok(Some(raw)) = read_stored(INTERNAL_SERVER_ID, RETIRED_KEY) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<serde_json::Value>>(&raw)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| {
+            Some((
+                v.get("server")?.as_str()?.to_string(),
+                v.get("key")?.as_str()?.to_string(),
+                v.get("value")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn retired_save(entries: &[(String, String, String)]) -> Result<(), String> {
+    crate::secret_redact::RETIRED_PENDING
+        .store(entries.len(), std::sync::atomic::Ordering::Relaxed);
+    if entries.is_empty() {
+        return match read_stored(INTERNAL_SERVER_ID, RETIRED_KEY) {
+            Ok(Some(_)) => delete_secret_raw(INTERNAL_SERVER_ID, RETIRED_KEY),
+            _ => Ok(()),
+        };
+    }
+    let list: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(server, key, value)| serde_json::json!({"server": server, "key": key, "value": value}))
+        .collect();
+    #[cfg(test)]
+    if tests::write_is_injected_failure(RETIRED_KEY) {
+        return Err("injected secret persistence failure".into());
+    }
+    write_stored(
+        INTERNAL_SERVER_ID,
+        RETIRED_KEY,
+        &serde_json::Value::Array(list).to_string(),
+    )
+}
+
+/// The cross-process lock every read-modify-write of the retired list holds,
+/// so two processes never save over each other's entries.
+fn retired_lock() -> Result<crate::registry::FileLock, String> {
+    let dir = crate::registry::conduit_dir().ok_or("no data directory")?;
+    crate::registry::lock_at(&dir.join(RETIRED_KEY))
+}
+
+fn retire(server_id: &str, key: &str, value: &str) -> Result<(), String> {
+    let saved = retired_lock().and_then(|_lock| {
+        let mut entries = retired_load();
+        let entry = (server_id.to_string(), key.to_string(), value.to_string());
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+        retired_save(&entries)
+    });
+    saved.map_err(|error| {
+        eprintln!("toolport: could not keep a retired secret for cleanup: {error}");
+        crate::i18n::tr(
+            "The old value could not be kept for its log cleanup, so nothing was changed. Try again.",
+        )
+    })
+}
+
+/// Register every retired value and retry its cleanup; entries whose scrub now
+/// succeeds are dropped from the vault. Returns how many still wait. Called at
+/// gateway start, so a value is redacted again before anything is written.
+pub fn retry_retired_scrubs() -> usize {
+    // The list lives in the store: reading it while locked would ask the user
+    // to unlock it at start. It waits for the next start that finds it open.
+    if store_would_prompt() {
+        return crate::secret_redact::RETIRED_PENDING.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    let entries = retired_load();
+    if entries.is_empty() {
+        crate::secret_redact::RETIRED_PENDING.store(0, std::sync::atomic::Ordering::Relaxed);
+        return 0;
+    }
+    // The scrubs run unlocked (each may wait for a busy scrub); then, under
+    // the lock, only the entries they cleaned are removed from the list as it
+    // is now, so a value another process retired meanwhile is kept.
+    let cleaned: Vec<(String, String, String)> = entries
+        .into_iter()
+        .filter(|(server, key, value)| {
+            crate::secret_redact::scrub_value_now(server, key, value).is_ok()
+        })
+        .collect();
+    #[cfg(test)]
+    tests::run_retry_hook();
+    let _lock = match retired_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("toolport: could not update retired secrets: {error}");
+            return retired_load().len();
+        }
+    };
+    let remaining: Vec<(String, String, String)> = retired_load()
+        .into_iter()
+        .filter(|entry| !cleaned.contains(entry))
+        .collect();
+    let left = remaining.len();
+    if let Err(error) = retired_save(&remaining) {
+        eprintln!("toolport: could not update retired secrets: {error}");
+    }
+    left
+}
+
+/// How many retired values still wait for their log cleanup (for status).
+pub fn retired_scrubs_pending() -> usize {
+    retired_load().len()
+}
+
 fn delete_secret_raw(server_id: &str, key: &str) -> Result<(), String> {
+    if write_would_prompt() {
+        return Err("the keyring is locked; this background delete waits for it".into());
+    }
+    if locked_store::locked() {
+        return Err(locked_store::prompted(server_id, key));
+    }
+    scrub_previous(server_id, key, None)?;
     if file::active() {
         return file::delete_secret(server_id, key);
     }
@@ -1634,8 +3235,65 @@ pub(crate) mod tests {
         static FAILED_WRITE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
     }
 
+    thread_local! {
+        static READS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    thread_local! {
+        static VAULT_READS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record_vault_read(server_id: &str, key: &str) {
+        VAULT_READS.with(|reads| reads.borrow_mut().push(format!("{server_id}/{key}")));
+    }
+
+    /// The `server/key` reads of every secret store backend (keychain or file vault)
+    /// on this thread while `test` runs, whichever entry point made them.
+    pub(crate) fn vault_reads_during<T>(test: impl FnOnce() -> T) -> (T, Vec<String>) {
+        VAULT_READS.with(|reads| reads.borrow_mut().clear());
+        let value = test();
+        (
+            value,
+            VAULT_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut())),
+        )
+    }
+
+    pub(crate) fn record_read(server_id: &str, key: &str) {
+        READS.with(|reads| reads.borrow_mut().push(format!("{server_id}/{key}")));
+    }
+
+    /// The `server/key` reads of [`super::get_secret_result`] on this thread
+    /// while `test` runs.
+    pub(crate) fn reads_during(test: impl FnOnce()) -> Vec<String> {
+        READS.with(|reads| reads.borrow_mut().clear());
+        test();
+        READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()))
+    }
+
+    thread_local! {
+        static DAMAGED_READ: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(crate) fn read_is_injected_damage(key: &str) -> bool {
+        DAMAGED_READ.with(|damaged| damaged.get() == Some(key))
+    }
+
+    /// Reads of `key`'s stored value find it damaged (a broken chunk manifest,
+    /// an undecodable item) while `test` runs: nothing can ever read it back.
+    pub(crate) fn with_damaged_read<T>(key: &'static str, test: impl FnOnce() -> T) -> T {
+        struct Restore(Option<&'static str>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DAMAGED_READ.with(|damaged| damaged.set(self.0));
+            }
+        }
+        let _restore = Restore(DAMAGED_READ.with(|damaged| damaged.replace(Some(key))));
+        test()
+    }
+
+    /// `"*"` fails every key.
     pub(crate) fn read_is_injected_failure(key: &str) -> bool {
-        FAILED_READ.with(|failed| failed.get() == Some(key))
+        FAILED_READ.with(|failed| matches!(failed.get(), Some(k) if k == key || k == "*"))
     }
 
     pub(crate) fn with_failed_read<T>(key: &'static str, test: impl FnOnce() -> T) -> T {
@@ -1647,6 +3305,26 @@ pub(crate) mod tests {
         }
         let _restore = Restore(FAILED_READ.with(|failed| failed.replace(Some(key))));
         test()
+    }
+
+    thread_local! {
+        static RETRY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Run `hook` inside the next [`super::retry_retired_scrubs`] on this
+    /// thread, after its scrubs and before it updates the retired list.
+    pub(crate) fn with_retry_hook<T>(hook: impl FnOnce() + 'static, test: impl FnOnce() -> T) -> T {
+        RETRY_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        let out = test();
+        RETRY_HOOK.with(|h| h.borrow_mut().take());
+        out
+    }
+
+    pub(crate) fn run_retry_hook() {
+        if let Some(hook) = RETRY_HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
     }
 
     pub(crate) fn write_is_injected_failure(key: &str) -> bool {
@@ -1690,6 +3368,130 @@ pub(crate) mod tests {
         let _cleanup = Cleanup(dir, std::env::var_os("TOOLPORT_SECRET_KEY"));
         std::env::set_var("TOOLPORT_SECRET_KEY", "publisher-synthetic-vault");
         test();
+    }
+
+    /// Failure mode: the owner check listed every item of every collection on
+    /// each probe round, which a large keyring could stretch past its 2 s
+    /// deadline, and then every server showed "Keyring locked" though the
+    /// keyring was open.
+    #[test]
+    fn an_open_default_collection_is_one_search_and_a_locked_one_walks_locked_collections() {
+        let (searches, walks) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+        let owners = owners_with_locked_by(
+            || Ok::<_, ()>(Some(false)),
+            || {
+                searches.set(searches.get() + 1);
+                Ok(vec![Some("other-collection::API_KEY".into())])
+            },
+            || {
+                walks.set(walks.get() + 1);
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+        assert_eq!((searches.get(), walks.get()), (1, 0));
+        assert_eq!(owners, ["other-collection".to_string()].into());
+
+        // Locked: no search; only the locked collections are listed.
+        let listed = std::cell::RefCell::new(Vec::new());
+        let collections = [("login", true), ("open", false), ("second", true)];
+        let owners = owners_with_locked_by(
+            || Ok::<_, ()>(Some(true)),
+            || {
+                searches.set(searches.get() + 1);
+                Ok(Vec::new())
+            },
+            || {
+                accounts_in_locked(
+                    &collections,
+                    |(_, locked)| Ok(*locked),
+                    |(name, _)| {
+                        listed.borrow_mut().push(*name);
+                        Ok(vec![Some(format!("{name}-server::KEY")), None])
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(searches.get(), 1, "searched while the default was locked");
+        assert_eq!(*listed.borrow(), ["login", "second"]);
+        assert_eq!(
+            owners,
+            ["login-server".to_string(), "second-server".to_string()].into()
+        );
+    }
+
+    /// Times one owner check against the session's real keyring. Run in a
+    /// box with a filled keyring:
+    /// `cargo test ... -- --ignored --exact secrets::tests::time_owner_check --nocapture`
+    #[test]
+    #[ignore = "times the session keyring; run in omabox"]
+    fn time_owner_check() {
+        let _data = crate::registry::data_dir_test_lock();
+        let dir = std::env::temp_dir().join(format!("toolport-owner-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        std::env::remove_var("TOOLPORT_SECRET_KEY");
+        let started = std::time::Instant::now();
+        let owners = owners_with_locked_values();
+        println!(
+            "owner check: {:?} in {} ms",
+            owners.map(|owners| owners.len()),
+            started.elapsed().as_millis()
+        );
+    }
+
+    /// Failure mode: every check searched the store, and KeePassXC answers a
+    /// search with its unlock dialog while its database is locked, so the 3 s
+    /// polls raised it again after every cancel.
+    #[test]
+    fn polls_never_search_while_the_default_collection_is_locked() {
+        let searches = std::cell::Cell::new(0);
+        let search = || {
+            searches.set(searches.get() + 1);
+            Ok::<_, ()>(false)
+        };
+        for _ in 0..20 {
+            for write in [false, true] {
+                assert_eq!(would_prompt_by(write, || Ok(Some(true)), search), Ok(true));
+            }
+        }
+        assert_eq!(
+            searches.get(),
+            0,
+            "searched while the default collection was locked"
+        );
+        // Open: the search still finds locked items in another collection.
+        assert_eq!(
+            would_prompt_by(false, || Ok(Some(false)), || Ok::<_, ()>(true)),
+            Ok(true)
+        );
+        assert_eq!(
+            would_prompt_by(false, || Ok(Some(false)), search),
+            Ok(false)
+        );
+        // No default collection: a read searches, a write would ask.
+        assert_eq!(would_prompt_by(false, || Ok(None), search), Ok(false));
+        assert_eq!(would_prompt_by(true, || Ok(None), search), Ok(true));
+        assert_eq!(searches.get(), 2);
+    }
+
+    /// Failure mode: the background write gate asked only whether a Toolport
+    /// item was locked, so with none in the store a new item's write to the
+    /// locked default collection asked to unlock it.
+    #[test]
+    fn a_background_write_waits_while_the_default_collection_is_locked() {
+        with_isolated_vault(|| {
+            let mut written = None;
+            let prompts = locked_store::write_prompts_during(|| {
+                written = Some(without_prompts(|| {
+                    set_secret("srv", "API_KEY", "collection-locked-value")
+                }));
+            });
+            assert!(prompts.is_empty(), "the write asked: {prompts:?}");
+            assert!(written.unwrap().is_err());
+            assert_eq!(get_secret("srv", "API_KEY"), None);
+        });
     }
 
     /// Deletes a real keychain credential even when a test assertion unwinds.
@@ -1755,6 +3557,62 @@ pub(crate) mod tests {
             assert!(writer.contains("SecItemAdd("));
             assert!(!writer.contains("SecItemDelete("));
         }
+    }
+
+    #[test]
+    fn native_recovery_status_codes_are_explicit_and_never_use_error_text() {
+        use BackupSecretError::*;
+        for (code, state) in [
+            (-25308, Locked),
+            (-25293, AuthenticationFailed),
+            (-128, Cancelled),
+            (-25300, Missing),
+            (-34018, AccessDenied),
+            (-25294, Unavailable),
+        ] {
+            assert_eq!(BackupSecretError::macos(code), state);
+        }
+        for (code, state) in [
+            (5, AccessDenied),
+            (1223, Cancelled),
+            (1326, AuthenticationFailed),
+            (1168, Missing),
+            (13, Corrupt),
+            (1312, Unavailable),
+        ] {
+            assert_eq!(BackupSecretError::windows(code), state);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_backup_recovery_maps_locked_authentication_and_cancelled_statuses() {
+        assert_eq!(BackupSecretError::macos(-25308), BackupSecretError::Locked);
+        assert_eq!(
+            BackupSecretError::macos(-25293),
+            BackupSecretError::AuthenticationFailed
+        );
+        assert_eq!(BackupSecretError::macos(-128), BackupSecretError::Cancelled);
+        assert!(include_str!("secrets.rs")
+            .split_whitespace()
+            .collect::<String>()
+            .contains("get_inner(account_str,true)"));
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_backup_recovery_maps_credential_manager_errors() {
+        assert_eq!(
+            BackupSecretError::windows(1312),
+            BackupSecretError::Unavailable
+        );
+        assert_eq!(
+            BackupSecretError::windows(5),
+            BackupSecretError::AccessDenied
+        );
+        assert_eq!(BackupSecretError::windows(1168), BackupSecretError::Missing);
+        assert_eq!(
+            BackupSecretError::windows(1223),
+            BackupSecretError::Cancelled
+        );
     }
 
     #[test]
@@ -2033,6 +3891,420 @@ pub(crate) mod tests {
                 "cleanup left Windows credential entry {account} behind"
             );
         }
+    }
+
+    /// One process of `windows_cross_process_access_never_tears_a_chunked_secret`.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "spawned by windows_cross_process_access_never_tears_a_chunked_secret"]
+    fn windows_cross_process_child() {
+        let _data = crate::registry::DataDirTestEnv::new("windows_cross_process_child");
+        let sid = std::env::var("TOOLPORT_CROSS_PROCESS_SID").unwrap();
+        let writer = std::env::var("TOOLPORT_CROSS_PROCESS_ROLE").as_deref() == Ok("writer");
+        let values = cross_process_values();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (mut reads, mut torn) = (0u64, Vec::new());
+        let mut index = 0;
+        while std::time::Instant::now() < deadline {
+            if writer {
+                set_secret(&sid, "OAUTH_TOKEN", &values[index % values.len()]).unwrap();
+                index += 1;
+                continue;
+            }
+            reads += 1;
+            match get_secret_result(&sid, "OAUTH_TOKEN") {
+                Ok(Some(value)) if values.contains(&value) => {}
+                Ok(Some(value)) => torn.push(format!("mixed value of {} bytes", value.len())),
+                Ok(None) => torn.push("absent".to_string()),
+                Err(error) => torn.push(error),
+            }
+        }
+        assert!(
+            torn.is_empty(),
+            "{} of {reads} reads were torn, first: {:?}",
+            torn.len(),
+            torn.iter().take(3).collect::<Vec<_>>()
+        );
+        println!("cross-process child done: writes {index}, reads {reads}");
+    }
+
+    #[cfg(target_os = "windows")]
+    fn cross_process_values() -> [String; 3] {
+        [
+            format!("{}{}", "a".repeat(3_500), "🔒".repeat(300)),
+            format!("{}{}", "b".repeat(6_100), "🚀".repeat(100)),
+            "short replacement".to_string(),
+        ]
+    }
+
+    /// The app and the gateway are separate processes sharing one vault. A chunked
+    /// secret must read back whole in one process while another rewrites it, and
+    /// replaced generations must not be leaked.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_cross_process_access_never_tears_a_chunked_secret() {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_NOT_FOUND};
+        use windows_sys::Win32::Security::Credentials::{CredEnumerateW, CredFree, CREDENTIALW};
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_cross_process_access_never_tears_a_chunked_secret",
+        );
+        // Keep env-switching tests (e.g. CONDUIT_SECRET_KEY) from changing the
+        // backend for the parent or the children it spawns.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sid = format!("toolport-windows-cross-process-{unique}");
+        let _cleanup = SecretCleanupGuard::new(&sid, "OAUTH_TOKEN");
+        set_secret(&sid, "OAUTH_TOKEN", &cross_process_values()[0]).unwrap();
+        let children: Vec<_> = ["writer", "reader", "reader", "reader"]
+            .into_iter()
+            .map(|role| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "secrets::tests::windows_cross_process_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("TOOLPORT_CROSS_PROCESS_SID", &sid)
+                    .env("TOOLPORT_CROSS_PROCESS_ROLE", role)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        // Reap every child before asserting, so none outlives the test.
+        let outputs: Vec<_> = children
+            .into_iter()
+            .map(|child| child.wait_with_output().unwrap())
+            .collect();
+        for output in &outputs {
+            assert!(
+                output.status.success(),
+                "cross-process child failed: {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        delete_secret(&sid, "OAUTH_TOKEN").unwrap();
+        let filter: Vec<u16> = format!("{sid}::*").encode_utf16().chain([0]).collect();
+        let mut count = 0;
+        let mut entries: *mut *mut CREDENTIALW = std::ptr::null_mut();
+        if unsafe { CredEnumerateW(filter.as_ptr(), 0, &mut count, &mut entries) } != 0 {
+            unsafe { CredFree(entries.cast()) };
+        } else {
+            // Only "nothing matched" may count as zero leftovers.
+            let error = unsafe { GetLastError() };
+            assert_eq!(error, ERROR_NOT_FOUND, "CredEnumerateW failed: {error}");
+        }
+        assert_eq!(count, 0, "replaced chunk generations were left behind");
+    }
+
+    /// Orphaned chunk generations, from crashed or racing writes, are removed. The
+    /// live generation and anything that is not exactly a Toolport chunk stay.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_sweep_removes_only_orphaned_toolport_chunks() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_sweep_removes_only_orphaned_toolport_chunks",
+        );
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // Every account here starts with `sid`, the only scope the sweep may see.
+        let sid = format!("toolport-windows-sweep-{unique}");
+        let gone_sid = format!("{sid}-gone");
+        let key = "OAUTH_TOKEN";
+        let _cleanup = SecretCleanupGuard::new(&sid, key);
+        let value = format!("{}{}", "a".repeat(3_500), "🔒".repeat(300));
+        set_secret(&sid, key, &value).unwrap();
+        let live = platform::raw_entries_for_test(&sid, key).unwrap();
+        assert!(live.len() > 1, "fixture must be chunked");
+
+        let base = format!("{sid}::{key}");
+        let stale = "0123456789abcdef0123456789abcdef";
+        let orphans = [
+            // A replaced generation the cleanup never removed.
+            platform::plant_chunk_for_test(&base, stale, 0).unwrap(),
+            platform::plant_chunk_for_test(&base, stale, 1).unwrap(),
+            // Chunks whose base credential no longer exists at all.
+            platform::plant_chunk_for_test(&format!("{gone_sid}::{key}"), stale, 0).unwrap(),
+        ];
+        // Look-alikes that are not Toolport chunks must never be touched.
+        let lookalikes = [
+            format!("{base}::toolport-chunk::not-a-generation::0"),
+            format!("{base}::toolport-chunk::{stale}::x"),
+        ];
+        for account in &lookalikes {
+            platform::set_raw_account_for_test(account, "keep me").unwrap();
+        }
+        let foreign = keyring::Entry::new(
+            "toolport-sweep-other-app",
+            &format!("{base}::toolport-chunk::{stale}::0"),
+        )
+        .unwrap();
+        foreign.set_password("other app").unwrap();
+
+        // Fresh orphans are left alone: a pre-lock process may still be writing them.
+        assert_eq!(
+            platform::sweep_orphaned_chunks_for_test(std::time::Duration::from_secs(3600), &sid),
+            0
+        );
+        for account in &orphans {
+            assert!(platform::raw_entry_exists_for_test(account).unwrap());
+        }
+
+        assert_eq!(
+            platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO, &sid),
+            orphans.len()
+        );
+        for account in &orphans {
+            assert!(
+                !platform::raw_entry_exists_for_test(account).unwrap(),
+                "orphaned chunk {account} survived the sweep"
+            );
+        }
+        for account in &live {
+            assert!(
+                platform::raw_entry_exists_for_test(account).unwrap(),
+                "the sweep removed live entry {account}"
+            );
+        }
+        assert_eq!(
+            get_secret_result(&sid, key).unwrap().as_deref(),
+            Some(value.as_str())
+        );
+        assert_eq!(foreign.get_password().unwrap(), "other app");
+        foreign.delete_credential().unwrap();
+        for account in &lookalikes {
+            assert!(
+                platform::raw_entry_exists_for_test(account).unwrap(),
+                "the sweep removed non-chunk entry {account}"
+            );
+            platform::delete_raw_account_for_test(account).unwrap();
+        }
+    }
+
+    /// The sweep deletes only on positive evidence. A base that the vault lists but
+    /// a read reports absent (Windows does this mid-rewrite), a damaged manifest,
+    /// and a manifest version newer than this build all keep every generation.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_sweep_keeps_chunks_it_cannot_prove_orphaned() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_sweep_keeps_chunks_it_cannot_prove_orphaned",
+        );
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(platform::lock_mutex_opens_for_test().is_ok());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sid = format!("toolport-windows-sweep-keep-{unique}");
+        let (future_sid, damaged_sid) = (format!("{sid}-future"), format!("{sid}-damaged"));
+        let key = "OAUTH_TOKEN";
+        let _cleanup = [
+            SecretCleanupGuard::new(&sid, key),
+            SecretCleanupGuard::new(&future_sid, key),
+            SecretCleanupGuard::new(&damaged_sid, key),
+        ];
+        let value = format!("{}{}", "a".repeat(3_500), "🔒".repeat(300));
+        set_secret(&sid, key, &value).unwrap();
+        let live = platform::raw_entries_for_test(&sid, key).unwrap();
+        let stale = "0123456789abcdef0123456789abcdef";
+        let replaced = platform::plant_chunk_for_test(&format!("{sid}::{key}"), stale, 0).unwrap();
+
+        // Listed by the vault, absent to every read: nothing is provably orphaned.
+        let removed = platform::with_sweep_reads_absent(|| {
+            platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO, &sid)
+        });
+        assert_eq!(
+            removed, 0,
+            "a false absence must not condemn any generation"
+        );
+        for account in live.iter().chain([&replaced]) {
+            assert!(
+                platform::raw_entry_exists_for_test(account).unwrap(),
+                "a false absence removed {account}"
+            );
+        }
+
+        // Manifests this build cannot read keep their chunks too.
+        platform::set_raw_for_test(&future_sid, key, "toolport-chunked-v2:from-a-newer-build")
+            .unwrap();
+        platform::set_raw_for_test(&damaged_sid, key, "toolport-chunked-v1:damaged").unwrap();
+        let unreadable = [
+            platform::plant_chunk_for_test(&format!("{future_sid}::{key}"), stale, 0).unwrap(),
+            platform::plant_chunk_for_test(&format!("{damaged_sid}::{key}"), stale, 0).unwrap(),
+        ];
+        // With honest reads the replaced generation is provably orphaned; only it goes.
+        assert_eq!(
+            platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO, &sid),
+            1
+        );
+        assert!(!platform::raw_entry_exists_for_test(&replaced).unwrap());
+        for account in live.iter().chain(&unreadable) {
+            assert!(
+                platform::raw_entry_exists_for_test(account).unwrap(),
+                "the sweep removed {account}"
+            );
+        }
+        assert_eq!(
+            get_secret_result(&sid, key).unwrap().as_deref(),
+            Some(value.as_str())
+        );
+        for account in &unreadable {
+            platform::delete_raw_account_for_test(account).unwrap();
+        }
+    }
+
+    /// SIDs are not secret, so another account can pre-create the lock name. A
+    /// mutex this user does not own is refused rather than waited on.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_lock_refuses_a_mutex_another_account_owns() {
+        use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::System::Threading::CreateMutexExW;
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // A name nobody holds is created with this user as owner and accepted.
+        assert_eq!(
+            platform::open_lock_mutex_named_for_test(&format!(
+                "Global\\toolport-test-fresh-lock-{unique}"
+            )),
+            Ok(())
+        );
+        // Stand-in squatter: owner Administrators instead of this user, which an
+        // elevated test process may assign. Elsewhere this case cannot be set up.
+        let squatted = format!("Global\\toolport-test-squatted-lock-{unique}");
+        let name: Vec<u16> = squatted.encode_utf16().chain([0]).collect();
+        let sddl: Vec<u16> = "O:BAD:(A;;GA;;;WD)".encode_utf16().chain([0]).collect();
+        let mut descriptor = std::ptr::null_mut();
+        assert!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            } != 0
+        );
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let squatter = unsafe { CreateMutexExW(&attributes, name.as_ptr(), 0, 0x001F_0001) };
+        unsafe { LocalFree(descriptor.cast()) };
+        if squatter.is_null() {
+            eprintln!(
+                "skipping: cannot create a mutex owned by Administrators here ({})",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let refused = platform::open_lock_mutex_named_for_test(&squatted);
+        unsafe { CloseHandle(squatter) };
+        let error = refused.expect_err("a mutex owned by another account must be refused");
+        assert!(error.contains("another account"), "{error}");
+    }
+
+    /// A vault slow enough to list that one snapshot outlasts a whole batch must
+    /// still be swept to completion in bounded time, and the lock stays free for
+    /// other callers while the sweep lists the vault.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_sweep_terminates_when_snapshots_are_slow() {
+        let _data = crate::registry::DataDirTestEnv::new(
+            "windows_sweep_terminates_when_snapshots_are_slow",
+        );
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sid = format!("toolport-windows-sweep-slow-{unique}");
+        let key = "OAUTH_TOKEN";
+        let value = format!("{}{}", "a".repeat(3_500), "🔒".repeat(300));
+        let stale = "0123456789abcdef0123456789abcdef";
+        let servers: Vec<String> = (0..4).map(|index| format!("{sid}-{index}")).collect();
+        let _cleanup: Vec<_> = servers
+            .iter()
+            .map(|server| SecretCleanupGuard::new(server, key))
+            .collect();
+        let mut orphans = Vec::new();
+        for server in &servers {
+            set_secret(server, key, &value).unwrap();
+            for index in 0..3 {
+                orphans.push(
+                    platform::plant_chunk_for_test(&format!("{server}::{key}"), stale, index)
+                        .unwrap(),
+                );
+            }
+        }
+        // And chunks whose base is gone, which need two snapshots to condemn.
+        orphans
+            .push(platform::plant_chunk_for_test(&format!("{sid}-gone::{key}"), stale, 0).unwrap());
+
+        let started = std::time::Instant::now();
+        let removed =
+            platform::with_slow_sweep_snapshots(std::time::Duration::from_millis(300), || {
+                platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO, &sid)
+            });
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "the sweep ran for {elapsed:?}"
+        );
+        assert_eq!(removed, orphans.len());
+        for account in &orphans {
+            assert!(!platform::raw_entry_exists_for_test(account).unwrap());
+        }
+
+        // While another thread's sweep is in a slow listing, the lock stays free:
+        // the listing is taken before the lock, so other credential calls do not
+        // queue behind it.
+        let sweeper = std::thread::spawn({
+            let sid = sid.clone();
+            move || {
+                platform::with_slow_sweep_snapshots(std::time::Duration::from_secs(3), || {
+                    platform::sweep_orphaned_chunks_for_test(std::time::Duration::ZERO, &sid)
+                })
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let waited = platform::credential_lock_wait_for_test().expect("credential lock");
+        assert!(
+            !sweeper.is_finished(),
+            "the sweep's listing ended before the lock was tried"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "the lock waited {waited:?} behind the sweep's listing"
+        );
+        assert_eq!(sweeper.join().unwrap(), 0);
+        for server in &servers {
+            assert!(get_secret_result(server, key).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_production_sweep_covers_the_whole_vault_with_production_limits() {
+        assert!(platform::production_sweep_is_whole_vault_with_production_limits());
     }
 
     /// Cross-platform: setting `CONDUIT_SECRET_KEY` activates the file backend.
